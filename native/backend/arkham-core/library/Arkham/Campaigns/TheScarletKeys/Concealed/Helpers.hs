@@ -1,0 +1,276 @@
+module Arkham.Campaigns.TheScarletKeys.Concealed.Helpers (
+  module Arkham.Campaigns.TheScarletKeys.Concealed.Helpers,
+  module Arkham.Campaigns.TheScarletKeys.Concealed.Query,
+) where
+
+import Arkham.Ability
+import Arkham.Campaigns.TheScarletKeys.Concealed
+import Arkham.Campaigns.TheScarletKeys.Concealed.Query
+import Arkham.Campaigns.TheScarletKeys.I18n
+import Arkham.Campaigns.TheScarletKeys.Modifiers
+import Arkham.Card.CardCode
+import Arkham.Card.CardDef
+import Arkham.Classes.Entity
+import Arkham.Classes.HasGame
+import Arkham.Classes.HasQueue
+import Arkham.Classes.Query
+import Arkham.Enemy.CardDefs.NightOfTheZealot.DarkCult qualified as Cards
+import Arkham.Enemy.CardDefs.TheScarletKeys.AgentsOfYuggoth qualified as Cards
+import Arkham.Enemy.CardDefs.TheScarletKeys.CleanupCrew qualified as Cards
+import Arkham.Enemy.CardDefs.TheScarletKeys.CrimsonConspiracy qualified as Cards
+import Arkham.Enemy.CardDefs.TheScarletKeys.DancingMad qualified as Cards
+import Arkham.Enemy.CardDefs.TheScarletKeys.DealingsInTheDark qualified as Cards
+import Arkham.Enemy.CardDefs.TheScarletKeys.OnThinIce qualified as Cards
+import Arkham.Enemy.CardDefs.TheScarletKeys.RiddlesAndRain qualified as Cards
+import Arkham.Enemy.CardDefs.TheScarletKeys.SanguineShadows qualified as Cards
+import Arkham.Enemy.CardDefs.TheScarletKeys.ShadesOfSuffering qualified as Cards
+import Arkham.Helpers.Enemy
+import Arkham.Helpers.GameValue
+import Arkham.Helpers.Location
+import Arkham.Helpers.Modifiers (hasModifier)
+import Arkham.Helpers.Query (getLead)
+import Arkham.Homebrew.Defs (homebrewConcealedCardDefs)
+import Arkham.Id
+import Arkham.Keyword qualified as Keyword
+import Arkham.Matcher.Enemy
+import Arkham.Matcher.Investigator
+import Arkham.Matcher.Location
+import Arkham.Matcher.Window
+import Arkham.Message qualified as Msg
+import Arkham.Message.Lifted
+import Arkham.Message.Lifted.Choose
+import Arkham.Modifier
+import Arkham.Placement
+import Arkham.Prelude
+import Arkham.Queue
+import Arkham.Source
+import Arkham.Target
+import Arkham.Window qualified as Window
+import Data.Monoid (First (..))
+
+getConcealedIds :: HasGame m => ForExpose -> InvestigatorId -> m [ConcealedCardId]
+getConcealedIds fe iid = map toId <$> getConcealed fe iid
+
+getConcealed :: HasGame m => ForExpose -> InvestigatorId -> m [ConcealedCard]
+getConcealed fe iid = getLocationOf iid >>= maybe (pure []) (getConcealedAt fe)
+
+exposeConcealed
+  :: (ReverseQueue m, Sourceable source) => InvestigatorId -> source -> ConcealedCardId -> m ()
+exposeConcealed iid source cid = doFlip iid source cid
+
+-- | How a mini-card came to be exposed, for call sites that know.
+data ExposeRoute = ExposedByFight | ExposedByEvade | ExposedByDiscover
+  deriving stock (Show, Eq)
+
+exposeRouteKey :: ExposeRoute -> Text
+exposeRouteKey = \case
+  ExposedByFight -> "exposedVia[fight]"
+  ExposedByEvade -> "exposedVia[evade]"
+  ExposedByDiscover -> "exposedVia[discover]"
+
+exposeRouteKeyFor :: HasCardCode a => ExposeRoute -> a -> Text
+exposeRouteKeyFor route a = exposeRouteKey route <> "[" <> unCardCode (toCardCode a) <> "]"
+
+{- | Additive: raised alongside the @exposed[...]@ windows, which are untouched. No official card
+matches an @exposedVia[...]@ key, and a call site with no route raises nothing. Mirrors @exposed@ by
+also raising a card-code-qualified key; the mini-card is still in play here, before the @Flip@.
+-}
+exposedVia :: ReverseQueue m => ExposeRoute -> InvestigatorId -> ConcealedCardId -> m ()
+exposedVia route iid cid = do
+  mdef <- (concealedToCardDef =<<) <$> selectOne (ConcealedCardWithId cid)
+  let payload = toJSON $ ConcealedCardTarget cid
+  checkAfter $ Window.CampaignEvent (exposeRouteKey route) (Just iid) payload
+  for_ mdef \def -> checkAfter $ Window.CampaignEvent (exposeRouteKeyFor route def) (Just iid) payload
+
+afterExposedVia :: Maybe InvestigatorMatcher -> ExposeRoute -> WindowMatcher
+afterExposedVia who route = CampaignEvent #after who (exposeRouteKey route)
+
+afterExposedViaFor
+  :: HasCardCode a => Maybe InvestigatorMatcher -> ExposeRoute -> a -> WindowMatcher
+afterExposedViaFor who route a = CampaignEvent #after who (exposeRouteKeyFor route a)
+
+{- | Opt-out from the automatic sweep that ends an exposure when no enemy is left in the shadows.
+Additive and unused by official content; an explicit @RemoveAllConcealed@ still removes everything.
+Deliberately NOT @ScenarioModifier "doNotRemove"@, which Congress of the Keys already sets on grid
+mini-cards for a different purpose.
+-}
+keepConcealedInPlay :: ModifierType
+keepConcealedInPlay = ScenarioModifier "keepConcealedInPlay"
+
+getKeepsConcealedInPlay :: HasGame m => m Bool
+getKeepsConcealedInPlay = hasModifier ScenarioTarget keepConcealedInPlay
+
+-- | Queue order puts the window after the whole exposure resolves, not after the push.
+exposeConcealedVia
+  :: (ReverseQueue m, Sourceable source)
+  => ExposeRoute -> InvestigatorId -> source -> ConcealedCardId -> m ()
+exposeConcealedVia route iid source cid = do
+  exposeConcealed iid source cid
+  exposedVia route iid cid
+
+exposedInShadows
+  :: (Sourceable a, HasCardCode a, ReverseQueue m)
+  => InvestigatorId -> a -> QueueT Msg.Message m () -> m ()
+exposedInShadows iid source = chooseOneM iid . abilityLabeled iid (mkAbility source (-1) $ forced AnyWindow)
+
+moveFromShadows
+  :: (ReverseQueue m, Sourceable source) => InvestigatorId -> source -> ConcealedCardId -> m ()
+moveFromShadows iid source cid = push $ Msg.DoStep 3 $ Msg.Flip iid (toSource source) (toTarget cid)
+
+revealConcealed
+  :: (ReverseQueue m, Sourceable source) => InvestigatorId -> source -> ConcealedCardId -> m ()
+revealConcealed iid source cid = push $ Msg.LookAtRevealed iid (toSource source) (toTarget cid)
+
+turnOverConcealed
+  :: (ReverseQueue m, Sourceable source) => InvestigatorId -> source -> ConcealedCardId -> m ()
+turnOverConcealed iid source = push . Msg.DoStep 2 . Msg.LookAtRevealed iid (toSource source) . toTarget
+
+turnOverAllConcealed :: (ReverseQueue m, Sourceable source) => source -> m ()
+turnOverAllConcealed source = do
+  lead <- getLead
+  selectEach ConcealedCardAny \c -> turnOverConcealed lead source c.id
+
+chooseExposeConcealed :: (ReverseQueue m, Sourceable source) => InvestigatorId -> source -> m ()
+chooseExposeConcealed iid source = chooseExposeConcealedAt iid source (LocationWithInvestigator $ InvestigatorWithId iid)
+
+chooseExposeConcealedVia
+  :: (ReverseQueue m, Sourceable source) => ExposeRoute -> InvestigatorId -> source -> m ()
+chooseExposeConcealedVia route iid source =
+  chooseExposeConcealedAtVia route iid source (LocationWithInvestigator $ InvestigatorWithId iid)
+
+chooseExposeConcealedAt
+  :: (ReverseQueue m, Sourceable source) => InvestigatorId -> source -> LocationMatcher -> m ()
+chooseExposeConcealedAt = chooseExposeConcealedAtWithRoute Nothing
+
+chooseExposeConcealedAtVia
+  :: (ReverseQueue m, Sourceable source)
+  => ExposeRoute -> InvestigatorId -> source -> LocationMatcher -> m ()
+chooseExposeConcealedAtVia = chooseExposeConcealedAtWithRoute . Just
+
+chooseExposeConcealedAtWithRoute
+  :: (ReverseQueue m, Sourceable source)
+  => Maybe ExposeRoute -> InvestigatorId -> source -> LocationMatcher -> m ()
+chooseExposeConcealedAtWithRoute mroute iid source lmatcher = do
+  concealed <- getConcealedChoicesAt (ForExpose $ toSource source) lmatcher
+  when (notNull concealed) do
+    chooseOneM iid do
+      targets concealed \c -> do
+        exposeConcealed iid source c.id
+        for_ mroute \route -> exposedVia route iid c.id
+      campaignI18n $ labeled "doNotExposeConcealed" nothing
+
+chooseRevealConcealedAt
+  :: (ReverseQueue m, Sourceable source) => InvestigatorId -> source -> LocationMatcher -> m ()
+chooseRevealConcealedAt iid source lmatcher = do
+  concealed <- getConcealedChoicesAt NotForExpose lmatcher
+  chooseOneM iid do
+    targets concealed (revealConcealed iid source . (.id))
+    campaignI18n $ labeled "doNotRevealConcealed" nothing
+
+gatherConcealedCards
+  :: (MonadRandom m, HasGame m) => EnemyId -> m (Maybe (ConcealedCardKind, [ConcealedCard]))
+gatherConcealedCards a = do
+  mconcealed <-
+    getModifiedKeywords a <&> foldMap \case
+      Keyword.Concealed card n -> First $ Just (card, n)
+      _ -> First Nothing
+  for (getFirst mconcealed) \(card, gv) -> do
+    n <- getGameValue gv
+    let
+      cards =
+        card
+          : if card == VoidChimeraTrueForm
+            then
+              [ DecoyVoidChimeraFellbeak
+              , DecoyVoidChimeraFellhound
+              , DecoyVoidChimeraGorefeaster
+              , DecoyVoidChimeraEarsplitter
+              ]
+            else replicate n Decoy
+    (card,) <$> (shuffle cards >>= traverse mkConcealedCard)
+
+makeDecoyAt :: ReverseQueue m => InvestigatorId -> LocationId -> m ()
+makeDecoyAt iid loc = mkConcealedCard Decoy >>= \decoy -> makeDecoyAt' decoy iid loc
+
+makeDecoyAt' :: ReverseQueue m => ConcealedCard -> InvestigatorId -> LocationId -> m ()
+makeDecoyAt' decoy iid loc = do
+  push $ Msg.CreateConcealedCard decoy
+  push $ Msg.PlaceConcealedCards iid [decoy.id] [loc]
+
+placeConcealed :: ReverseQueue m => InvestigatorId -> ConcealedCardKind -> [ConcealedCard] -> m ()
+placeConcealed iid kind cards = do
+  locations <-
+    select
+      $ LocationWithoutModifier (CampaignModifier ("noConcealed[" <> tshow kind <> "]"))
+      <> LocationWithoutModifier (CannotBeEnteredBy AnyEnemy)
+  for_ cards $ push . Msg.CreateConcealedCard
+  push $ Msg.PlaceConcealedCards iid (map toId cards) locations
+
+resolveConcealed_ :: ReverseQueue m => EnemyId -> m ()
+resolveConcealed_ eid = do
+  lead <- getLead
+  resolveConcealed lead eid
+
+resolveConcealed :: ReverseQueue m => InvestigatorId -> EnemyId -> m ()
+resolveConcealed iid eid =
+  gatherConcealedCards eid >>= \case
+    Nothing -> pure ()
+    Just (kind, cards) -> placeConcealed iid kind cards
+
+shuffleConcealedAt :: (ReverseQueue m, ToId location LocationId) => location -> m ()
+shuffleConcealedAt location = do
+  concealed <- getConcealedAtAll NotForExpose location
+  let (known, unknown) = partition (attr concealedCardKnown) concealed
+  case known <> unknown of
+    (x : _) -> push $ Msg.PlaceConcealedCard "00000" x.id (AtLocation $ asId location)
+    [] -> pure ()
+
+distributeEvenlyBetween :: (ReverseQueue m, ToId a ConcealedCardId) => [a] -> [LocationId] -> m ()
+distributeEvenlyBetween concealed locations = do
+  lead <- getLead
+  do1 $ forTargets locations (Msg.PlaceConcealedCards lead (map asId concealed) locations)
+
+pattern InvestigatorCanExpose :: InvestigatorMatcher
+pattern InvestigatorCanExpose <- InvestigatorWithoutModifier CannotExpose
+  where
+    InvestigatorCanExpose = InvestigatorWithoutModifier CannotExpose
+
+pattern WithConcealed :: LocationMatcher
+pattern WithConcealed <- LocationWithConcealedCard
+  where
+    WithConcealed = LocationWithConcealedCard
+
+concealedToCardDef :: ConcealedCard -> Maybe CardDef
+concealedToCardDef c = concealedKindToCardDef c.kind
+
+concealedKindToCardDef :: ConcealedCardKind -> Maybe CardDef
+concealedKindToCardDef = \case
+  Decoy -> Nothing
+  AcolyteAny -> Just Cards.acolyte
+  ApportionedKa -> Just Cards.apportionedKa
+  CoterieAgentA -> Just Cards.coterieAgentA
+  CoterieAgentB -> Just Cards.coterieAgentB
+  CoterieAgentC -> Just Cards.coterieAgentC
+  EmissaryFromYuggoth -> Just Cards.emissaryFromYuggoth
+  LaChicaRoja -> Just Cards.laChicaRojaTheGirlInTheCarmineCoat
+  SinisterAspirantA -> Just Cards.sinisterAspirantA
+  SinisterAspirantB -> Just Cards.sinisterAspirantB
+  SinisterAspirantC -> Just Cards.sinisterAspirantC
+  TheRedGlovedMan -> Just Cards.theRedGlovedManShroudedInMystery
+  WizardOfTheOrder -> Just Cards.wizardOfTheOrder
+  DesiderioDelgadoAlvarez -> Just Cards.desiderioDelgadoAlvarez106
+  CoterieEnforcerA -> Just Cards.coterieEnforcerA
+  CoterieEnforcerB -> Just Cards.coterieEnforcerB
+  CoterieAssassinA -> Just Cards.coterieAssassinA
+  CoterieAssassinB -> Just Cards.coterieAssassinB
+  VoidChimeraTrueForm -> Just Cards.voidChimeraTrueForm
+  TzuSanNiang -> Just Cards.tzuSanNiangTheLadyWithTheRedParasol
+  k@(HomebrewConcealedCardKind _) -> lookup k homebrewConcealedCardDefs
+  _ -> Nothing
+
+allConcealedCardDefs :: [CardDef]
+allConcealedCardDefs =
+  Cards.desiderioDelgadoAlvarez107
+    : ( mapMaybe concealedKindToCardDef coreConcealedCardKinds
+          <> toList homebrewConcealedCardDefs
+      )

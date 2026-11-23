@@ -1,0 +1,152 @@
+name: arkham-core
+version: 0.1.0.0
+language: GHC2021
+
+default-extensions:
+- AllowAmbiguousTypes
+- BlockArguments
+- DataKinds
+- DeriveAnyClass
+- DerivingStrategies
+- DerivingVia
+- ExtendedDefaultRules
+- FunctionalDependencies
+- GADTs
+- LambdaCase
+- MultiWayIf
+- NoImplicitPrelude
+- NoMonomorphismRestriction
+- OverloadedLabels
+- OverloadedRecordDot
+- OverloadedStrings
+- PatternSynonyms
+- RecordWildCards
+- StrictData
+- TypeFamilies
+- TypeFamilyDependencies
+- TypeOperators
+- UndecidableInstances
+- ViewPatterns
+
+build-tools:
+- cards-discover
+
+dependencies:
+  - base
+  - MonadRandom
+  - aeson
+  - aeson-casing
+  - aeson-diff
+  - annotated-exception
+  - async
+  - base16-bytestring
+  - base64-bytestring
+  - bytestring
+  - case-insensitive
+  - classy-prelude
+  - conduit
+  - constraints-extras
+  - containers
+  - crypton
+  - cryptohash-sha256
+  - data-default-class
+  - deepseq
+  - dependent-map
+  - dependent-sum
+  - dependent-sum-template
+  - directory
+  - errors
+  - exceptions
+  - extra
+  - file-embed
+  - filepath
+  - hashable
+  - lens
+  - lens-aeson
+  - monad-time
+  - monoidal-containers
+  - mtl >= 2.3.1
+  - parsec
+  - path-pieces
+  - pretty-simple
+  - process
+  - random
+  - random-shuffle
+  - relude
+  - safe
+  - semialign
+  - some
+  - stm
+  - string-conversions
+  - template-haskell
+  - text
+  - these
+  - these-lens
+  - time
+  - transformers
+  - unliftio
+  - uuid
+  - vector
+  - yaml
+  - zlib
+
+library:
+  source-dirs: [library, generated]
+  # Permanent public development/test API. Hpack infers every remaining source
+  # module as other-modules; no rules are removed from the library.
+  exposed-modules:
+  - Arkham.Prelude
+  - Arkham.Difficulty
+  - Arkham.Decklist.Type
+  - Arkham.Game
+  - Arkham.Id
+  - Arkham.Card.CustomCard
+  - Arkham.Card.CardType
+  - Arkham.Question
+  - Arkham.Message
+  - Arkham.Native.Env
+  - Arkham.Native.Answer
+  - Arkham.Native.Validation
+  - Arkham.Native.Events
+  - Arkham.Native.Session
+  - Arkham.Native.Epic.Types
+  - Arkham.Native.Epic.Engine
+  - Arkham.Native.Network.View
+  - Arkham.Native.Network.Question
+  - Arkham.Native.Author
+  - Arkham.Native.DeckBuild.Types
+  - Arkham.Native.DeckBuild.Catalog
+  - Arkham.Native.DeckBuild.Validate
+  - Arkham.Native.DeckBuild.Customizations
+  - Arkham.Native.DeckBuild.Investigators
+  - Arkham.Native.DeckBuild.Taboos
+  - Arkham.Native.DeckBuild.Owned
+  - Arkham.Native.DeckBuild.Extra
+  - Arkham.Native.DeckBuild.Attachments
+  - Arkham.Native.DeckBuild.UpgradeQuote
+  - Arkham.Native.DeckMetadata
+  - Arkham.Native.Settings.Types
+  - Arkham.Native.Settings.Definition
+  - Arkham.Native.Settings.Catalog
+  - Arkham.Native.Settings.Predicate
+  - Arkham.Native.Settings.Engine
+  - Arkham.Native.StrictJSON
+  - Arkham.Native.Debug.Scenario
+  - Arkham.CampaignLog
+  - Arkham.Native.History.Types
+  - Arkham.Native.History.Profile
+  - Arkham.Native.History.Log
+  - Arkham.Native.History.Inheritance
+  - Arkham.Native.History.Story
+  - Arkham.Native.History.Manifest
+  - Arkham.Native.History.Engine
+  - Arkham.Helpers.Playable
+  - Arkham.Helpers.Modifiers
+  ghc-options: [-O0, -Wall, -fno-write-ide-info]
+
+executables:
+  core-spec:
+    main: Main.hs
+    source-dirs: spec
+    ghc-options: [-threaded, -rtsopts, -O0]
+    dependencies: [arkham-core]

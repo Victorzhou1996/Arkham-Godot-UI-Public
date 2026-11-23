@@ -1,0 +1,582 @@
+module Arkham.Game.Utils where
+
+import Arkham.Act.Types (Act)
+import Arkham.ActiveCost
+import Arkham.Agenda.Types (Agenda)
+import Arkham.Asset.Types (Asset)
+import Arkham.Campaign.Types hiding (campaign, modifiersL)
+import Arkham.Campaigns.TheScarletKeys.Concealed
+import Arkham.Campaigns.TheScarletKeys.Key.Types
+import Arkham.Card
+import Arkham.Classes.Entity
+import Arkham.Classes.HasGame
+import Arkham.Classes.Query (select, (<=~>))
+import Arkham.Cost qualified as Cost
+import Arkham.Effect.Types (Effect)
+import Arkham.Enemy.Types (Enemy, Field (EnemyRemainingHealth))
+import Arkham.EnemyLocation.EnemyProxy (toEnemyLocationEnemyProxy)
+import Arkham.EnemyLocation.Proxy (toEnemyLocationProxy)
+import Arkham.Entities
+import Arkham.Event.Types (Event)
+import Arkham.Game.Base
+import Arkham.Game.Outcome
+import Arkham.Game.State
+import Arkham.Helpers.Action (getActionCost)
+import Arkham.Helpers.Calculation
+import Arkham.Helpers.Card
+import Arkham.Helpers.Investigator (getMaybeLocation)
+import Arkham.Helpers.Modifiers
+import Arkham.Id
+import Arkham.Investigator (promoInvestigators)
+import Arkham.Investigator.Types (
+  Field (..),
+  Investigator,
+  InvestigatorAttrs,
+  investigatorResources,
+ )
+import Arkham.Keyword (Sealing (..))
+import Arkham.Keyword qualified as Keyword
+import Arkham.Location.Types (Location)
+import Arkham.Matcher.Target (matchTarget)
+import Arkham.Prelude
+import Arkham.Projection
+import Arkham.Scenario.Types hiding (scenario)
+import Arkham.Skill.Types (Skill)
+import Arkham.Source
+import Arkham.Story.Types (Story)
+import Arkham.Target
+import Arkham.Treachery.Types (Treachery)
+import Arkham.Window (Window)
+import Control.Lens (each)
+import Data.List.Extra (nubOrd)
+import Data.Text qualified as T
+
+{- | Card ids that already have an entity somewhere in @e@, so a preload does not
+load a second copy of the same card.
+-}
+loadedCardIds :: Entities -> Set CardId
+loadedCardIds e =
+  setFromList
+    $ [(toAttrs s).cardId | s <- toList (e ^. skillsL)]
+    <> [(toAttrs x).cardId | x <- toList (e ^. eventsL)]
+    <> [(toAttrs x).cardId | x <- toList (e ^. assetsL)]
+
+newtype MissingEntity = MissingEntity Text
+  deriving stock Show
+
+instance Exception MissingEntity
+
+getInvestigator
+  :: (HasCallStack, HasGame m) => InvestigatorId -> m Investigator
+getInvestigator iid =
+  getInvestigatorMaybe iid >>= \case
+    Nothing -> case lookup iid promoInvestigators of
+      Just iid' -> fromJustNote missingInvestigator <$> getInvestigatorMaybe iid'
+      Nothing -> throw $ MissingEntity $ T.pack missingInvestigator
+    Just i -> pure i
+ where
+  missingInvestigator = "Unknown investigator: " <> show iid <> "\n\n" <> prettyCallStack callStack
+
+getInvestigatorMaybe :: HasGame m => InvestigatorId -> m (Maybe Investigator)
+getInvestigatorMaybe iid = preview (entitiesL . investigatorsL . ix iid) <$> getGame
+
+getEvent :: (HasCallStack, HasGame m) => EventId -> m Event
+getEvent eid = fromJustNote missingEvent <$> getEventMaybe eid
+ where
+  missingEvent = "Unknown event: " <> show eid <> "\n\n" <> prettyCallStack callStack
+
+getEventMaybe :: HasGame m => EventId -> m (Maybe Event)
+getEventMaybe eid = do
+  g <- getGame
+  pure
+    $ preview (entitiesL . eventsL . ix eid) g
+    <|> preview (inSearchEntitiesL . eventsL . ix eid) g
+    <|> preview (inHandEntitiesL . each . eventsL . ix eid) g
+    <|> preview (committedEntitiesL . each . eventsL . ix eid) g
+    <|> getInDiscardEntity eventsL eid g
+    <|> getRemovedEntity eventsL eid g
+
+getInDiscardEntity
+  :: (entityId ~ EntityId entity, Ord entityId)
+  => Lens' Entities (EntityMap entity)
+  -> entityId
+  -> Game
+  -> Maybe entity
+getInDiscardEntity lensFunc entityId game =
+  asum
+    $ map
+      (preview (lensFunc . ix entityId))
+      (toList $ view inDiscardEntitiesL game)
+
+getInEncounterDiscardEntity
+  :: (entityId ~ EntityId entity, Ord entityId)
+  => Lens' Entities (EntityMap entity)
+  -> entityId
+  -> Game
+  -> Maybe entity
+getInEncounterDiscardEntity lensFunc entityId game = preview (lensFunc . ix entityId) (view encounterDiscardEntitiesL game)
+
+getRemovedEntity
+  :: (entityId ~ EntityId entity, Ord entityId)
+  => Lens' Entities (EntityMap entity)
+  -> entityId
+  -> Game
+  -> Maybe entity
+getRemovedEntity lensFunc entityId game =
+  preview (lensFunc . ix entityId) (view actionRemovedEntitiesL game)
+
+getTreachery :: (HasCallStack, HasGame m) => TreacheryId -> m Treachery
+getTreachery tid = fromMaybe (throw missingTreachery) <$> maybeTreachery tid
+ where
+  missingTreachery =
+    MissingEntity
+      $ "Unknown treachery: "
+      <> tshow tid
+      <> "\n"
+      <> T.pack (prettyCallStack callStack)
+
+maybeTreachery :: HasGame m => TreacheryId -> m (Maybe Treachery)
+maybeTreachery tid = do
+  g <- getGame
+  pure
+    $ preview (entitiesL . treacheriesL . ix tid) g
+    <|> preview (inHandEntitiesL . each . treacheriesL . ix tid) g
+    <|> preview (committedEntitiesL . each . treacheriesL . ix tid) g
+    <|> preview (inSearchEntitiesL . treacheriesL . ix tid) g
+    <|> getInDiscardEntity treacheriesL tid g
+    <|> getRemovedEntity treacheriesL tid g
+
+getAsset :: (HasCallStack, HasGame m) => AssetId -> m Asset
+getAsset aid = fromMaybe (throw missingAsset) <$> maybeAsset aid
+ where
+  missingAsset =
+    MissingEntity
+      $ "Unknown asset: "
+      <> tshow aid
+      <> "\n"
+      <> T.pack
+        (prettyCallStack callStack)
+
+maybeAsset :: HasGame m => AssetId -> m (Maybe Asset)
+maybeAsset aid = do
+  g <- getGame
+  pure
+    $ preview (entitiesL . assetsL . ix aid) g
+    <|> preview (inHandEntitiesL . each . assetsL . ix aid) g
+    <|> preview (committedEntitiesL . each . assetsL . ix aid) g
+    <|> getInDiscardEntity assetsL aid g
+    <|> getRemovedEntity assetsL aid g
+    -- Last resort: a leave-play window can surface an asset that has already been
+    -- swept out of every live map (see `getAssetsMatching`). Anything that then
+    -- projects a field off that id -- `selectAgg` totalling doom, say -- has to
+    -- find something rather than throw MissingEntity. #5518
+    <|> preview (tombstonesL . assetsL . ix aid) g
+
+getEffect :: (HasCallStack, HasGame m) => EffectId -> m Effect
+getEffect effectId = fromMaybe (throw missingEffect) <$> maybeEffect effectId
+ where
+  missingEffect =
+    MissingEntity $ "Unknown effect: " <> tshow effectId <> "\n" <> T.pack (prettyCallStack callStack)
+
+maybeEffect :: HasGame m => EffectId -> m (Maybe Effect)
+maybeEffect effectId = do
+  g <- getGame
+  pure
+    $ preview (entitiesL . effectsL . ix effectId) g
+    <|> getRemovedEntity effectsL effectId g
+
+createActiveCostForAdditionalCardCosts
+  :: (MonadRandom m, HasGame m)
+  => InvestigatorId
+  -> Card
+  -> m (Maybe ActiveCost)
+createActiveCostForAdditionalCardCosts iid card = do
+  acId <- getRandom
+  initiationTick <- gameWindowTick <$> getGame
+  mods <- getModifiers (CardIdTarget $ toCardId card)
+  let
+    additionalCosts = flip mapMaybe mods $ \case
+      AdditionalCost c -> Just c
+      _ -> Nothing
+    sealingToCost = \case
+      Sealing matcher -> Just $ Cost.SealCost matcher
+      SealUpTo n matcher -> Just $ Cost.UpTo (Fixed n) $ Cost.SealCost matcher
+      SealOneOf (m1 :| rest) -> Just $ Cost.OrCost $ mapMaybe sealingToCost (m1 : rest)
+      SealUpToX _ -> Nothing
+    sealChaosTokenCosts =
+      flip mapMaybe (setToList $ cdKeywords $ toCardDef card) $ \case
+        Keyword.Seal sealing -> sealingToCost sealing
+        _ -> Nothing
+    cost = mconcat $ additionalCosts <> sealChaosTokenCosts
+
+  pure
+    $ if cost == Cost.Free
+      then Nothing
+      else
+        Just
+          $ ActiveCost
+            { activeCostId = acId
+            , activeCostCosts = cost
+            , activeCostPayments = Cost.NoPayment
+            , activeCostTarget = ForCost card
+            , activeCostWindows = []
+            , activeCostInitiationTick = Just initiationTick
+            , activeCostInvestigator = iid
+            , activeCostSealedChaosTokens = []
+            , activeCostCancelled = False
+            , activeCostChosenOrAction = Nothing
+            , activeCostPendingEventId = Nothing
+            }
+
+getEnemy :: (HasCallStack, HasGame m) => EnemyId -> m Enemy
+getEnemy eid = fromJustNote missingEnemy <$> maybeEnemy eid
+ where
+  missingEnemy = "Unknown enemy: " <> show eid <> "\n\n" <> prettyCallStack callStack
+
+maybeEnemy :: HasGame m => EnemyId -> m (Maybe Enemy)
+maybeEnemy eid = do
+  g <- getGame
+  pure
+    $ preview (entitiesL . enemiesL . ix eid) g
+    <|> getInDiscardEntity enemiesL eid g
+    <|> getInEncounterDiscardEntity enemiesL eid g
+    <|> getRemovedEntity enemiesL eid g
+    <|> ( let lid = LocationId (coerce (unEnemyId eid))
+           in fmap (toEnemyLocationEnemyProxy . toAttrs) $ preview (entitiesL . enemyLocationsL . ix lid) g
+        )
+
+getSkill :: (HasCallStack, HasGame m) => SkillId -> m Skill
+getSkill sid = fromJustNote missingSkill <$> maybeSkill sid
+ where
+  missingSkill = "Unknown skill: " <> show sid <> "\n\n" <> prettyCallStack callStack
+
+maybeSkill :: HasGame m => SkillId -> m (Maybe Skill)
+maybeSkill sid = do
+  g <- getGame
+  pure
+    $ preview (entitiesL . skillsL . ix sid) g
+    <|> getInDiscardEntity skillsL sid g
+    <|> getRemovedEntity skillsL sid g
+    <|> preview (inHandEntitiesL . each . skillsL . ix sid) g
+    <|> preview (committedEntitiesL . each . skillsL . ix sid) g
+    <|> preview (inSearchEntitiesL . skillsL . ix sid) g
+
+getStory :: (HasCallStack, HasGame m) => StoryId -> m Story
+getStory sid = fromJustNote missingStory <$> maybeStory sid
+ where
+  missingStory = "Unknown story: " <> show sid
+
+maybeStory :: HasGame m => StoryId -> m (Maybe Story)
+maybeStory sid = preview (entitiesL . storiesL . ix sid) <$> getGame
+
+getScarletKey :: (HasCallStack, HasGame m) => ScarletKeyId -> m ScarletKey
+getScarletKey sid = fromJustNote missingScarletKey <$> maybeScarletKey sid
+ where
+  missingScarletKey = "Unknown scarlet key: " <> show sid
+
+maybeScarletKey :: HasGame m => ScarletKeyId -> m (Maybe ScarletKey)
+maybeScarletKey sid = preview (entitiesL . scarletKeysL . ix sid) <$> getGame
+
+getConcealedCard :: (HasCallStack, HasGame m) => ConcealedCardId -> m ConcealedCard
+getConcealedCard cid = fromJustNote missingConcealedCard <$> maybeConcealedCard cid
+ where
+  missingConcealedCard = "Unknown concealed card: " <> show cid <> "\n" <> prettyCallStack callStack
+
+maybeConcealedCard :: HasGame m => ConcealedCardId -> m (Maybe ConcealedCard)
+maybeConcealedCard cid = preview (entitiesL . concealedL . ix cid) <$> getGame
+
+getActiveInvestigator :: HasGame m => m Investigator
+getActiveInvestigator = getGame >>= getInvestigator . gameActiveInvestigatorId
+
+getCostForCard :: HasGame m => InvestigatorId -> Card -> IsPlayAction -> m Cost.Cost
+getCostForCard iid card isPlayAction = do
+  cardMods <- getModifiers card
+  investigatorMods <- getModifiers iid
+  let allModifiers = cardMods <> investigatorMods
+  if IgnoreAllCosts `elem` allModifiers
+    then pure Cost.Free
+    else do
+      mResources <- getModifiedCardCost iid card
+      investigator' <- getInvestigator iid
+      let
+        isInvestigate = #investigate `elem` card.actions
+        sealingToCost = \case
+          Sealing matcher -> Just $ Cost.SealCost matcher
+          SealUpTo n matcher -> Just $ Cost.UpTo (Fixed n) $ Cost.SealCost matcher
+          SealOneOf (m1 :| rest) -> Just $ Cost.OrCost $ mapMaybe sealingToCost (m1 : rest)
+          SealUpToX _ -> Nothing
+        sealChaosTokenCosts =
+          flip mapMaybe (setToList $ cdKeywords $ toCardDef card) $ \case
+            Keyword.Seal sealing -> sealingToCost sealing
+            _ -> Nothing
+
+      resourceCost <- case mResources of
+        Nothing -> pure Cost.UnpayableCost
+        Just resources -> case cdCost (toCardDef card) of
+          Just (AnyMatchingCardCost ecMatcher) -> do
+            cards <- select ecMatcher
+            pure $ case nubOrd (map (Cost.ResourceCost . getCost) cards) of
+              [x] -> x
+              xs -> Cost.OrCost xs
+          Just (MatchingEnemyFieldCost enemyMatcher enemyCostField) -> do
+            enemies <- select enemyMatcher
+            let enemyField = case enemyCostField of
+                  EnemyRemainingHealthField -> EnemyRemainingHealth
+            values <- mapMaybeM (field enemyField) enemies
+            pure $ Cost.OrCost $ map Cost.ResourceCost $ nubOrd values
+          _
+            | isDynamic card -> do
+                -- a reduction past zero is credited to X when the cost is paid, so the player
+                -- should not be offered resources to spend on it as well
+                ucost <- fromMaybe 0 <$> getUnboundedModifiedCardCost iid card
+                let discount = max 0 (negate ucost)
+                let availableForX = max 0 (investigatorResources (toAttrs investigator') - resources)
+                let
+                  dynamicPart = case maxDynamic card of
+                    Nothing -> Cost.UpTo (Fixed availableForX) (Cost.ResourceCost 1)
+                    -- NB. MaxCalculation is min and MinCalculation is max, so this is
+                    -- min (max 0 (cap - discount)) availableForX
+                    Just c ->
+                      Cost.UpTo
+                        ( MaxCalculation
+                            (MinCalculation (Fixed 0) (SubtractCalculation c (Fixed discount)))
+                            (Fixed availableForX)
+                        )
+                        (Cost.ResourceCost 1)
+                -- keep a resource cost around when discounted so the discount still gets credited
+                pure
+                  $ if resources == 0 && discount == 0
+                    then dynamicPart
+                    else Cost.ResourceCost resources <> dynamicPart
+          _ -> pure $ if resources == 0 then Cost.Free else Cost.ResourceCost resources
+
+      investigateCosts <- runDefaultMaybeT [] do
+        guard isInvestigate
+        lid <- MaybeT $ getMaybeLocation iid
+        mods' <- lift $ getModifiers lid
+        pure [c | AdditionalCostToInvestigate c <- mods']
+
+      let
+        additionalActionModifiers =
+          if isPlayAction == NotPlayAction
+            then allModifiers
+            else cardMods
+      additionalActionCosts <-
+        sum <$> flip mapMaybeM additionalActionModifiers \case
+          AdditionalCost (Cost.ActionCost n) -> pure $ Just n
+          AdditionalActionCostOf match n -> do
+            performedActions <- field InvestigatorActionsPerformed iid
+            takenActions <- field InvestigatorActionsTaken iid
+            let cardActions = if isPlayAction == IsPlayAction then nub (#play : card.actions) else card.actions
+            pure $ guard (any (matchTarget takenActions performedActions match) cardActions) $> n
+          _ -> pure Nothing
+
+      actionCost <-
+        if isPlayAction == NotPlayAction
+          then do
+            pure $ if additionalActionCosts > 0 then Cost.ActionCost additionalActionCosts else Cost.Free
+          else
+            Cost.ActionCost
+              . (+ additionalActionCosts)
+              <$> getActionCost (toAttrs investigator') (#play : card.actions)
+
+      additionalCosts <- flip mapMaybeM allModifiers $ \case
+        AdditionalCost (Cost.ActionCost _) -> pure Nothing
+        AdditionalCost c -> pure $ Just c
+        AdditionalPlayCostOf matcher additionalCost -> do
+          isMatch <- card <=~> matcher
+          pure $ guard isMatch $> additionalCost
+        _ -> pure Nothing
+
+      pure
+        $ mconcat
+        $ [resourceCost]
+        <> (maybe [] pure . cdAdditionalCost $ toCardDef card)
+        <> [actionCost]
+        <> additionalCosts
+        <> investigateCosts
+        <> sealChaosTokenCosts
+
+createActiveCostForCard
+  :: (MonadRandom m, HasGame m)
+  => InvestigatorId
+  -> Card
+  -> IsPlayAction
+  -> [Window]
+  -> m ActiveCost
+createActiveCostForCard iid card isPlayAction windows' = do
+  acId <- getRandom
+  initiationTick <- gameWindowTick <$> getGame
+  cost <- getCostForCard iid card isPlayAction
+  pure
+    ActiveCost
+      { activeCostId = acId
+      , activeCostCosts = cost
+      , activeCostPayments = Cost.NoPayment
+      , activeCostTarget = ForCard isPlayAction card
+      , activeCostWindows = windows'
+      , activeCostInitiationTick = Just initiationTick
+      , activeCostInvestigator = iid
+      , activeCostSealedChaosTokens = []
+      , activeCostCancelled = False
+      , activeCostChosenOrAction = Nothing
+      , activeCostPendingEventId = Nothing
+      }
+
+data MissingLocation = MissingLocation Text CallStack
+
+instance Show MissingLocation where
+  show (MissingLocation t cs) = show t <> "\n" <> prettyCallStack cs
+
+instance Exception MissingLocation
+
+getLocation :: (HasCallStack, HasGame m) => LocationId -> m Location
+getLocation lid = fromMaybe missingLocation <$> maybeLocation lid
+ where
+  missingLocation =
+    throw $ MissingLocation ("Unknown location: " <> tshow lid) callStack
+
+maybeLocation :: HasGame m => LocationId -> m (Maybe Location)
+maybeLocation lid = do
+  g <- getGame
+  case preview (entitiesL . locationsL . ix lid) g <|> getRemovedEntity locationsL lid g of
+    Just l -> pure (Just l)
+    Nothing -> pure $ fmap (toEnemyLocationProxy . toAttrs) $ preview (entitiesL . enemyLocationsL . ix lid) g
+
+maybeEnemyLocation :: HasGame m => LocationId -> m (Maybe EnemyLocationId)
+maybeEnemyLocation lid = do
+  g <- getGame
+  pure $ EnemyLocationId . toId <$> preview (entitiesL . enemyLocationsL . ix lid) g
+
+{- | Will any entity still claim a 'UseAbility' for this source? Each entity runner's
+@UseAbility _ ab _ | isSource a ab.source@ arm is the ONLY converter to
+@Do (UseAbility ...)@, so an ability whose source has left every map the dispatch reaches
+is silently swallowed -- and a materialised initiation holding it is then re-offered
+forever, because neither the recorded use nor 'releaseInitiationEffects' can mark it done
+(#5761). Anything not entity-backed answers True, so nothing else changes.
+
+The kinds the ResolvedAbility sweep parks (events, treacheries -- Caught in the Crossfire
+discards itself on its first resolution, #5743) go through the @maybe*@ lookups, which
+already consult 'actionRemovedEntitiesL' and the in-hand/in-discard/in-search maps, so
+they keep answering True. Acts, agendas, stories, concealed cards and scarlet keys have no
+such lookup -- theirs are @entitiesL@-only even though 'Arkham.Entities' does fan the
+message over the removed map -- so they are checked against both here.
+-}
+sourceCanClaimUseAbility :: HasGame m => Source -> m Bool
+sourceCanClaimUseAbility = \case
+  AbilitySource s _ -> sourceCanClaimUseAbility s
+  UseAbilitySource _ s _ -> sourceCanClaimUseAbility s
+  PaymentSource s -> sourceCanClaimUseAbility s
+  IndexedSource _ s -> sourceCanClaimUseAbility s
+  -- the runners compare against ProxySource's ORIGINAL source (`isProxySource`)
+  ProxySource _ s -> sourceCanClaimUseAbility s
+  BothSource s1 s2 -> orM [sourceCanClaimUseAbility s1, sourceCanClaimUseAbility s2]
+  AssetSource aid -> isJust <$> maybeAsset aid
+  EventSource eid -> isJust <$> getEventMaybe eid
+  TreacherySource tid -> isJust <$> maybeTreachery tid
+  SkillSource sid -> isJust <$> maybeSkill sid
+  EnemySource eid -> isJust <$> maybeEnemy eid
+  LocationSource lid -> isJust <$> maybeLocation lid
+  EffectSource eid -> isJust <$> maybeEffect eid
+  InvestigatorSource iid -> isJust <$> getInvestigatorMaybe iid
+  ActSource aid -> livesIn actsL aid
+  AgendaSource aid ->
+    orM [livesIn agendasL aid, livesIn actsL (coerce aid :: ActId)]
+  StorySource sid -> livesIn storiesL sid
+  ConcealedCardSource cid -> livesIn concealedL cid
+  ScarletKeySource kid -> livesIn scarletKeysL kid
+  _ -> pure True
+ where
+  livesIn
+    :: (HasGame m, entityId ~ EntityId entity, Ord entityId)
+    => Lens' Entities (EntityMap entity) -> entityId -> m Bool
+  livesIn l eid = do
+    g <- getGame
+    pure $ isJust (preview (entitiesL . l . ix eid) g) || isJust (getRemovedEntity l eid g)
+
+modeScenario :: GameMode -> Maybe Scenario
+modeScenario = \case
+  That s -> Just s
+  These _ s -> Just s
+  This _ -> Nothing
+
+modeCampaign :: GameMode -> Maybe Campaign
+modeCampaign = \case
+  That _ -> Nothing
+  These c _ -> Just c
+  This c -> Just c
+
+getScenario :: HasGame m => m (Maybe Scenario)
+getScenario = modeScenario . view modeL <$> getGame
+
+getCampaign :: HasGame m => m (Maybe Campaign)
+getCampaign = modeCampaign . view modeL <$> getGame
+
+{- | A finished game's outcome: the one it recorded, or, failing that, one
+reconstructed from what it left behind.
+
+Games that finished before outcomes were recorded have nothing stored, and there
+are a lot of them, so rather than rewrite the hottest column of the largest table
+to backfill a heuristic, the heuristic runs on read. An inferred outcome says so
+('Arkham.Game.Outcome.Inferred'), and a recorded one always wins.
+-}
+gameOutcomeOf :: Game -> Maybe GameOutcome
+gameOutcomeOf g
+  | gameGameState g /= IsOver = Nothing
+  | otherwise = gameOutcome g <|> inferred
+ where
+  ending = gameLastResolution g
+  withEnding o = o {outcomeEnding = ending <|> outcomeEnding o}
+  inferred = case modeCampaign (gameMode g) of
+    Just c ->
+      let attrs = toAttrs c
+       in withEnding
+            <$> inferCampaignOutcome
+              (campaignId attrs)
+              (campaignStep attrs)
+              (campaignCompletedSteps attrs)
+              (campaignResolutions attrs)
+    Nothing -> standaloneOutcome <$> ending
+
+setScenario :: Scenario -> GameMode -> GameMode
+setScenario c (This a) = These a c
+setScenario c (That _) = That c
+setScenario c (These a _) = These a c
+
+gameSkills :: Game -> EntityMap Skill
+gameSkills = entitiesSkills . gameEntities
+
+gameStories :: Game -> EntityMap Story
+gameStories = entitiesStories . gameEntities
+
+gameEvents :: Game -> EntityMap Event
+gameEvents = entitiesEvents . gameEntities
+
+gameConcealed :: Game -> EntityMap ConcealedCard
+gameConcealed = entitiesConcealed . gameEntities
+gameActs :: Game -> EntityMap Act
+gameActs = entitiesActs . gameEntities
+
+gameAgendas :: Game -> EntityMap Agenda
+gameAgendas = entitiesAgendas . gameEntities
+
+gameEnemies :: Game -> EntityMap Enemy
+gameEnemies = entitiesEnemies . gameEntities
+
+gameLocations :: Game -> EntityMap Location
+gameLocations = entitiesLocations . gameEntities
+
+gameInvestigators :: Game -> EntityMap Investigator
+gameInvestigators = entitiesInvestigators . gameEntities
+
+gameAssets :: Game -> EntityMap Asset
+gameAssets = entitiesAssets . gameEntities
+
+gameTreacheries :: Game -> EntityMap Treachery
+gameTreacheries = entitiesTreacheries . gameEntities
+
+withInvestigatorEdit
+  :: HasGame m => InvestigatorId -> (InvestigatorAttrs -> InvestigatorAttrs) -> ReaderT Game m a -> m a
+withInvestigatorEdit iid f body = do
+  game <- getGame
+  runReaderT body $ game & entitiesL . investigatorsL . ix iid %~ overAttrs f

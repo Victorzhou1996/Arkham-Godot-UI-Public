@@ -1,0 +1,254 @@
+{
+ "code": "02041",
+ "name": "课外活动",
+ "mapName": "地点总览",
+ "exterior": "act:02045",
+ "cardBackgrounds": true,
+ "endings": {},
+ "_note": "No paintings for the Dunwich Legacy yet: backgrounds are the location cards' art, the scenario picture the first act's art, the map drawn from the core's location layout.",
+ "map": {
+  "image": "map-miskatonic",
+  "style": "cards",
+  "_note": "Yunke's Miskatonic University campus, second version (11-18). Labels are the core's location symbols: triangle Orne Library, plus Quad, hourglass Science Building, squiggle Alchemy Labs, square Humanities, diamond Student Union, circle Administration, equals Dormitories, t Faculty Offices. Paths follow the painted stone walks; pairs joined in the picture itself (glass corridors, the two touching halls) have no line.",
+  "hotspots": {
+   "triangle": [
+    0.1227,
+    0.1488,
+    0.2035,
+    0.3719
+   ],
+   "squiggle": [
+    0.3232,
+    0.0213,
+    0.1885,
+    0.2391
+   ],
+   "hourglass": [
+    0.5117,
+    0.0531,
+    0.1676,
+    0.2338
+   ],
+   "plus": [
+    0.4399,
+    0.4729,
+    0.1017,
+    0.101
+   ],
+   "circle": [
+    0.6643,
+    0.3879,
+    0.1466,
+    0.255
+   ],
+   "t": [
+    0.8558,
+    0.3666,
+    0.1317,
+    0.2125
+   ],
+   "square": [
+    0.1227,
+    0.5845,
+    0.2035,
+    0.2232
+   ],
+   "equals": [
+    0.3441,
+    0.6376,
+    0.1975,
+    0.2179
+   ],
+   "diamond": [
+    0.4668,
+    0.6961,
+    0.1795,
+    0.1966
+   ]
+  },
+  "shapes": {
+   "plus": [
+    [
+     0.444,
+     0.4803
+    ],
+    [
+     0.5374,
+     0.4803
+    ],
+    [
+     0.5416,
+     0.5685
+    ],
+    [
+     0.4399,
+     0.5685
+    ]
+   ],
+   "squiggle": [
+    [
+     0.3232,
+     0.0903
+    ],
+    [
+     0.3591,
+     0.0478
+    ],
+    [
+     0.4189,
+     0.0319
+    ],
+    [
+     0.4847,
+     0.0638
+    ],
+    [
+     0.4877,
+     0.1116
+    ],
+    [
+     0.5206,
+     0.17
+    ],
+    [
+     0.5266,
+     0.255
+    ],
+    [
+     0.4967,
+     0.2657
+    ],
+    [
+     0.4219,
+     0.1966
+    ],
+    [
+     0.3651,
+     0.2285
+    ],
+    [
+     0.3351,
+     0.2125
+    ]
+   ]
+  },
+  "paths": {
+   "plus-triangle": [
+    [
+     0.4548,
+     0.5207
+    ],
+    [
+     0.383,
+     0.5186
+    ],
+    [
+     0.3112,
+     0.5143
+    ],
+    [
+     0.2693,
+     0.5016
+    ]
+   ],
+   "plus-hourglass": [
+    [
+     0.5057,
+     0.4942
+    ],
+    [
+     0.5566,
+     0.4091
+    ],
+    [
+     0.5984,
+     0.3348
+    ],
+    [
+     0.6284,
+     0.2784
+    ]
+   ],
+   "plus-circle": [
+    [
+     0.5356,
+     0.5207
+    ],
+    [
+     0.5925,
+     0.5218
+    ],
+    [
+     0.6433,
+     0.5239
+    ],
+    [
+     0.6732,
+     0.5313
+    ]
+   ],
+   "plus-square": [
+    [
+     0.4698,
+     0.5526
+    ],
+    [
+     0.4189,
+     0.6217
+    ],
+    [
+     0.3591,
+     0.6961
+    ],
+    [
+     0.2992,
+     0.7492
+    ]
+   ],
+   "plus-diamond": [
+    [
+     0.5984,
+     0.5367
+    ],
+    [
+     0.6074,
+     0.6111
+    ],
+    [
+     0.6493,
+     0.6908
+    ],
+    [
+     0.6583,
+     0.7758
+    ],
+    [
+     0.6344,
+     0.8448
+    ]
+   ],
+   "triangle-square": [
+    [
+     0.1496,
+     0.4835
+    ],
+    [
+     0.1047,
+     0.5526
+    ],
+    [
+     0.0838,
+     0.6376
+    ],
+    [
+     0.1107,
+     0.7333
+    ]
+   ],
+   "squiggle-hourglass": "none",
+   "circle-t": "none",
+   "diamond-equals": "none"
+  },
+  "_note_cards": "Yunke 11-18 r8: every map is location cards joined by lines; the painted setup is kept in backup/scenarios-before-cards-20261118"
+ }
+}

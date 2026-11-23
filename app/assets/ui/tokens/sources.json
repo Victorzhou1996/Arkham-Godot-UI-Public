@@ -1,0 +1,27 @@
+[
+  {
+    "file": "health.png",
+    "source": "G:\\Python Project\\ArkhamHorrorLocal-WinDeploy-20260712\\game\\frontend\\dist\\img\\arkham\\health.png",
+    "sha256": "416cf498b54879adb9a7437a3e5c5ef8ae90042f7d5caa537a56866e9e996bb9"
+  },
+  {
+    "file": "horror.png",
+    "source": "G:\\Python Project\\ArkhamHorrorLocal-WinDeploy-20260712\\game\\frontend\\dist\\img\\arkham\\horror.png",
+    "sha256": "6d29d775ccdd8d1c926e3bd29fc9be01e482aa76a1de22a049937bfe690195a6"
+  },
+  {
+    "file": "resource.png",
+    "source": "G:\\Python Project\\ArkhamHorrorLocal-WinDeploy-20260712\\game\\frontend\\dist\\img\\arkham\\resource.png",
+    "sha256": "0c523b6c316065c7db4937803bf9b1699823f62fe4d94ceed2e9a5cfabcea20a"
+  },
+  {
+    "file": "clue.png",
+    "source": "G:\\Python Project\\ArkhamHorrorLocal-WinDeploy-20260712\\game\\frontend\\dist\\img\\arkham\\clue.png",
+    "sha256": "5e6cebe15bc8f0c63dee98fdc74930019a3db5ee66eb950d2d82389f26bde8e6"
+  },
+  {
+    "file": "doom.png",
+    "source": "G:\\Python Project\\ArkhamHorrorLocal-WinDeploy-20260712\\game\\frontend\\dist\\img\\arkham\\doom.png",
+    "sha256": "7dc1c0a9ce43043403c07a0b32e07719d03bcfe13196acac8606caf6784cfe44"
+  }
+]

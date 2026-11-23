@@ -1,0 +1,41 @@
+module Arkham.Homebrew.AgesUnwound.Agendas.FamiliarAdversaries (familiarAdversaries) where
+
+import Arkham.Agenda.Import.Lifted
+import Arkham.Helpers.Modifiers (ModifierType (..), modifySelect)
+import Arkham.Homebrew.AgesUnwound.CardDefs.Agendas qualified as Cards
+import Arkham.Homebrew.AgesUnwound.Traits (pattern Fate)
+import Arkham.Matcher
+
+newtype FamiliarAdversaries = FamiliarAdversaries AgendaAttrs
+  deriving anyclass (IsAgenda, HasAbilities)
+  deriving newtype (Show, Eq, ToJSON, FromJSON, Entity)
+
+{- | Agenda 2. "Locations with a resource on them are 'warded'." is the same
+reminder acts 1 and 2 print and needs nothing of the agenda.
+
+"[[Fate]] treacheries cannot be cancelled or discarded from play, except by
+abilities printed on them." The discard half is 'CannotLeavePlay', which the
+treachery discard in @Game/Runner@ now honours the way the asset runner always
+has -- including the "except by abilities printed on them" exemption, since a
+discard a treachery sources itself is let through. It protects /Unwritten
+Existence/ and /Aged a Thousand Years/, both of which print their own way off
+the table.
+
+The cancellation modifier targets card IDs, including cards outside play, so
+it is already present when the encounter-draw cancellation window opens.
+-}
+familiarAdversaries :: AgendaCard FamiliarAdversaries
+familiarAdversaries = agenda (2, A) FamiliarAdversaries Cards.familiarAdversaries (Static 7)
+
+instance HasModifiersFor FamiliarAdversaries where
+  getModifiersFor (FamiliarAdversaries a) = do
+    modifySelect a (TreacheryWithTrait Fate <> InPlayTreachery) [CannotLeavePlay]
+    modifySelect a (basic $ #treachery <> CardWithTrait Fate) [EffectsCannotBeCanceled]
+
+-- | Agenda 2b /A Broken Eternity/: "(->R1)."
+instance RunMessage FamiliarAdversaries where
+  runMessage msg a@(FamiliarAdversaries attrs) = runQueueT $ case msg of
+    AdvanceAgenda (isSide B attrs -> True) -> do
+      push R1
+      pure a
+    _ -> FamiliarAdversaries <$> liftRunMessage msg attrs

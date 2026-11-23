@@ -1,0 +1,9 @@
+{
+ "code": "05120",
+ "name": "隐秘之名",
+ "mapName": "地点总览",
+ "cardBackgrounds": true,
+ "endings": {},
+ "_note": "Later cycles (11-22, tools import): no paintings — the scenario picture is the first act's art, the map the core's location layout.",
+ "exterior": "act:05125"
+}

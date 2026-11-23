@@ -1,0 +1,5 @@
+# the rules core source is hashed byte for byte (its sourceId): never rewrite its line endings
+native/backend/** -text
+native/parity/** -text
+native/ffi/** -text
+native/ffi-posix/** -text

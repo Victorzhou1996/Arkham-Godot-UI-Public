@@ -1,0 +1,394 @@
+{-# OPTIONS_GHC -Wno-orphans #-}
+
+module Arkham.Event.Runner (
+  module X,
+) where
+
+import Arkham.Prelude
+
+import Arkham.Calculation as X
+import Arkham.Event.Types as X
+import Arkham.Helpers.Effect as X
+import Arkham.Helpers.Message as X hiding (
+  InvestigatorEliminated,
+  PlayCard,
+  RevealLocation,
+ )
+import Arkham.Helpers.Query as X
+import Arkham.Helpers.SkillTest as X
+import Arkham.Id as X
+import Arkham.SkillTest.Base as X (SkillTestDifficulty (..))
+import Arkham.Source as X
+import Arkham.Target as X
+
+import Arkham.Asset.Types (Field (AssetUses))
+import Arkham.Asset.Uses
+import Arkham.Card
+import Arkham.ChaosToken
+import Arkham.Classes
+import Arkham.Deck qualified as Deck
+import Arkham.Enemy.Types (Field (..))
+import Arkham.GameEnv (getCard)
+import Arkham.Helpers.Calculation (calculate)
+import Arkham.Helpers.Customization
+import Arkham.Helpers.Modifiers
+import Arkham.Helpers.Ref (sourceToTarget)
+import Arkham.Helpers.Window
+import Arkham.Matcher (EnemyMatcher (..), EventMatcher (..))
+import Arkham.Message qualified as Msg
+import Arkham.Message.Lifted qualified as Lifted
+import Arkham.Placement
+import Arkham.Projection
+import Arkham.Window (mkAfter)
+import Arkham.Window qualified as Window
+import Control.Lens (non)
+import Data.Aeson.KeyMap qualified as KeyMap
+import Data.IntMap.Strict qualified as IntMap
+
+instance RunMessage EventAttrs where
+  runMessage msg a@EventAttrs {..} = do
+    result <- runEventMessage msg a
+    pure
+      $ if eventBeingPaidFor
+        then case msg of
+          SpendResources _ _ -> result & paymentMessagesL %~ (<> [msg])
+          _ -> result
+        else result
+
+runEventMessage :: Runner EventAttrs
+runEventMessage msg a@EventAttrs {..} = runQueueT $ case msg of
+  -- As an asset: what the card remembers, bound back for its own abilities.
+  SetGlobal (is a -> True) key value -> pure $ a & metaMapL %~ KeyMap.insert key value
+  IncreaseCustomization iid cardCode customization choices | toCardCode a == cardCode && a.owner == iid -> do
+    case customizationIndex a customization of
+      Nothing -> pure a
+      Just i ->
+        pure
+          $ a
+            { eventCustomizations =
+                IntMap.alter (Just . maybe (1, choices) (bimap (+ 1) (const choices))) i eventCustomizations
+            }
+  SetOriginalCardCode cardCode -> pure $ a & originalCardCodeL .~ cardCode
+  AttachEvent eid target | eid == eventId -> do
+    case target of
+      LocationTarget lid -> push $ PlaceEvent eid (AttachedToLocation lid)
+      EnemyTarget enid -> push $ PlaceEvent eid (AttachedToEnemy enid)
+      CardIdTarget cid -> do
+        card <- getCard cid
+        case card.kind of
+          EnemyType -> do
+            menemy <- selectOne $ EnemyWithCardId cid
+            for_ menemy $ push . PlaceEvent eid . AttachedToEnemy
+          PlayerEnemyType -> do
+            menemy <- selectOne $ EnemyWithCardId cid
+            for_ menemy $ push . PlaceEvent eid . AttachedToEnemy
+          _ -> error "Cannot attach event to that type"
+      _ -> error "Cannot attach event to that type"
+    pure a
+  Msg.InvestigatorEliminated iid
+    | eventAttachedTarget a
+        == Just (InvestigatorTarget iid)
+        || (iid == a.controller && isInPlayPlacement a.placement) -> do
+        push $ RemoveFromGame (toTarget a)
+        pure a
+  Discard _ source (isTarget a -> True) -> do
+    (batchId, windowMessages) <- wouldWindows $ Window.WouldBeDiscarded (toTarget a)
+    push
+      $ Would batchId
+      $ windowMessages
+      <> [Discarded (toTarget a) source (toCard a), RemoveFromPlay $ toSource a]
+    pure a
+  RemoveFromPlay source | isSource a source -> do
+    let
+      handleDiscard c = case c of
+        PlayerCard pc -> AddToDiscard (fromJustNote "missing owner" $ toCardOwner c) pc
+        EncounterCard ec -> AddToEncounterDiscard ec
+        VengeanceCard vc -> handleDiscard vc
+
+    windowMsg <-
+      checkWindows
+        ( (`Window.mkWindow` Window.LeavePlay (toTarget a))
+            <$> [#when, #at, #after]
+        )
+    pushAll
+      $ windowMsg
+      : [UnsealChaosToken token | token <- eventSealedChaosTokens]
+        <> map handleDiscard eventCardsUnderneath
+        <> [RemovedFromPlay source]
+    pure a
+  Discard _ _ target | eventAttachedTarget a == Just target -> do
+    push $ toDiscard GameSource a
+    pure a
+  Discard _ _ (AssetTarget aid) -> do
+    case eventPlacement of
+      AttachedToAsset aid' _ | aid == aid' -> do
+        push $ toDiscard GameSource a
+      _ -> pure ()
+    pure a
+  -- An event attached to something (e.g. a Rot on an enemy) is discarded when that
+  -- thing leaves play, mirroring attached treacheries and enemies. Without this an
+  -- attachment whose host is removed rather than discarded is stranded in play, #5309.
+  --
+  -- Only while this event is still in play, though. `RemoveEvent` moves the
+  -- entity to `actionRemovedEntities`, which keeps receiving messages, and the
+  -- copy it parks there is read via `getEvent` from the ambient game -- i.e. the
+  -- state as of the *start* of the removing message -- so it keeps its old
+  -- `AttachedToEnemy` placement no matter what the runner sets during that
+  -- message. A Rot that had already returned to the bonded pile via
+  -- `PlaceInBonded` therefore discarded itself when its host enemy left play a
+  -- few messages later, landing in the discard as well, #5426. `select` reads
+  -- only `entitiesL.eventsL`, so it is the liveness test the placement is not.
+  RemovedFromPlay source | not (isSource a source) -> do
+    stillInPlay <- selectAny $ EventWithId a.id
+    when stillInPlay $ case placementToAttached eventPlacement of
+      Just target | isTarget target (sourceToTarget source) -> push $ toDiscard GameSource a
+      _ -> pure ()
+    pure a
+  -- An event placed directly on a location leaves play with it. An event
+  -- attached to an enemy or asset is that host's business instead, which is
+  -- what keeps Rod of Carnamagos' Rots alive long enough to react to their
+  -- enemy's leave-play window, #5426.
+  RemovedLocation lid | isDirectlyAtLocation lid eventPlacement -> do
+    push $ toDiscard GameSource a
+    pure a
+  ReadyExhausted -> pure $ a & exhaustedL .~ False
+  -- An event in play exhausts like an asset, so "your exhausted cards cannot
+  -- ready" has to stop it here too. Only the wider modifier: a card that says
+  -- /assets/ does not reach an event.
+  Ready (isTarget a -> True) -> do
+    modifiers <- getModifiers a.controller
+    pure $ if ControlledCardsCannotReady `elem` modifiers then a else a & exhaustedL .~ False
+  Exhaust ea | a `isTarget` ea.target -> do
+    unless eventExhausted $ pushAll ea.thenMsgs
+    pure $ a & exhaustedL .~ True
+  PayCardCost _ card _ | toCardId a == toCardId card -> do
+    pure $ a & beingPaidForL .~ True
+  CardEnteredPlay _ card | toCardId a == toCardId card -> do
+    pure $ a & beingPaidForL .~ False
+  SealedChaosToken token _ (isTarget a -> True) -> do
+    pure $ a & sealedChaosTokensL %~ addSealedChaosToken token
+  SealedChaosToken token _ _ -> do
+    pure $ a & sealedChaosTokensL %~ filter (/= token)
+  ReturnChaosTokens tokens -> pure $ a & sealedChaosTokensL %~ filter (`notElem` tokens)
+  UnsealChaosToken token -> pure $ a & sealedChaosTokensL %~ filter (/= token)
+  RemoveAllChaosTokens face -> pure $ a & sealedChaosTokensL %~ filter ((/= face) . chaosTokenFace)
+  PlaceEvent eid placement | eid == eventId -> do
+    let
+      controller =
+        case placement of
+          AttachedToInvestigator iid' -> iid'
+          InPlayArea iid' -> iid'
+          _ -> a.controller
+      handleWindows = do
+        for_ placement.attachedTo $ Lifted.checkAfter . Window.AttachCard (Just a.controller) (toCard a)
+      updated = a & placementL .~ placement & controllerL .~ controller
+    case placement of
+      InThreatArea iid' -> do
+        Lifted.checkAfter $ Window.EntersThreatArea iid' (toCard a)
+        handleWindows
+        pure updated
+      -- An enemy that cannot have attachments refuses the attach outright, the same way
+      -- an enemy that has already left play does.
+      AttachedToEnemy eid' -> do
+        cannotAttach <- hasModifier eid' CannotHaveAttachments
+        fieldMay EnemyPlacement eid' >>= \case
+          _ | cannotAttach -> pure a
+          Nothing -> pure a
+          Just p -> do
+            case p of
+              InThreatArea iid' -> Lifted.checkAfter $ Window.EntersThreatArea iid' (toCard a)
+              _ -> pure ()
+            handleWindows
+            pure updated
+      _ -> handleWindows >> pure updated
+  FinishedEvent eid | eid == eventId -> do
+    mods <- liftA2 (<>) (getModifiers eid) (getModifiers $ toCardId $ toCard a)
+    let
+      modifyAfterPlay cur = \case
+        SetAfterPlay n -> case cur of
+          DevourThis {} -> cur
+          _ -> n
+        _ -> cur
+      afterPlay = foldl' modifyAfterPlay eventAfterPlay mods
+    case afterPlay of
+      DeferDiscard -> pure ()
+      _ -> push $ Do (FinishedEvent eid)
+    pure a
+  Do (FinishedEvent eid) | eid == eventId -> do
+    mods <- liftA2 (<>) (getModifiers eid) (getModifiers $ toCardId $ toCard a)
+    let
+      modifyAfterPlay cur = \case
+        SetAfterPlay n -> case cur of
+          DevourThis {} -> cur
+          _ -> n
+        _ -> cur
+
+      afterPlay = foldl' modifyAfterPlay eventAfterPlay mods
+
+    after <- checkWindows [mkAfter (Window.PlayEventDiscarding eventController (toId a))]
+
+    if LeaveCardWhereItIs `elem` mods
+      then push $ RemoveEvent $ toId a
+      else case eventPlacement of
+        Limbo -> case afterPlay of
+          PlaceThisBeneath target -> pushAll [after, PlaceUnderneath target [toCard a], RemovedFromPlay (toSource a)]
+          DiscardThis -> Lifted.batched \_ -> pushAll [after, toDiscardBy eventController GameSource a]
+          ExileThis -> pushAll [after, Exile (toTarget a)]
+          DeferDiscard -> pushAll [after, toDiscardBy eventController GameSource a]
+          RemoveThisFromGame -> push (RemoveEvent $ toId a)
+          AbsoluteRemoveThisFromGame -> push (RemoveEvent $ toId a)
+          ShuffleThisBackIntoDeck -> push (ShuffleIntoDeck (Deck.InvestigatorDeck eventController) (toTarget a))
+          ReturnThisToHand -> push (ReturnToHand eventController (toTarget a))
+          DevourThis iid' -> do
+            c <- field EventCard a.id
+            push $ Devoured iid' c
+            push $ RemovedFromPlay (toSource a)
+        _ -> case afterPlay of
+          PlaceThisBeneath target -> pushAll [PlaceUnderneath target [toCard a], RemovedFromPlay (toSource a)]
+          AbsoluteRemoveThisFromGame -> push (RemoveEvent $ toId a)
+          DevourThis iid' -> do
+            c <- field EventCard a.id
+            push $ Devoured iid' c
+            push $ RemovedFromPlay (toSource a)
+          -- A placement other than Limbo means the event stayed in play (it
+          -- attached, or sits in a play/threat area), so it is never discarded
+          -- here and the discard-replacement window must not open. #5942
+          _ -> pure ()
+    pure a
+  After (Revelation _iid (isSource a -> True)) -> do
+    result <- liftRunMessage (FinishedEvent a.id) a
+    push $ ObtainCard (toCard result).id
+    pure result
+  InvestigatorPlayEvent _ eid _ _ _ | eid == eventId -> do
+    pure $ a & placementL .~ Limbo
+  PlaceUnderneath (isTarget a -> True) cards -> do
+    pure $ a & cardsUnderneathL <>~ cards
+  PlaceUnderneath _ cards -> do
+    pure
+      $ if toCard a `elem` cards
+        then a & afterPlayL .~ AbsoluteRemoveThisFromGame
+        else a
+  AddToDiscard _ c -> do
+    pure $ a & cardsUnderneathL %~ filter (/= toCard c)
+  CommitCard _ card -> do
+    pure $ a & cardsUnderneathL %~ filter (/= card)
+  AddToHand _ cards -> do
+    pure $ a & cardsUnderneathL %~ filter (`notElem` cards)
+  Exile target | a `isTarget` target -> do
+    pushAll [RemoveFromPlay $ toSource a, Exiled target (toCard a)]
+    -- once exiled we don't want any other discard effect to take hold, so we
+    -- overwrite to defer discard which is effectively a no op
+    pure $ a & afterPlayL .~ DeferDiscard
+  ShuffleCardsIntoDeck _ cards ->
+    pure $ a & cardsUnderneathL %~ filter (`notElem` cards)
+  RemoveAllAttachments source target -> do
+    case placementToAttached a.placement of
+      Just attached | target == attached -> push $ toDiscard source a
+      _ -> pure ()
+    pure a
+  SpendUses source target useType' n | isTarget a target -> do
+    mods <- getModifiers a
+    let otherSources = [s | ProvidesUses uType s <- mods, uType == useType']
+    otherSourcePairs <- for otherSources \case
+      AssetSource aid' -> do
+        uses <- fieldMap AssetUses (findWithDefault 0 useType') aid'
+        pure (AssetTarget aid', uses)
+      EventSource eid' -> do
+        uses <- fieldMap EventUses (findWithDefault 0 useType') eid'
+        pure (EventTarget eid', uses)
+      _ -> error $ "Unhandled source: " <> show source
+
+    -- window should be independent of other sources since they are spent from this asset
+    -- for_ eventController $ \controller ->
+    --   pushM $ checkWindows [mkAfter $ Window.SpentUses controller source (toId a) useType' n]
+
+    if null otherSourcePairs
+      then push $ Do msg
+      else do
+        -- we may want a nicer way to handle this, but for the now the
+        -- logic is to duplicate the choice for each use (the ui can only
+        -- display it being clickable) and then to remove that choice from
+        -- the list when used.
+        player <- getPlayer a.controller
+        push
+          $ chooseN player n
+          $ replicate (a.use useType') (targetLabel a [Do msg])
+          <> concat
+            [ replicate x (targetLabel otherTarget [Do $ SpendUses source otherTarget useType' n])
+            | (otherTarget, x) <- otherSourcePairs
+            ]
+    pure a
+  Do (SpendUses source target useType' n) | isTarget a target -> do
+    result <- liftRunMessage (RemoveTokens source target useType' n) a
+    Lifted.checkAfter $ Window.SpentToken source (toTarget a) useType' n
+    pure result
+  MoveTokens s source _ tType n | isSource a source -> liftRunMessage (RemoveTokens s (toTarget a) tType n) a
+  MoveTokens _s (InvestigatorSource _) target Clue _ | isTarget a target -> pure a
+  MoveTokens s _ target tType n | isTarget a target -> liftRunMessage (PlaceTokens s (toTarget a) tType n) a
+  RemoveTokens _ target tType n | isTarget a target -> pure $ a & tokensL %~ subtractTokens tType n
+  PlaceTokens source target tType n | isTarget a target -> do
+    let
+      handleWindows = do
+        Lifted.checkAfter $ Window.PlacedToken source target tType n
+        when (tType == Doom && a.doom == 0) do
+          Lifted.checkAfter $ Window.PlacedDoomCounterOnTargetWithNoDoom source target n
+    if
+      | tokenIsUse tType -> case eventPrintedUses of
+          NoUses -> do
+            handleWindows
+            pure $ a & tokensL . at tType . non 0 %~ (+ n)
+          Uses useType'' _ | tType == useType'' -> do
+            handleWindows
+            pure $ a & tokensL . at tType . non 0 %~ (+ n)
+          UsesWithLimit useType'' _ pl | tType == useType'' -> do
+            handleWindows
+            l <- calculate pl
+            pure $ a & tokensL . at tType . non 0 %~ min l . (+ n)
+          _ ->
+            error
+              $ "Trying to add the wrong use type, has "
+              <> show eventPrintedUses
+              <> ", but got: "
+              <> show tType
+      | tType == Doom -> do
+          handleWindows
+          pure $ a & tokensL %~ addTokens Doom n
+      | otherwise -> do
+          pushWhen (tType == Horror) $ checkDefeated source a
+          handleWindows
+          pure $ a & tokensL %~ addTokens tType n
+  UseAbility _ ab _ | isSource a ab.source || isProxySource a ab.source -> do
+    push $ Do msg
+    pure a
+  InSearch msg'@(UseAbility _ ab _) | isSource a ab.source || isProxySource a ab.source -> do
+    push $ Do msg'
+    pure a
+  -- NOTE: No InDiscard UseAbility handler here. In-discard entities also receive the raw message
+  -- (see RunMessage Game in Game/Runner.hs), so the bare `UseAbility` handler above already fires
+  -- for them. Adding an InDiscard handler would push `Do (UseAbility)` twice and resolve the
+  -- ability (and pay its cost) twice — see issue #4764 (Parallel Wendy's Amulet + Intel Report).
+  InHand iid msg'@(UseAbility iid' ab _) | iid == iid' && (isSource a ab.source || isProxySource a ab.source) -> do
+    push $ Do msg'
+    pure a
+  Committed iid msg'@(UseAbility iid' ab _) | iid == iid' && (isSource a ab.source || isProxySource a ab.source) -> do
+    push $ Do msg'
+    pure a
+  SetLocationOutOfGame lid -> do
+    case eventPlacement of
+      AtLocation lid' | lid' == lid -> pure $ a & placementL .~ OutOfGame eventPlacement
+      AttachedToLocation lid' | lid' == lid -> pure $ a & placementL .~ OutOfGame eventPlacement
+      _ -> pure a
+  ReturnLocationToGame lid -> do
+    case eventPlacement of
+      OutOfGame p@(AtLocation lid') | lid' == lid -> pure $ a & placementL .~ p
+      OutOfGame p@(AttachedToLocation lid') | lid' == lid -> pure $ a & placementL .~ p
+      _ -> pure a
+  UpdateEventMeta eid value | eid == eventId -> do
+    pure $ a & metaL .~ value
+  UpdateEventTarget eid mtarget | eid == eventId -> do
+    pure $ a {eventTarget = mtarget}
+  BeforePlayEvent _ eid acId | eid == eventId -> do
+    -- Default: no pre-play questions; resume the cost pipeline immediately
+    push $ CreatedCost acId
+    pure a
+  _ -> pure a

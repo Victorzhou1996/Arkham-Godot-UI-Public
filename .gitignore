@@ -1,0 +1,6 @@
+# Media shipped as a GitHub Release asset, not in git.
+app/assets/bg/
+app/assets/cards/
+app/assets/ref/
+app/assets/art-portrait-wide/
+app/assets/art-fallback/

@@ -1,0 +1,102 @@
+{
+ "code": "01142",
+ "name": "地底噬魔",
+ "mapName": "阿卡姆密林",
+ "exterior": "forest-gate",
+ "backgrounds": {
+  "mainPath": "forest-path",
+  "ritualSite": "forest-ritual-site",
+  "woods1": "forest-misty-path",
+  "woods2": "forest-misty-path",
+  "woods3": "forest-misty-path",
+  "woods4": "forest-misty-path"
+ },
+ "states": [
+  {
+   "code": "01150",
+   "background": "forest-thorns"
+  },
+  {
+   "code": "01151",
+   "background": "forest-misty-path"
+  },
+  {
+   "code": "01152",
+   "background": "forest-clearing"
+  },
+  {
+   "code": "01153",
+   "background": "forest-cliff"
+  },
+  {
+   "code": "01154",
+   "background": "forest-ground"
+  },
+  {
+   "code": "01155",
+   "background": "forest-cabin"
+  }
+ ],
+ "map": {
+  "image": "forest-map",
+  "hotspots": {
+   "mainPath": [
+    0.38,
+    0.6,
+    0.24,
+    0.38
+   ],
+   "woods1": [
+    0.04,
+    0.08,
+    0.28,
+    0.3
+   ],
+   "woods2": [
+    0.03,
+    0.5,
+    0.28,
+    0.32
+   ],
+   "woods3": [
+    0.64,
+    0.06,
+    0.3,
+    0.3
+   ],
+   "woods4": [
+    0.66,
+    0.5,
+    0.3,
+    0.32
+   ],
+   "ritualSite": [
+    0.38,
+    0.0,
+    0.24,
+    0.26
+   ]
+  },
+  "style": "cards",
+  "_note_cards": "Yunke 11-18 r8: every map is location cards joined by lines; the painted setup is kept in backup/scenarios-before-cards-20261118"
+ },
+ "objectives": {
+  "01147": {
+   "perPlayer": 0
+  },
+  "01148": {
+   "perPlayer": 0
+  }
+ },
+ "endings": {
+  "R1": "forest-ritual-site",
+  "R2": "forest-ritual-site",
+  "R3": "forest-gate"
+ },
+ "places": {
+  "woods1": "西北",
+  "woods2": "西南",
+  "woods3": "东北",
+  "woods4": "东南"
+ }
+}

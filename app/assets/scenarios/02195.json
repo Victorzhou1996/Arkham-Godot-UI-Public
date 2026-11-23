@@ -1,0 +1,9 @@
+{
+  "code": "02195",
+  "name": "血色祭坛",
+  "mapName": "地点总览",
+  "exterior": "act:02199",
+  "cardBackgrounds": true,
+  "endings": {},
+  "_note": "No paintings for the Dunwich Legacy yet: backgrounds are the location cards' art, the scenario picture the first act's art, the map drawn from the core's location layout."
+}

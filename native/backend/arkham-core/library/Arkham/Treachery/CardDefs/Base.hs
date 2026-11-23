@@ -1,0 +1,72 @@
+module Arkham.Treachery.CardDefs.Base where
+
+import Arkham.Card.CardCode
+import Arkham.Card.CardDef
+import Arkham.Card.CardType
+import Arkham.ClassSymbol
+import Arkham.EncounterSet hiding (Byakhee, Dunwich, Poison)
+import Arkham.Id (InvestigatorId)
+import Arkham.Keyword qualified as Keyword
+import Arkham.Name
+import Arkham.Prelude
+
+baseTreachery
+  :: CardCode
+  -> Name
+  -> Maybe (EncounterSet, Int)
+  -> Maybe CardSubType
+  -> CardDef
+baseTreachery cardCode name mEncounterSet isWeakness =
+  (emptyCardDef cardCode name (if isJust isWeakness then PlayerTreacheryType else TreacheryType))
+    { cdCardSubType = isWeakness
+    , cdClassSymbols = if isJust isWeakness then singleton Neutral else mempty
+    , cdEncounterSet = fst <$> mEncounterSet
+    , cdEncounterSetQuantity = snd <$> mEncounterSet
+    , cdRevelation = IsRevelation
+    , cdLevel = Nothing
+    }
+
+{- | A card only legal in one investigator's deck.
+
+Also what 'isSignature' answers, so it is what tells the deck overlay whose
+signatures to take out when it swaps an investigator, and what
+@SignatureTreachery@ / @SignatureEnemy@ match on. A signature weakness needs it
+as much as a signature asset does.
+-}
+signature :: InvestigatorId -> CardDef -> CardDef
+signature iid cd = cd {cdDeckRestrictions = [Signature iid], cdLevel = Nothing}
+
+-- | For the few cards two different investigators both bring.
+signatureOf :: [InvestigatorId] -> CardDef -> CardDef
+signatureOf iids cd = cd {cdDeckRestrictions = map Signature iids, cdLevel = Nothing}
+
+surge :: CardDef -> CardDef
+surge def = def {cdKeywords = insertSet Keyword.Surge (cdKeywords def)}
+
+peril :: CardDef -> CardDef
+peril def = def {cdKeywords = insertSet Keyword.Peril (cdKeywords def)}
+
+hidden :: CardDef -> CardDef
+hidden def = def {cdKeywords = insertSet Keyword.Hidden (cdKeywords def)}
+
+weakness :: CardCode -> Name -> CardDef
+weakness cardCode name = baseTreachery cardCode name Nothing (Just Weakness)
+
+basicWeakness :: CardCode -> Name -> CardDef
+basicWeakness cardCode name =
+  baseTreachery cardCode name Nothing (Just BasicWeakness)
+
+otherSideIs :: CardCode -> CardDef -> CardDef
+otherSideIs cCode def =
+  def
+    { cdDoubleSided = True
+    , cdOtherSide = Just cCode
+    }
+
+treachery :: CardCode -> Name -> EncounterSet -> Int -> CardDef
+treachery cardCode name encounterSet encounterSetQuantity =
+  baseTreachery
+    cardCode
+    name
+    (Just (encounterSet, encounterSetQuantity))
+    Nothing

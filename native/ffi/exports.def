@@ -1,0 +1,8 @@
+LIBRARY arkham_core
+EXPORTS
+ ah_core_init
+ ah_core_call
+ ah_core_result_size
+ ah_core_result_copy
+ ah_core_result_release
+ ah_core_shutdown

@@ -1,0 +1,6 @@
+_ah_core_init
+_ah_core_call
+_ah_core_result_size
+_ah_core_result_copy
+_ah_core_result_release
+_ah_core_shutdown

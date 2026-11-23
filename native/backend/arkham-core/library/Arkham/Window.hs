@@ -1,0 +1,628 @@
+{-# LANGUAGE TemplateHaskell #-}
+
+module Arkham.Window where
+
+import Arkham.Prelude
+
+import Arkham.Ability.Types
+import Arkham.Action (Action)
+import Arkham.Agenda.AdvancementReason (AgendaAdvancementReason)
+import Arkham.Asset.Uses
+import Arkham.Attack.Types
+import Arkham.Card (Card, CardId, EncounterCard)
+import Arkham.ChaosToken.Types (ChaosToken, ChaosTokenFace)
+import Arkham.Damage
+import Arkham.DamageEffect (DamageEffect)
+import Arkham.Deck
+import Arkham.DefeatedBy
+import Arkham.Id
+import Arkham.Key
+import Arkham.Location.FloodLevel
+import Arkham.Matcher (ExtendedCardMatcher, LocationMatcher, MovesVia)
+import Arkham.Phase (Phase)
+import Arkham.Placement
+import Arkham.ScenarioLogKey
+import Arkham.SkillTest.Base
+import Arkham.SkillTest.Step
+import Arkham.SkillTest.Type
+import Arkham.Source (Source (GameSource))
+import Arkham.Strategy (DamageStrategy)
+import Arkham.Target (Target (EnemyTarget, InvestigatorTarget))
+import Arkham.Timing (Timing)
+import Arkham.Timing qualified as Timing
+import Arkham.Token qualified as Token
+import Data.Aeson.TH
+import Data.UUID qualified as UUID
+import GHC.Records
+
+data Result b a = Success a | Failure b
+  deriving stock (Show, Eq, Ord, Data)
+
+data Window = Window
+  { windowTiming :: Timing
+  , windowType :: WindowType
+  , windowBatchId :: Maybe BatchId
+  , windowConditionTick :: Maybe Int
+  {- ^ The window tick at which this window's triggering condition initiated,
+  for windows built ahead of the point where they are checked (e.g. the
+  after-window of an attack, built when the attack starts but checked once
+  it resolves). 'Nothing' means the condition initiated when the window
+  opened. See 'Arkham.Helpers.Action.getActionsWith'.
+  -}
+  }
+  deriving stock (Show, Data)
+
+{- | 'windowConditionTick' is bookkeeping, not identity: two windows that differ
+only by it are the same window. Ability limits compare recorded windows
+against the open ones ('Arkham.Helpers.Ability') and those recordings persist.
+-}
+instance Eq Window where
+  a == b = windowKey a == windowKey b
+
+instance Ord Window where
+  compare = comparing windowKey
+
+windowKey :: Window -> (Timing, WindowType, Maybe BatchId)
+windowKey w = (windowTiming w, windowType w, windowBatchId w)
+
+replaceWindowType :: WindowType -> Window -> Window
+replaceWindowType wType window = window {windowType = wType}
+
+-- | Pin the tick at which this window's triggering condition initiated.
+setWindowConditionTick :: Int -> Window -> Window
+setWindowConditionTick tick window = window {windowConditionTick = Just tick}
+
+instance HasField "timing" Window Timing where
+  getField = windowTiming
+
+instance HasField "kind" Window WindowType where
+  getField = windowType
+
+mkWindow :: Timing -> WindowType -> Window
+mkWindow timing windowType = Window timing windowType Nothing Nothing
+
+mkCancel :: WindowType -> Window
+mkCancel windowType = Window #cancel windowType Nothing Nothing
+
+mkWhen :: WindowType -> Window
+mkWhen windowType = Window #when windowType Nothing Nothing
+
+mkAtIf :: WindowType -> Window
+mkAtIf windowType = Window #at windowType Nothing Nothing
+
+mkAfter :: WindowType -> Window
+mkAfter windowType = Window #after windowType Nothing Nothing
+
+getBatchId :: [Window] -> BatchId
+getBatchId ws = case getMaybeBatchId ws of
+  Just batchId -> batchId
+  Nothing -> error "No BatchId found in windows"
+
+getMaybeBatchId :: [Window] -> Maybe BatchId
+getMaybeBatchId ((windowBatchId -> Just batchId) : _) = Just batchId
+getMaybeBatchId (_ : rest) = getMaybeBatchId rest
+getMaybeBatchId [] = Nothing
+
+duringTurnWindow :: InvestigatorId -> Window
+duringTurnWindow = mkWindow Timing.When . DuringTurn
+
+defaultWindows :: InvestigatorId -> [Window]
+defaultWindows iid =
+  [ duringTurnWindow iid
+  , mkWindow Timing.When NonFast
+  , mkWindow Timing.When FastPlayerWindow
+  ]
+
+{- | Whether an eliminated seat should still process this window check.
+
+It must see the end of the game and its OWN elimination -- 'defeatedL' is set in
+the same handler that pushes that window -- but another investigator's
+elimination is none of its business: it would pick up every initiation in that
+window with no @You@ affinity, e.g. the resigning investigator's own weakness or
+an act's @Objective $ forced AnyWindow@. #5812
+-}
+hasOwnEliminatedWindow :: InvestigatorId -> [Window] -> Bool
+hasOwnEliminatedWindow iid = any $ \case
+  (windowType -> InvestigatorEliminated iid') -> iid' == iid
+  -- Defeat applies its trauma on the way out, so this window belongs to an
+  -- investigator who is already defeated by the time it resolves.
+  (windowType -> SufferedTrauma iid' _ _) -> iid' == iid
+  (windowType -> EndOfGame {}) -> True
+  _ -> False
+
+{- | Windows that fire constantly during scenario setup as locations and clues
+are placed, but which cannot trigger any abilities while @gameInSetup@ is
+@True@. Used by 'Arkham.Game.runMessages' to drop their CheckWindows before
+the heavy modifier preload pipeline.
+-}
+isSetupSkippableWindow :: Window -> Bool
+isSetupSkippableWindow w = case windowType w of
+  PutLocationIntoPlay {} -> True
+  PutLocationIntoPlayByGroup {} -> True
+  LocationEntersPlay {} -> True
+  PlacedToken _ _ Clue _ -> True
+  _ -> False
+
+isEnemyReadyWindow :: Window -> Bool
+isEnemyReadyWindow w = case windowType w of
+  WouldReady (EnemyTarget _) -> True
+  Readies (EnemyTarget _) -> True
+  _ -> False
+
+primaryWindowTarget :: WindowType -> Maybe Target
+primaryWindowTarget = \case
+  Healed _ target _ _ -> Just target
+  TakeDamage _ _ target _ -> Just target
+  TakeHorror _ target _ -> Just target
+  DealtHorror _ target _ -> Just target
+  DealtDamage _ _ target _ -> Just target
+  _ -> Nothing
+
+{- | The timing points a matched window list holds, for splitting a forced ability's
+initiations (@runWindow@ in "Arkham.Investigator.Runner").
+
+A forced ability initiates once per timing point, and one check can carry several
+(@simultaneously@ merges one 'DealtDamage' window per enemy for Storm of Spirits). But the
+damage and the horror one source deals to one target are a __single__ point: "when X is
+dealt damage or horror" is one trigger that sees both halves. Splitting them made Spectral
+Shield offer two identical target buttons, then cancel damage without asking, then trigger
+again for the horror (#5785). Grouping by source and target keeps "damage dealt to __an__
+asset" initiating once per asset.
+
+'DealtExcessDamage' is deliberately not grouped -- it is its own timing point.
+-}
+windowEventGroups :: [Window] -> [[Window]]
+windowEventGroups = go
+ where
+  go [] = []
+  go (w : rest) = case damageEventKey w of
+    Nothing -> [w] : go rest
+    Just k -> let (same, others) = partition ((== Just k) . damageEventKey) rest in (w : same) : go others
+  damageEventKey w =
+    (windowTiming w,) <$> case windowType w of
+      DealtDamage source _ target _ -> Just (source, target)
+      DealtHorror source target _ -> Just (source, target)
+      TakeDamage source _ target _ -> Just (source, target)
+      TakeHorror source target _ -> Just (source, target)
+      _ -> Nothing
+
+revealedChaosTokens :: [Window] -> [ChaosToken]
+revealedChaosTokens [] = []
+revealedChaosTokens ((windowType -> RevealChaosToken _ token) : rest) = token : revealedChaosTokens rest
+revealedChaosTokens (_ : rest) = revealedChaosTokens rest
+
+pattern PlacedDoom :: Source -> Target -> Int -> WindowType
+pattern PlacedDoom source target n <- PlacedToken source target Doom n
+  where
+    PlacedDoom source target n = PlacedToken source target Doom n
+
+pattern PlacedClues :: Source -> Target -> Int -> WindowType
+pattern PlacedClues source target n <- PlacedToken source target Clue n
+  where
+    PlacedClues source target n = PlacedToken source target Clue n
+
+pattern PlacedResources :: Source -> Target -> Int -> WindowType
+pattern PlacedResources source target n <- PlacedToken source target Token.Resource n
+  where
+    PlacedResources source target n = PlacedToken source target Token.Resource n
+
+pattern PlacedHorror :: Source -> Target -> Int -> WindowType
+pattern PlacedHorror source target n <- PlacedToken source target Horror n
+  where
+    PlacedHorror source target n = PlacedToken source target Horror n
+
+pattern PlacedDamage :: Source -> Target -> Int -> WindowType
+pattern PlacedDamage source target n <- PlacedToken source target Damage n
+  where
+    PlacedDamage source target n = PlacedToken source target Damage n
+
+data IsDirect = IsDirect | IsNonDirect
+  deriving stock (Show, Eq, Data)
+
+data CardPlay = CardPlay
+  { cardPlayedCard :: Card
+  , cardPlayedNeedsAction :: Bool
+  }
+  deriving stock (Show, Ord, Eq, Data)
+
+instance HasField "card" CardPlay Card where
+  getField = cardPlayedCard
+
+instance HasField "needsAction" CardPlay Bool where
+  getField = cardPlayedNeedsAction
+
+data WindowType
+  = AttemptToEvadeEnemy SkillTestId InvestigatorId EnemyId
+  | AttemptToFightEnemy SkillTestId InvestigatorId EnemyId
+  | ResolvingRevelation InvestigatorId TreacheryId
+  | VehicleLeaves AssetId LocationId
+  | VehicleEnters AssetId LocationId
+  | VehicleWouldEnter AssetId LocationId
+  | {- | An increase to this location's flood level is about to be applied. Raised
+    whether or not the level can actually change, so an ability that answers "when
+    its flood level would be increased" still gets its chance on a location that is
+    already at its maximum -- 'FloodLevelChanged' only fires when the level moves.
+    -}
+    WouldIncreaseFloodLevel LocationId FloodLevel FloodLevel
+  | FloodLevelChanged LocationId FloodLevel FloodLevel
+  | FloodLevelIncreased LocationMatcher
+  | FirstTimeParleyingThisRound InvestigatorId
+  | AttachCard (Maybe InvestigatorId) Card Target
+  | ActAdvance ActId
+  | ActivateAbility InvestigatorId [Window] Ability
+  | CardRescued InvestigatorId Card
+  | AddedToVictory (Maybe InvestigatorId) Card
+  | AgendaAdvance AgendaId
+  | AgendaWouldAdvance AgendaAdvancementReason AgendaId
+  | AllDrawEncounterCard
+  | -- | A card an investigator drew has gained surge, and that surge is resolving.
+    GainedSurge InvestigatorId Source
+  | AfterCheckDoomThreshold
+  | AllUndefeatedInvestigatorsResigned
+  | AmongSearchedCards BatchId InvestigatorId
+  | AnyPhaseBegins
+  | AssetDefeated AssetId DefeatedBy
+  | AssignedHorror Source InvestigatorId [Target]
+  | AtBeginningOfRound
+  | AtEndOfRound
+  | GameBegins
+  | SkillTestStep SkillTestStep
+  | ChosenRandomLocation LocationId
+  | CommittedCard InvestigatorId Card
+  | CommittedCards InvestigatorId [Card]
+  | CommittingCardsFromHandToSkillTestStep InvestigatorId
+  | DealtDamage Source DamageEffect Target Int
+  | DealtExcessDamage Source DamageEffect Target Int
+  | DealtHorror Source Target Int
+  | DeckHasNoCards InvestigatorId
+  | EncounterDeckRunsOutOfCards
+  | Discarded (Maybe InvestigatorId) Source Card
+  | DiscardedFromHand InvestigatorId Source Card
+  | {- | Fired once after a batch of cards has been discarded from hand. Cards that
+    care about discarding "1 or more cards" hang off this rather than the
+    per-card 'DiscardedFromHand' window, which opens once per card.
+    -}
+    DiscardedFromHandBatch InvestigatorId Source [Card]
+  | DiscardedFromDeck InvestigatorId Source Card
+  | WouldDiscardFromHand InvestigatorId Source
+  | WouldDiscardFromDeck InvestigatorId Source
+  | {- | Fired once, before any card leaves the encounter deck, carrying the
+    number of cards about to be discarded. Responders that change how many
+    cards are discarded hang off this rather than the per-card 'Discarded'
+    window, so the whole discard stays a single batch.
+    -}
+    WouldDiscardTopOfEncounterDeck InvestigatorId Source Int
+  | -- | Fired once after a batch of cards has been discarded from the top of the encounter deck.
+    DiscardedTopOfEncounterDeckBatch InvestigatorId Source [EncounterCard]
+  | DiscoverClues InvestigatorId LocationId Source Int
+  | WouldDiscoverClues InvestigatorId LocationId DiscoverId Source Int
+  | SpentClues InvestigatorId Int
+  | DiscoveringLastClue InvestigatorId LocationId
+  | SuccessfullyInvestigateWithNoClues InvestigatorId LocationId
+  | WouldDrawCard InvestigatorId CardDrawId DeckSignifier
+  | WouldDrawExactlyOneCard InvestigatorId CardDrawId DeckSignifier
+  | DrawCard InvestigatorId Card DeckSignifier
+  | DrawCards InvestigatorId [Card]
+  | DrewCardsFromOwnDeck InvestigatorId
+  | DrawChaosToken InvestigatorId ChaosToken
+  | DrawingStartingHand InvestigatorId
+  | DuringTurn InvestigatorId
+  | EndOfGame
+  | WouldEndTurn InvestigatorId
+  | EndTurn InvestigatorId
+  | TreacheryEntersPlay TreacheryId
+  | EnemyAttacked InvestigatorId Source EnemyId
+  | EnemyAttacks EnemyAttackDetails
+  | EnemyAttacksEvenIfCancelled EnemyAttackDetails
+  | EnemyAttemptsToSpawnAt EnemyId LocationMatcher
+  | EnemyDefeated (Maybe InvestigatorId) DefeatedBy EnemyId
+  | IfEnemyDefeated (Maybe InvestigatorId) DefeatedBy EnemyId
+  | EnemyEngaged InvestigatorId EnemyId
+  | EnemyDisengaged InvestigatorId EnemyId
+  | EnemyWouldEngage InvestigatorId EnemyId
+  | EnemyEnters EnemyId LocationId
+  | {- | Fires when an enemy enters a location where the given investigator
+    was already present (i.e. NOT a simultaneous entry such as an engaged
+    enemy following the investigator). Use this in matchers whose flavour
+    is "an enemy entered MY location" — Pursued, Cash Cart, etc.
+    -}
+    EnemyEntersYourLocation InvestigatorId EnemyId LocationId
+  | EnemyEvaded InvestigatorId EnemyId
+  | {- | Batched "would" window fired immediately before an evasion resolves,
+    around the @Do (EnemyEvaded)@ that exhausts and disengages the enemy.
+    Cancelling its batch replaces the evasion: the enemy neither exhausts nor
+    disengages, and the @EnemyEvaded@ windows never fire.
+    -}
+    EnemyWouldBeEvaded InvestigatorId EnemyId
+  | EnemyLeaves EnemyId LocationId
+  | EnemyWouldSpawnAt EnemyId LocationId
+  | EnemySpawns EnemyId Placement
+  | EnemyFlipped EnemyId
+  | EnemyPlaced EnemyId Placement
+  | EnemyWouldAttack EnemyAttackDetails
+  | EnemyWouldBeDefeated EnemyId
+  | EnterPlay Target
+  | Entering InvestigatorId LocationId
+  | {- | Fired alongside the after-@Entering@ window, but only when the
+    investigator entered a location that had one or more enemies at the moment
+    of entry. Because enemies engage (and can be defeated) before the
+    after-entering window resolves, the @Entering@ window's current-state enemy
+    check is unreliable for "after you enter a location with 1+ enemies"
+    triggers (e.g. On Their Heels). This window snapshots that condition at
+    entry. See #4813.
+    -}
+    EnteringLocationWithEnemy InvestigatorId LocationId
+  | Exhausts Target
+  | FailAttackEnemy InvestigatorId EnemyId Int
+  | FailEvadeEnemy InvestigatorId EnemyId Int
+  | FailInvestigationSkillTest InvestigatorId LocationId Int
+  | FailSkillTest InvestigatorId Int
+  | FailSkillTestAtOrLess InvestigatorId Int
+  | FastPlayerWindow
+  | GainsActions InvestigatorId Source Int
+  | GainsClues InvestigatorId Source Int
+  | GainsResources InvestigatorId Source Int
+  | SpendsResources InvestigatorId Int
+  | Healed DamageType Target Source Int
+  | InDiscardWindow InvestigatorId Window
+  | InHandWindow InvestigatorId Window
+  | InitiatedSkillTest SkillTest
+  | InvestigatorDefeated DefeatedBy InvestigatorId
+  | InvestigatorWouldBeDefeated DefeatedBy InvestigatorId
+  | InvestigatorEliminated InvestigatorId
+  | InvestigatorResigned InvestigatorId
+  | -- | Physical then mental, as 'Arkham.Message.SufferTrauma' carries them.
+    SufferedTrauma InvestigatorId Int Int
+  | LastClueRemovedFromAsset AssetId
+  | LastClueRemovedFromLocation LocationId
+  | LeavePlay Target
+  | Leaving InvestigatorId LocationId
+  | MoveAction InvestigatorId LocationId LocationId
+  | MovedButBeforeEnemyEngagement InvestigatorId LocationId
+  | MovedBy Source LocationId InvestigatorId
+  | MovedFromHunter EnemyId
+  | WouldMoveFromHunter EnemyId
+  | WouldPatrol EnemyId
+  | EnemyMovesTo LocationId MovesVia EnemyId
+  | EnemyMoves EnemyId LocationId
+  | HuntersMoveStep
+  | Moves InvestigatorId Source (Maybe LocationId) LocationId MovementId
+  | WouldMove InvestigatorId Source LocationId LocationId
+  | EnemyWouldMove EnemyId Source LocationId LocationId
+  | NonFast
+  | PassInvestigationSkillTest InvestigatorId LocationId Int
+  | PassSkillTest (Maybe Action) Source InvestigatorId Int
+  | PerformAction InvestigatorId Action
+  | PerformedSameTypeOfAction InvestigatorId [Action]
+  | PerformedDifferentTypesOfActionsInARow InvestigatorId Int [[Action]]
+  | PhaseBegins Phase
+  | PhaseEnds Phase
+  | PlaceUnderneath Target Card
+  | PlacedToken Source Target Token Int
+  | PlacedDoomCounterOnTargetWithNoDoom Source Target Int
+  | InvestigatorPlacedFromTheirPool InvestigatorId Source Target Token Int
+  | SpentToken Source Target Token Int
+  | AttackOrEffectSpentLastUse Source Target Token
+  | LostResources InvestigatorId Source Int
+  | LostActions InvestigatorId Source Int
+  | WouldPlaceDoom Source Target Int
+  | WouldPlaceClueOnLocation InvestigatorId LocationId Source Int
+  | TakeControlOfClues InvestigatorId Source Int
+  | TakeControlOfKey InvestigatorId ArkhamKey
+  | WouldAddChaosTokensToChaosBag (Maybe InvestigatorId) [ChaosTokenFace]
+  | DeckWouldRunOutOfCards InvestigatorId
+  | WouldSearchDeck InvestigatorId DeckSignifier
+  | {- | A search, reveal or discard that digs through the encounter deck for a
+    card is about to resolve: who is doing it, the card that sent it, and the
+    matcher it was given, which is what it is looking for. Raised inside a
+    batch, so an ability worded "instead" can cancel it.
+    -}
+    WouldFindEncounterCard InvestigatorId Target ExtendedCardMatcher
+  | WouldLookAtDeck InvestigatorId DeckSignifier
+  | SearchedDeck InvestigatorId DeckSignifier
+  | LookedAtDeck InvestigatorId DeckSignifier
+  | PlacedBreaches Target -- BEGIN Breaches
+  | PlacedBreach Target
+  | WouldPlaceBreaches Target
+  | WouldPlaceBreach Target
+  | RemovedBreaches Target
+  | RemovedBreach Target
+  | WouldRemoveBreaches Target
+  | WouldRemoveBreach Target -- END Breaches
+  | WouldPayCardCost InvestigatorId ActiveCostId BatchId Card
+  | PlayCard InvestigatorId CardPlay
+  | PlayEventDiscarding InvestigatorId EventId
+  | PlayEvent InvestigatorId EventId
+  | PlayAsset InvestigatorId AssetId
+  | PutLocationIntoPlay InvestigatorId LocationId
+  | {- | A location put into play or revealed with no specific investigator behind
+    it, i.e. by an act, agenda or other scenario card. "Because acts and agendas
+    are advanced by the players, as a group, each investigator is considered to
+    have put the location(s) into play", so these carry no investigator and the
+    'Arkham.Matcher.PutLocationIntoPlay' / 'Arkham.Matcher.RevealLocation'
+    matchers resolve their @Who@ against whoever is being asked.
+    -}
+    PutLocationIntoPlayByGroup LocationId
+  | LocationEntersPlay LocationId
+  | RevealLocation InvestigatorId LocationId
+  | RevealLocationByGroup LocationId
+  | RevealLocationForcedAbilities InvestigatorId LocationId (Maybe LocationId)
+  | UnrevealedRevealLocation InvestigatorId LocationId
+  | UnrevealedRevealLocationByGroup LocationId
+  | FlipLocation InvestigatorId LocationId
+  | RevealChaosToken InvestigatorId ChaosToken
+  | RevealChaosTokensDuringSkillTest InvestigatorId SkillTest [ChaosToken]
+  | TokensWouldBeRemovedFromChaosBag [ChaosToken]
+  | ResolvesTreachery InvestigatorId TreacheryId
+  | {- | A story card being resolved by the investigator who read it. Raised at
+    both timings around the story's own resolution: @#when@ before its effects,
+    @#after@ once they have resolved -- and after its skill test, if resolving it
+    started one. Both fire while the story is still in play, so a
+    'Arkham.Matcher.StoryMatcher' can still read its traits. Declining to resolve
+    a story (@DoNotResolveIt@) raises neither.
+    -}
+    ResolvesStory InvestigatorId StoryId
+  | ResolvesChaosToken InvestigatorId ChaosToken
+  | ChaosTokenSealed InvestigatorId ChaosToken
+  | {- | Raised on the investigator the token is sealed ON, whoever sealed it.
+    'ChaosTokenSealed' instead names the investigator who did the sealing, and
+    fires for seals onto their assets too.
+    -}
+    ChaosTokenSealedOn InvestigatorId ChaosToken
+  | {- | Raised on the card the token was sealed on, whichever card that is: an
+    investigator card, but also an enemy, asset, location, treachery or skill.
+    -}
+    ChaosTokenReleased Target ChaosToken
+  | IgnoreChaosToken InvestigatorId ChaosToken
+  | CancelChaosToken InvestigatorId ChaosToken
+  | RevealChaosTokenEffect InvestigatorId ChaosToken EffectId
+  | RevealChaosTokenEventEffect InvestigatorId [ChaosToken] EventId
+  | RevealChaosTokenSkillEffect InvestigatorId [ChaosToken] SkillId
+  | RevealChaosTokenTreacheryEffect InvestigatorId [ChaosToken] TreacheryId
+  | RevealChaosTokenAssetAbilityEffect InvestigatorId [ChaosToken] AssetId
+  | RevealChaosTokenWithNegativeModifier InvestigatorId ChaosToken
+  | WouldPerformRevelationSkillTest InvestigatorId SkillTestId
+  | SpentUses InvestigatorId Source AssetId UseType Int
+  | SkillTest SkillTestType
+  | SkillTestEnded SkillTest
+  | SuccessfulAttackEnemy InvestigatorId Source EnemyId Int
+  | SuccessfulEvadeEnemy InvestigatorId Source EnemyId Int
+  | SuccessfulInvestigation InvestigatorId LocationId
+  | SuccessfulParley InvestigatorId
+  | TakeDamage Source DamageEffect Target Int
+  | TakeHorror Source Target Int
+  | TookControlOfAsset InvestigatorId AssetId
+  | TurnBegins InvestigatorId
+  | TurnEnds InvestigatorId
+  | WouldBeDiscarded Target
+  | EntityDiscarded Source Target
+  | WouldBeShuffledIntoDeck DeckSignifier Card
+  | WouldDrawEncounterCard InvestigatorId CardDrawId Phase
+  | WouldFailSkillTest InvestigatorId Int
+  | WouldPassSkillTest InvestigatorId Int
+  | WouldReady Target
+  | Readies Target
+  | WouldRevealChaosToken Source InvestigatorId
+  | WouldRevealChaosTokens Source InvestigatorId
+  | WouldTakeDamage Source Target Int DamageStrategy
+  | WouldTakeDamageOrHorror Source Target Int Int
+  | WouldTakeHorror Source Target Int
+  | Explored InvestigatorId (Maybe LocationId) (Result Card LocationId)
+  | AttemptExplore InvestigatorId (Maybe LocationId)
+  | EnemiesAttackStep
+  | AddingToCurrentDepth
+  | EntersThreatArea InvestigatorId Card
+  | CancelledOrIgnoredCardOrGameEffect Source (Maybe CardId) -- Diana Stanley
+  | ScenarioCountIncremented ScenarioCountKey
+  | ScenarioCountDecremented ScenarioCountKey
+  | RememberedLogKey ScenarioLogKey
+  | IncreasedAlarmLevel InvestigatorId
+  | ScenarioEvent Text (Maybe InvestigatorId) Value
+  | CampaignEvent Text (Maybe InvestigatorId) Value
+  | -- used to avoid checking a window
+    DoNotCheckWindow
+  deriving stock (Show, Eq, Ord, Data)
+
+mconcat
+  [ deriveJSON defaultOptions ''IsDirect
+  , deriveJSON defaultOptions ''CardPlay
+  , deriveJSON defaultOptions ''Result
+  , deriveToJSON defaultOptions ''WindowType
+  , [d|
+      instance FromJSON WindowType where
+        parseJSON = withObject "WindowType" \o -> do
+          tag :: Text <- o .: "tag"
+          case tag of
+            "WouldDiscoverClues" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left (a, b, c, d) -> pure $ WouldDiscoverClues a b (DiscoverId UUID.nil) c d
+                Right (a, b, c, d, e) -> pure $ WouldDiscoverClues a b c d e
+            "AttemptExplore" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left i -> pure $ AttemptExplore i Nothing
+                Right (i, c) -> pure $ AttemptExplore i c
+            "AddedToVictory" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left c -> pure $ AddedToVictory Nothing c
+                Right (i, c) -> pure $ AddedToVictory i c
+            "Moves" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left (i, s, md1, d1) -> pure $ Moves i s md1 d1 (MovementId UUID.nil)
+                Right (i, s, md1, d1, mId) -> pure $ Moves i s md1 d1 mId
+            "SuccessfulEvadeEnemy" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left (i, e, n) -> pure $ SuccessfulEvadeEnemy i GameSource e n
+                Right (i, s, e, n) -> pure $ SuccessfulEvadeEnemy i s e n
+            "WouldDrawCard" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Right (i, cid, deck) -> pure $ WouldDrawCard i cid deck
+                Left (i, deck) -> pure $ WouldDrawCard i (CardDrawId UUID.nil) deck
+            "WouldDrawEncounterCard" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Right (i, cid, p) -> pure $ WouldDrawEncounterCard i cid p
+                Left (i, p) -> pure $ WouldDrawEncounterCard i (CardDrawId UUID.nil) p
+            "CancelledOrIgnoredCardOrGameEffect" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left a -> pure $ CancelledOrIgnoredCardOrGameEffect a Nothing
+                Right (a, b) -> pure $ CancelledOrIgnoredCardOrGameEffect a b
+            "Explored" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left (a, b) -> pure $ Explored a Nothing b
+                Right (a, b, c) -> pure $ Explored a b c
+            "DeckRanOutOfCards" -> DeckHasNoCards <$> o .: "contents"
+            "ScenarioEvent" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left (a, b) -> pure $ ScenarioEvent a Nothing b
+                Right (a, b, c) -> pure $ ScenarioEvent a b c
+            "AttemptToEvadeEnemy" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left (i, e) -> pure $ AttemptToEvadeEnemy (SkillTestId UUID.nil) i e
+                Right (sid, i, e) -> pure $ AttemptToEvadeEnemy sid i e
+            "PlayCard" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left (i, c) -> pure $ PlayCard i (CardPlay c True)
+                Right (i, cp) -> pure $ PlayCard i cp
+            "WouldAddChaosTokensToChaosBag" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Left cs -> pure $ WouldAddChaosTokensToChaosBag Nothing cs
+                Right (i, cs) -> pure $ WouldAddChaosTokensToChaosBag i cs
+            -- Used to carry the LocationId spawned at; a spawn into the
+            -- shadows has no location, so it carries the placement (#5649).
+            "EnemySpawns" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Right (eid, placement) -> pure $ EnemySpawns eid placement
+                Left (eid, lid) -> pure $ EnemySpawns eid (AtLocation lid)
+            -- Used to carry the investigator whose card held the token; a
+            -- seal lives on any card type, so it carries that card's target.
+            "ChaosTokenReleased" -> do
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Right (t, token) -> pure $ ChaosTokenReleased t token
+                Left (iid, token) -> pure $ ChaosTokenReleased (InvestigatorTarget iid) token
+            "PerformedDifferentTypesOfActionsInARow" -> do
+              -- New shape carries the per-action type groups ([[Action]]); old
+              -- saves carry a single flattened SDR ([Action]). Treat each legacy
+              -- action as its own singleton group.
+              contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+              case contents of
+                Right (i, n, groups) -> pure $ PerformedDifferentTypesOfActionsInARow i n groups
+                Left (i, n, as) -> pure $ PerformedDifferentTypesOfActionsInARow i n (map (: []) as)
+            _ -> $(mkParseJSON defaultOptions ''WindowType) (Object o)
+      |]
+  , deriveJSON defaultOptions ''Window
+  , makePrisms ''WindowType
+  ]

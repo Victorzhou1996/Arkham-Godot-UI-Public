@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Rules probe: answers the rules core step by step from the command line (card interaction checks).
+       Build: powershell -File tools/rules-probe/build.ps1   Run: tools/rules-probe/bin/RulesProbe.exe -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><AssemblyName>RulesProbe</AssemblyName>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>ArkhamUI</RootNamespace>
+    <NoWarn>CS8618;CS1998;CS8602;CS8604;CS8600</NoWarn>
+    <OutputPath>bin\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../engine/Gathering.Engine.csproj" />
+    <Reference Include="Arkham.NativeHost"><HintPath>../../runtime/Arkham.NativeHost.dll</HintPath></Reference>
+    <Compile Include="*.cs" /><Compile Include="../sim/SimSupport.cs" /><Compile Include="../sim/CampaignReward.cs" />
+    <!-- the game's own AI and table model, shared source (AiHostGodot.cs is the game-only part) -->
+    <Compile Include="../../app/Scripts/AI/*.cs" Exclude="../../app/Scripts/AI/AiHostGodot.cs" />
+    <Compile Include="../../app/Scripts/Table/TableModel.cs" />
+  </ItemGroup>
+</Project>

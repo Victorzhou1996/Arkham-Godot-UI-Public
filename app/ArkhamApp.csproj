@@ -1,0 +1,40 @@
+<Project Sdk="Godot.NET.Sdk/4.5.1">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseSharedCompilation>false</UseSharedCompilation>
+    <RootNamespace>ArkhamUI</RootNamespace>
+    <NoWarn>CS8618;CS1998</NoWarn>
+  </PropertyGroup>
+  <!-- EOS (Epic Online Services). The SDK's C# sources and native library come from the SDK folder, not the repo. EosSdkDir
+       defaults to %USERPROFILE%\.arkham\eos-sdk-1.19.2.1 (Windows); on macOS pass -p:EosSdkDir=<absolute path>. Without the SDK
+       the game builds with ARKHAM_EOS off and online play stays disabled. -->
+  <PropertyGroup>
+    <EosSdkDir Condition="'$(EosSdkDir)' == ''">$(USERPROFILE)\.arkham\eos-sdk-1.19.2.1</EosSdkDir>
+    <ArkhamEos Condition="Exists('$(EosSdkDir)\SDK\Source\Core')">true</ArkhamEos>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(ArkhamEos)' == 'true'">
+    <DefineConstants>$(DefineConstants);ARKHAM_EOS</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(ArkhamEos)' == 'true' And !$([MSBuild]::IsOSPlatform('OSX'))">
+    <DefineConstants>$(DefineConstants);EOS_PLATFORM_WINDOWS_64</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(ArkhamEos)' == 'true' And $([MSBuild]::IsOSPlatform('OSX'))">
+    <DefineConstants>$(DefineConstants);EOS_PLATFORM_OSX</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(ArkhamEos)' == 'true'">
+    <Compile Include="$(EosSdkDir)\SDK\Source\Core\**\*.cs" />
+    <Compile Include="$(EosSdkDir)\SDK\Source\Generated\**\*.cs" Exclude="$(EosSdkDir)\SDK\Source\Generated\Android\**;$(EosSdkDir)\SDK\Source\Generated\IOS\**" />
+    <None Condition="!$([MSBuild]::IsOSPlatform('OSX'))" Include="$(EosSdkDir)\SDK\Bin\EOSSDK-Win64-Shipping.dll" Link="EOSSDK-Win64-Shipping.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Condition="$([MSBuild]::IsOSPlatform('OSX'))" Include="$(EosSdkDir)/SDK/Bin/libEOSSDK-Mac-Shipping.dylib" Link="libEOSSDK-Mac-Shipping.dylib" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../engine/Gathering.Engine.csproj" />
+    <Reference Include="Arkham.NativeHost"><HintPath>../runtime/Arkham.NativeHost.dll</HintPath></Reference>
+    <!-- the JS engine that runs arkham.build's rules (app/assets/build-engine/engine.js); DLLs from nuget.org, kept in app/lib -->
+    <Reference Include="Jint"><HintPath>lib/Jint.dll</HintPath></Reference>
+    <Reference Include="Acornima"><HintPath>lib/Acornima.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

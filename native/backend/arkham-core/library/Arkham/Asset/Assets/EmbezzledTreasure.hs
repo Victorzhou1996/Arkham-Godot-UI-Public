@@ -1,0 +1,76 @@
+module Arkham.Asset.Assets.EmbezzledTreasure (embezzledTreasure) where
+
+import Arkham.Ability
+import Arkham.Asset.Cards qualified as Cards
+import Arkham.Asset.Import.Lifted hiding (InvestigatorEliminated)
+import Arkham.I18n
+import Arkham.Investigator.Types (Field (InvestigatorName, InvestigatorResources))
+import Arkham.Matcher
+import Arkham.Modifier
+import Arkham.Name (toTitle)
+import Arkham.Projection
+import Arkham.Token
+
+newtype EmbezzledTreasure = EmbezzledTreasure AssetAttrs
+  deriving anyclass (IsAsset, HasModifiersFor)
+  deriving newtype (Show, Eq, ToJSON, FromJSON, Entity)
+
+embezzledTreasure :: AssetCard EmbezzledTreasure
+embezzledTreasure = asset EmbezzledTreasure Cards.embezzledTreasure
+
+instance HasAbilities EmbezzledTreasure where
+  getAbilities (EmbezzledTreasure a) =
+    [ controlled a 1 (youExist InvestigatorWithAnyResources <> resourceRestriction)
+        $ FastAbility (exhaust a)
+    , -- Resigning and then ending the scenario opens both windows, and a forced
+      -- ability's default per-window limit does not dedupe across them.
+      onlyOnce
+        $ controlled a 2 requiredResources
+        $ forced
+        $ oneOf [GameEnds #when, InvestigatorEliminated #when You]
+    ]
+   where
+    resourceRestriction = if a.use #resource >= 10 then Never else NoRestriction
+    requiredResources = if a.use #resource >= 2 then NoRestriction else Never
+
+{- | Who can be handed starting resources.
+
+The outer 'IncludeEliminated' is load bearing: 'affectsOthersKnown' wraps the matcher
+in 'InvestigatorIfThenKnown', which the select's eliminated check does not look
+inside, so the inner hint alone leaves the candidate list pre-filtered to
+uneliminated investigators — empty once the game has ended.
+-}
+startingResourceTargets :: InvestigatorId -> InvestigatorMatcher
+startingResourceTargets iid =
+  IncludeEliminated $ affectsOthersKnown iid $ IncludeEliminated Anyone <> not_ KilledInvestigator
+
+instance RunMessage EmbezzledTreasure where
+  runMessage msg a@(EmbezzledTreasure attrs) = runQueueT $ case msg of
+    UseThisAbility iid (isSource attrs -> True) 1 -> do
+      resources <- field InvestigatorResources iid
+      if resources > 1 || attrs.use Resource == 9
+        then withI18n $ chooseAmount iid "resources" "$resources" 1 2 attrs
+        else moveTokens (attrs.ability 1) (ResourceSource iid) attrs #resource 1
+      pure a
+    ResolveAmounts iid (getChoiceAmount "$resources" -> n) (isTarget attrs -> True) -> do
+      moveTokens (attrs.ability 1) (ResourceSource iid) attrs #resource n
+      pure a
+    UseThisAbility iid (isSource attrs -> True) 2 -> do
+      let total = attrs.use Resource `div` 2
+      investigators <- select $ startingResourceTargets iid
+      named <- forToSnd investigators \i -> toTitle <$> field InvestigatorName i
+      chooseAmounts
+        iid
+        "Distribute starting resources"
+        (TotalAmountTarget total)
+        [(name, (0, total)) | (_, name) <- named]
+        (ProxyTarget (toTarget attrs) (toTarget attrs))
+      pure a
+    ResolveAmounts iid choices (ProxyTarget (isTarget attrs -> True) _) -> do
+      investigators <- select $ startingResourceTargets iid
+      named <- forToSnd investigators \i -> toTitle <$> field InvestigatorName i
+      for_ named \(iid', name) -> do
+        let n = getChoiceAmount name choices
+        when (n > 0) $ setupModifier (attrs.ability 2) iid' (StartingResources n)
+      pure a
+    _ -> EmbezzledTreasure <$> liftRunMessage msg attrs

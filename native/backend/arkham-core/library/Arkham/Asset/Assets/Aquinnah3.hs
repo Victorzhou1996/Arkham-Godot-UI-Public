@@ -1,0 +1,43 @@
+module Arkham.Asset.Assets.Aquinnah3 (aquinnah3) where
+
+import Arkham.Ability
+import Arkham.Asset.Cards qualified as Cards
+import Arkham.Asset.Import.Lifted
+import Arkham.Attack.Types
+import Arkham.Enemy.Types (Field (EnemyHealthDamage))
+import Arkham.Helpers.Window
+import Arkham.Matcher hiding (NonAttackDamageEffect)
+import Arkham.Matcher qualified as Matcher
+import Arkham.Message.Lifted.Choose
+import Arkham.Projection
+
+newtype Aquinnah3 = Aquinnah3 AssetAttrs
+  deriving anyclass (IsAsset, HasModifiersFor)
+  deriving newtype (Show, Eq, ToJSON, FromJSON, Entity)
+
+aquinnah3 :: AssetCard Aquinnah3
+aquinnah3 = ally Aquinnah3 Cards.aquinnah3 (1, 4)
+
+instance HasAbilities Aquinnah3 where
+  getAbilities (Aquinnah3 a) =
+    [ controlledAbility a 1 (canDamageEnemyAt (a.ability 1) YourLocation)
+        $ triggered
+          (Matcher.EnemyAttacks #when You AnyEnemyAttack AnyEnemy)
+          (exhaust a <> horrorCost a 1)
+    ]
+
+instance RunMessage Aquinnah3 where
+  runMessage msg a@(Aquinnah3 attrs) = runQueueT $ case msg of
+    -- "instead" makes this a replacement effect: the attack still resolves, its
+    -- damage just lands on another enemy when it does. Registering it on the
+    -- attack rather than dealing it here means a later Dodge cancels the whole
+    -- thing, redirected damage included.
+    UseCardAbility _ (isSource attrs -> True) 1 (getAttackDetails -> attack) _ -> do
+      updateAttackDetails attack \details ->
+        details {attackDealDamage = False, attackDamageReplacement = [DoStep 1 msg]}
+      pure a
+    DoStep 1 (UseCardAbility iid (isSource attrs -> True) 1 (getAttackDetails -> attack) _) -> do
+      healthDamage' <- field EnemyHealthDamage attack.enemy
+      chooseDamageEnemy iid (attrs.ability 1) (locationWithInvestigator iid) AnyEnemy healthDamage'
+      pure a
+    _ -> Aquinnah3 <$> liftRunMessage msg attrs

@@ -1,0 +1,4 @@
+{
+  "_note": "hand-checked focus for portraits the detector gets wrong: [fx, fy, face height] as fractions of the picture",
+  "90078": [0.42, 0.30, 0.13]
+}

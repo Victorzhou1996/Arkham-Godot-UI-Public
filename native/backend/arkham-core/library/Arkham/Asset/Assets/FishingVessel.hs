@@ -1,0 +1,43 @@
+module Arkham.Asset.Assets.FishingVessel (fishingVessel) where
+
+import Arkham.Ability
+import Arkham.Asset.Cards qualified as Cards
+import Arkham.Asset.Import.Lifted
+import Arkham.Helpers.Location
+import Arkham.Helpers.Modifiers (ModifierType (..), modifySelect)
+import Arkham.Helpers.Vehicle
+import Arkham.Matcher
+import Arkham.Message.Lifted.Choose
+import Arkham.Trait (Trait (Ocean))
+
+newtype FishingVessel = FishingVessel AssetAttrs
+  deriving anyclass IsAsset
+  deriving newtype (Show, Eq, ToJSON, FromJSON, Entity)
+
+{- | "While you are in this vehicle, treat your location as if it were unflooded."
+Granted as a modifier so that 'getFloodLevelFor' needs no knowledge of this card -- the
+same way a diving suit grants 'TreatFullyFloodedAsPartiallyFlooded'.
+-}
+instance HasModifiersFor FishingVessel where
+  getModifiersFor (FishingVessel a) =
+    modifySelect a (InVehicleMatching $ AssetWithId a.id) [TreatLocationAsUnflooded]
+
+fishingVessel :: AssetCard FishingVessel
+fishingVessel = asset FishingVessel Cards.fishingVessel
+
+instance HasAbilities FishingVessel where
+  getAbilities (FishingVessel x) =
+    [ vehicleEnterOrExitAbility x
+    , restricted x 1 InThisVehicle actionAbility
+    ]
+
+instance RunMessage FishingVessel where
+  runMessage msg a@(FishingVessel attrs) = runQueueT $ case msg of
+    UseThisAbility iid (isSource attrs -> True) VehicleEnterExitAbility -> do
+      enterOrExitVehicle iid a
+    UseThisAbility iid (isSource attrs -> True) 1 -> do
+      getLocationOf attrs.id >>= traverse_ \lid -> do
+        oceans <- select $ withTrait Ocean <> connectedTo (LocationWithId lid)
+        chooseTargetM iid oceans $ moveVehicle attrs lid
+      pure a
+    _ -> FishingVessel <$> liftRunMessage msg attrs

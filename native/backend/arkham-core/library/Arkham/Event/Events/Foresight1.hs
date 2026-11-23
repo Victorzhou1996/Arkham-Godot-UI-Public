@@ -1,0 +1,47 @@
+module Arkham.Event.Events.Foresight1 (foresight1) where
+
+import Arkham.Classes.HasGame
+import Arkham.Event.Cards qualified as Cards
+import Arkham.Event.Import.Lifted hiding (cardDrawModifier)
+import Arkham.GameEnv (findAllCards)
+import Arkham.Helpers.Modifiers
+import Arkham.I18n (cardNameVar, ikey', withI18n)
+import Arkham.Name
+import Arkham.Window (Window (..))
+import Arkham.Window qualified as Window
+import Data.List.Extra (nubOrdOn)
+
+-- Needs to affect search/draw
+-- If the drawn card is the named card, that investigator may either (choose one):
+-- - Cancel that card's effects and discard it.
+-- - Immediately play that card at -2 cost.
+
+newtype Foresight1 = Foresight1 EventAttrs
+  deriving anyclass (IsEvent, HasModifiersFor, HasAbilities)
+  deriving newtype (Show, Eq, ToJSON, FromJSON, Entity)
+
+foresight1 :: EventCard Foresight1
+foresight1 = event Foresight1 Cards.foresight1
+
+allCardNames :: HasGame m => m [(Text, Text)]
+allCardNames = map toChoice . nubOrdOn toTitle . sortOn toTitle <$> findAllCards (const True)
+ where
+  toChoice card = (withI18n $ cardNameVar card $ ikey' "label.name", toTitle card)
+
+getWindowInvestigator :: HasCallStack => [Window] -> (InvestigatorId, CardDrawId)
+getWindowInvestigator [] = error $ "getWindowInvestigator: empty list\n" <> prettyCallStack callStack
+getWindowInvestigator ((windowType -> Window.WouldDrawCard iid cid _) : _) = (iid, cid)
+getWindowInvestigator (_ : ws) = getWindowInvestigator ws
+
+-- The actual cancel or play part is encoded in the card draw kind `Foresight`
+
+instance RunMessage Foresight1 where
+  runMessage msg e@(Foresight1 attrs) = runQueueT $ case msg of
+    InvestigatorPlayEvent iid (is attrs -> True) _ (getWindowInvestigator -> (iid', cid)) _ -> do
+      cardNames <- allCardNames
+
+      chooseOneDropDown iid =<< for cardNames \(label, name) -> do
+        enabled <- cardDrawModifier cid attrs iid' (Foresight name)
+        pure (label, enabled)
+      pure e
+    _ -> Foresight1 <$> liftRunMessage msg attrs

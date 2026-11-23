@@ -1,0 +1,375 @@
+{-# OPTIONS_GHC -Wno-orphans #-}
+
+module Arkham.GameEnv where
+
+import Arkham.Ability
+import Arkham.ActiveCost.Base
+import {-# SOURCE #-} Arkham.Card (
+  Card (EncounterCard, PlayerCard),
+  CardCode,
+  CardGen (..),
+  CardId,
+  lookupCardDef,
+  unsafeMakeCardId,
+ )
+import Arkham.Card.CardDef (CardDef, cdCardCode, cdCardSubType, cdMeta, toCardDef)
+import Arkham.Card.CardType (CardSubType (BasicWeakness))
+import Arkham.Card.CustomCard (CustomCard (..))
+import Arkham.Card.EncounterCard
+import Arkham.Card.PlayerCard
+import Arkham.Classes.GameLogger
+import Arkham.Classes.HasAbilities
+import Arkham.Classes.HasDistance
+import Arkham.Classes.HasGame
+import Arkham.Classes.HasQueue
+import Arkham.Decklist.RandomBasicWeakness (RandomBasicWeaknessContext (..))
+import Arkham.Distance
+import {-# SOURCE #-} Arkham.Game
+import Arkham.Game.Settings
+import Arkham.GameT
+import Arkham.History
+import Arkham.Id
+import Arkham.Message
+import Arkham.Modifier
+import Arkham.Phase
+import Arkham.Prelude
+import Arkham.Random
+import Arkham.SkillTest.Base
+import {-# SOURCE #-} Arkham.Source
+import Arkham.Target
+import Arkham.Window
+import Control.Monad.Random.Lazy hiding (filterM, foldM, fromList)
+import Data.Dependent.Map qualified as DMap
+import Data.Map.Strict qualified as Map
+
+-- Some ORPHANS we may want to move
+
+instance CardGen GameT where
+  genEncounterCard a = do
+    cardId <- unsafeMakeCardId <$> getRandom
+    let card = lookupEncounterCard (toCardDef a) cardId
+    ref <- asks gameEnvGame
+    atomicModifyIORef' ref $ \g ->
+      (g {gameCards = insertMap cardId (EncounterCard card) (gameCards g)}, ())
+    pure card
+  genPlayerCard a = do
+    cardId <- unsafeMakeCardId <$> getRandom
+    let card = lookupPlayerCard (toCardDef a) cardId
+    ref <- asks gameEnvGame
+    atomicModifyIORef' ref $ \g ->
+      (g {gameCards = insertMap cardId (PlayerCard card) (gameCards g)}, ())
+    pure card
+  replaceCard cardId card = do
+    ref <- asks gameEnvGame
+    atomicModifyIORef' ref $ \g ->
+      (g {gameCards = insertMap cardId card (gameCards g)}, ())
+  removeCard cardId = do
+    ref <- asks gameEnvGame
+    atomicModifyIORef' ref $ \g ->
+      (g {gameCards = deleteMap cardId (gameCards g)}, ())
+  clearCardCache = do
+    ref <- asks gameEnvGame
+    atomicModifyIORef' ref $ \g -> (g {gameCards = mempty}, ())
+
+instance HasGameRef GameEnv where
+  gameRefL = lens gameEnvGame $ \m x -> m {gameEnvGame = x}
+
+getCard :: (HasCallStack, HasGame m) => CardId -> m Card
+getCard cardId = do
+  g <- getGame
+  case lookup cardId (gameCards g) of
+    Nothing -> error $ "Unregistered card id: " <> show cardId <> "\n" <> prettyCallStack callStack
+    Just card -> pure card
+
+getCardMaybe :: HasGame m => CardId -> m (Maybe Card)
+getCardMaybe cardId = lookup cardId . gameCards <$> getGame
+
+findAllCards :: HasGame m => (Card -> Bool) -> m [Card]
+findAllCards cardPred = filter cardPred . toList . gameCards <$> getGame
+
+findCard :: HasGame m => (Card -> Bool) -> m (Maybe Card)
+findCard cardPred = find cardPred . toList . gameCards <$> getGame
+
+runGameEnvT :: MonadIO m => GameEnv -> GameT a -> m a
+runGameEnvT gameEnv = liftIO . flip runReaderT gameEnv . unGameT
+
+toGameEnv
+  :: ( HasGameRef env
+     , HasQueue Message m
+     , HasStdGen env
+     , HasGameLogger m
+     , MonadReader env m
+     )
+  => m GameEnv
+toGameEnv = do
+  gameEnvGame <- view gameRefL
+  gameRandomGen <- view genL
+  gameEnvQueue <- messageQueue
+  gameCacheRef <- newIORef DMap.empty
+  gameLogger <- getLogger
+  pure $ GameEnv {..}
+
+runWithEnv
+  :: ( HasGameRef env
+     , HasQueue Message m
+     , HasStdGen env
+     , HasGameLogger m
+     , MonadReader env m
+     )
+  => GameT a
+  -> m a
+runWithEnv body = do
+  gameEnv <- toGameEnv
+  runGameEnvT gameEnv body
+
+instance MonadRandom GameT where
+  getRandomR lohi = do
+    ref <- view genL
+    atomicModifyIORef' ref (swap . randomR lohi)
+  getRandom = do
+    ref <- view genL
+    atomicModifyIORef' ref (swap . random)
+  getRandomRs lohi = do
+    ref <- view genL
+    gen <- atomicModifyIORef' ref splitGen
+    pure $ randomRs lohi gen
+  getRandoms = do
+    ref <- view genL
+    gen <- atomicModifyIORef' ref splitGen
+    pure $ randoms gen
+
+getSkillTest :: HasGame m => m (Maybe SkillTest)
+getSkillTest = gameSkillTest <$> getGame
+
+{- | The card plays currently resolving, innermost last. Log-only; see
+'Arkham.Game.Base.gameCardPlayStack'.
+-}
+getCardPlayStack :: HasGame m => m [CardId]
+getCardPlayStack = gameCardPlayStack <$> getGame
+
+{- | The log blocks a resolving action has opened, innermost last. Log-only; see
+'Arkham.Game.Base.gameLogBlockStack'.
+-}
+getLogBlockStack :: HasGame m => m [Text]
+getLogBlockStack = gameLogBlockStack <$> getGame
+
+getsSkillTest :: HasGame m => (SkillTest -> a) -> m (Maybe a)
+getsSkillTest f = fmap f . gameSkillTest <$> getGame
+
+getSkillTestId :: HasGame m => m (Maybe SkillTestId)
+getSkillTestId = fmap skillTestId . gameSkillTest <$> getGame
+getActiveCosts :: HasGame m => m [ActiveCost]
+getActiveCosts = toList . gameActiveCost <$> getGame
+
+getJustSkillTest :: (HasGame m, HasCallStack) => m SkillTest
+getJustSkillTest = fromJustNote "must be called during a skill test" . gameSkillTest <$> getGame
+
+getHistory :: HasGame m => HistoryType -> InvestigatorId -> m History
+getHistory TurnHistory iid =
+  findWithDefault mempty iid . gameTurnHistory <$> getGame
+getHistory PhaseHistory iid =
+  findWithDefault mempty iid . gamePhaseHistory <$> getGame
+getHistory RoundHistory iid = do
+  roundH <- findWithDefault mempty iid . gameRoundHistory <$> getGame
+  phaseH <- getHistory PhaseHistory iid
+  pure $ roundH <> phaseH
+
+getHistoryField :: HasGame m => HistoryType -> InvestigatorId -> HistoryField k -> m k
+getHistoryField htype iid fld = viewHistoryField fld <$> getHistory htype iid
+
+getDistance :: HasGame m => LocationId -> LocationId -> m (Maybe Distance)
+getDistance l1 l2 = do
+  game <- getGame
+  getDistance' game l1 l2
+
+getPhase :: HasGame m => m Phase
+getPhase = gamePhase <$> getGame
+
+getMythosPhaseStep :: HasGame m => m (Maybe MythosPhaseStep)
+getMythosPhaseStep =
+  getGame <&> \g -> case gamePhaseStep g of
+    Just (MythosPhaseStep s) -> Just s
+    _ -> Nothing
+
+getEnemyPhaseStep :: HasGame m => m (Maybe EnemyPhaseStep)
+getEnemyPhaseStep =
+  getGame <&> \g -> case gamePhaseStep g of
+    Just (EnemyPhaseStep s) -> Just s
+    _ -> Nothing
+
+getWindowDepth :: HasGame m => m Int
+getWindowDepth = gameWindowDepth <$> getGame
+
+getDepthLock :: HasGame m => m Int
+getDepthLock = gameDepthLock <$> getGame
+
+getAllAbilities :: HasGame m => m [Ability]
+getAllAbilities = cached GetAllAbilitiesKey $ getAbilities <$> getGame
+
+getSettings :: HasGame m => m Settings
+getSettings = gameSettings <$> getGame
+
+{- | Whether "as if" should be ignored for this investigator right now. The
+Chapter 2 ruling confines the altered state to the ability being resolved, so
+windows that offer other abilities bracket themselves with 'SetAsIfAtIgnored'.
+Chapter 1 keeps the altered state throughout and always answers False.
+-}
+getAsIfIgnored :: HasGame m => InvestigatorId -> m Bool
+getAsIfIgnored iid = do
+  settings <- getSettings
+  g <- getGame
+  pure $ settingsStrictAsIfAt settings && iid `member` gameAsIfAtIgnored g
+
+getCurrentBatchId :: HasGame m => m (Maybe BatchId)
+getCurrentBatchId = gameCurrentBatchId <$> getGame
+
+getAllPlayers :: HasGame m => m [PlayerId]
+getAllPlayers = gamePlayers <$> getGame
+
+-- | Investigators set aside because their player left the campaign.
+getRetiredInvestigators :: HasGame m => m [InvestigatorId]
+getRetiredInvestigators = keys . gameRetiredInvestigators <$> getGame
+
+getActivePlayer :: HasGame m => m PlayerId
+getActivePlayer = gameActivePlayerId <$> getGame
+
+getAllModifiers :: HasGame m => m (Map Target [Modifier])
+getAllModifiers = gameModifiers <$> getGame
+
+withModifiers'
+  :: (Targetable target, HasGame m)
+  => target
+  -> m [Modifier]
+  -> ReaderT Game m a
+  -> m a
+withModifiers' (toTarget -> target) mods body = do
+  game <- getGame
+  mods' <- mods
+  let
+    modifiers = gameModifiers game
+    modifiers' = insertWith (<>) target mods' modifiers
+  runReaderT body $ game & modifiersL .~ modifiers'
+
+-- Primarily used for Parallel Lola right now, we may want to make this more generic
+withoutModifiersFrom
+  :: HasGame m
+  => InvestigatorId
+  -> ReaderT Game m a
+  -> m a
+withoutModifiersFrom iid body = do
+  game <- getGame
+  let
+    modifiers = gameModifiers game
+    modifiers' = Map.adjust (filter ((/= toSource iid) . (.source))) (toTarget iid) modifiers
+  runReaderT body $ game & modifiersL .~ modifiers'
+
+withoutModifiersOf
+  :: (HasGame m, Sourceable source)
+  => source
+  -> ReaderT Game m a
+  -> m a
+withoutModifiersOf source body = do
+  game <- getGame
+  let
+    modifiers = gameModifiers game
+    modifiers' = Map.map (filter ((/= toSource source) . (.source))) modifiers
+  runReaderT body $ game & modifiersL .~ modifiers'
+
+{- | 'withoutModifiersOf' over several sources at once, to ask what would still
+hold if none of them contributed. 'getAllAbilitiesSkippable' uses it to weigh a
+window against the sources offering something in it, which have not resolved
+yet. An empty list leaves the game untouched rather than rebuilding the map.
+-}
+withoutModifiersOfAny
+  :: (HasGame m, Sourceable source)
+  => [source]
+  -> ReaderT Game m a
+  -> m a
+withoutModifiersOfAny sources body = do
+  game <- getGame
+  let
+    sources' = map toSource sources
+    modifiers' = Map.map (filter ((`notElem` sources') . (.source))) (gameModifiers game)
+  runReaderT body $ if null sources' then game else game & modifiersL .~ modifiers'
+
+withActiveInvestigator :: HasGame m => InvestigatorId -> ReaderT Game m a -> m a
+withActiveInvestigator iid body = do
+  game <- getGame
+  runReaderT body $ game & activeInvestigatorIdL .~ iid
+
+withActiveInvestigatorAdjust
+  :: HasGame m => InvestigatorId -> ReaderT Game m a -> m a
+withActiveInvestigatorAdjust iid body = do
+  game <- getGame
+  game' <-
+    handleBlanked
+      =<< handleTraitRestrictedModifiers
+      =<< preloadModifiers (game & activeInvestigatorIdL .~ iid)
+  runReaderT body game'
+
+getActiveAbilities :: HasGame m => m [Ability]
+getActiveAbilities = gameActiveAbilities <$> getGame
+
+getActionCanBeUndone :: HasGame m => m Bool
+getActionCanBeUndone = gameActionCanBeUndone <$> getGame
+
+getGameInAction :: HasGame m => m Bool
+getGameInAction = gameInAction <$> getGame
+
+getWindowStack :: HasGame m => m [[Window]]
+getWindowStack = fromMaybe [] . gameWindowStack <$> getGame
+
+getCurrentWindowTick :: HasGame m => m (Maybe Int)
+getCurrentWindowTick = listToMaybe . gameWindowTickStack <$> getGame
+
+{- | The monotonic window clock. Read it to pin a triggering condition's
+initiation tick onto a window built ahead of when it is checked.
+-}
+getWindowTick :: HasGame m => m Int
+getWindowTick = gameWindowTick <$> getGame
+
+getEntryTicks :: HasGame m => m (Map CardId Int)
+getEntryTicks = gameEntryTicks <$> getGame
+
+getIgnoreCanModifiers :: HasGame m => m Bool
+getIgnoreCanModifiers = gameIgnoreCanModifiers <$> getGame
+
+getInSetup :: HasGame m => m Bool
+getInSetup = gameInSetup <$> getGame
+
+getCardUses :: HasGame m => CardCode -> m [InvestigatorId]
+getCardUses cCode = findWithDefault [] cCode . gameCardUses <$> getGame
+
+getAllCardUses :: HasGame m => m [CardDef]
+getAllCardUses =
+  concatMap (mapMaybe lookupCardDef . (\(k, v) -> replicate (length v) k))
+    . Map.toList
+    . gameCardUses
+    <$> getGame
+
+getTurnOrder :: HasGame m => m [InvestigatorId]
+getTurnOrder = gamePlayerOrder <$> getGame
+
+{- | Use the pool snapshotted when the player’s setting was changed, so every
+player keeps their own eligible sets. Empty selected sets means no custom cards.
+-}
+getCustomRandomWeaknessCards :: HasGame m => PlayerId -> m [CardDef]
+getCustomRandomWeaknessCards pid = do
+  g <- getGame
+  let (enabled, sets) = Map.findWithDefault (False, mempty) pid (settingsCustomRandomWeaknessPools $ gameSettings g)
+      defs =
+        Map.fromList
+          [(cdCardCode def, def) | card <- toList (gameCustomCards g), let def = customCardDef card]
+      selected def = case lookup "set" (cdMeta def) of
+        Just (String name) -> name `member` sets
+        _ -> "" `member` sets
+  pure
+    $ if enabled
+      then filter (\def -> cdCardSubType def == Just BasicWeakness && selected def) (toList defs)
+      else []
+
+withCustomRandomWeaknessPool
+  :: HasGame m => PlayerId -> RandomBasicWeaknessContext -> m RandomBasicWeaknessContext
+withCustomRandomWeaknessPool pid context = do
+  cards <- getCustomRandomWeaknessCards pid
+  pure $ context {rbwCustomCards = cards}

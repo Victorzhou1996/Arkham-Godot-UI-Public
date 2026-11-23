@@ -1,0 +1,120 @@
+module Arkham.Investigator.Cards.NormanWithers (normanWithers) where
+
+import Arkham.Ability
+import Arkham.Card
+import Arkham.Helpers
+import Arkham.Helpers.ChaosToken
+import Arkham.Helpers.Modifiers
+import Arkham.Investigator.Cards qualified as Cards
+import Arkham.Investigator.Runner
+import Arkham.Matcher hiding (PlayCard, RevealChaosToken)
+import Arkham.Prelude
+import Arkham.Projection
+import Arkham.Treachery.CardDefs.EdgeOfTheEarth qualified as Treacheries
+
+data Metadata = Metadata
+  { playedFromTopOfDeck :: Bool
+  , drawingForcedWeakness :: Bool
+  }
+  deriving stock (Show, Generic, Eq, Data)
+  deriving anyclass (ToJSON, FromJSON)
+
+defaultMetadata :: Metadata
+defaultMetadata = Metadata {playedFromTopOfDeck = False, drawingForcedWeakness = False}
+
+getMetadata :: InvestigatorAttrs -> Metadata
+getMetadata a = toResultDefault defaultMetadata a.meta
+
+newtype NormanWithers = NormanWithers InvestigatorAttrs
+  deriving anyclass IsInvestigator
+  deriving newtype (Show, Eq, ToJSON, FromJSON, Entity)
+  deriving stock Data
+
+normanWithers :: InvestigatorCard NormanWithers
+normanWithers =
+  investigator NormanWithers Cards.normanWithers
+    $ Stats {health = 6, sanity = 8, willpower = 4, intellect = 5, combat = 2, agility = 1}
+
+instance HasModifiersFor NormanWithers where
+  getModifiersFor (NormanWithers a) = do
+    let metadata = getMetadata a
+    canReveal <- withoutModifier a CannotRevealCards
+    let canPlayTop = canReveal && not (playedFromTopOfDeck metadata)
+    modifySelfWhen a canReveal
+      $ TopCardOfDeckIsRevealed
+      : [CanPlayTopOfDeck AnyCard | canPlayTop]
+    case unDeck (investigatorDeck a) of
+      x : _ -> do
+        modifiedWhen_ a canReveal x [ReduceCostOf (CardWithId x.id) 1]
+        modifySelfWhen a canPlayTop [AsIfInHandFor NotForPlay x.id]
+      _ -> pure ()
+
+instance HasAbilities NormanWithers where
+  getAbilities (NormanWithers a) =
+    [ selfAbility
+        a
+        1
+        ( youExist
+            ( TopCardOfDeckIs (WeaknessCard <> not_ (cardIs Treacheries.theHarbinger))
+                <> not_ (InvestigatorWithMetaKey "drawingForcedWeakness")
+            )
+            <> CanManipulateDeck
+            <> NotSetup
+        )
+        (forced AnyWindow)
+    ]
+
+instance HasChaosTokenValue NormanWithers where
+  getChaosTokenValue iid ElderSign (NormanWithers a) | iid == toId a = do
+    let
+      x = case unDeck (investigatorDeck a) of
+        [] -> 0
+        c : _ -> maybe 0 toPrintedCost (cdCost $ toCardDef c)
+    pure $ ChaosTokenValue ElderSign (PositiveModifier x)
+  getChaosTokenValue _ token _ = pure $ ChaosTokenValue token mempty
+
+instance RunMessage NormanWithers where
+  runMessage msg i@(NormanWithers a) = case msg of
+    UseThisAbility iid (isSource a -> True) 1 -> do
+      push $ drawCards iid (a.ability 1) 1
+      let metadata = getMetadata a
+      pure $ NormanWithers $ a & setMeta (metadata {drawingForcedWeakness = True})
+    When (RevealChaosToken _ iid token) | iid == toId a -> do
+      faces <- getModifiedChaosTokenFace token
+      canManipulate <- withoutModifier a CannotManipulateDeck
+      when (ElderSign `elem` faces && canManipulate && not (null (unDeck (investigatorDeck a)))) $ do
+        hand <- field InvestigatorHand iid
+        player <- getPlayer iid
+        push
+          $ chooseOne player
+          $ Label "$label.doNotSwap" []
+          : [ targetLabel (toCardId c) [handleTargetChoice iid (ChaosTokenEffectSource ElderSign) (toCardId c)]
+            | c <- onlyPlayerCards hand
+            ]
+      pure i
+    -- This is a swap, not a draw: the top card and the chosen card change places in one step so
+    -- no draw window fires and the deck is never briefly missing its top card
+    HandleTargetChoice iid (ChaosTokenEffectSource ElderSign) (CardIdTarget cid) | iid == toId a -> do
+      case (unDeck (investigatorDeck a), find ((== cid) . toCardId) (onlyPlayerCards $ investigatorHand a)) of
+        (top : rest, Just handCard) ->
+          pure
+            $ NormanWithers
+            $ a
+            & (deckL .~ Deck (handCard : rest))
+            & (handL %~ map (\c -> if toCardId c == cid then toCard top else c))
+        _ -> pure i
+    Do BeginRound -> do
+      attrs' <- runMessage msg a
+      pure $ NormanWithers $ attrs' & setMeta defaultMetadata
+    Do (DrawCards iid' _) | iid' == toId a -> do
+      attrs' <- runMessage msg a
+      let metadata = getMetadata attrs'
+      pure $ NormanWithers $ attrs' & setMeta (metadata {drawingForcedWeakness = False})
+    PlayCard iid card _ _ _ False | iid == toId a ->
+      case unDeck (investigatorDeck a) of
+        c : _ | toCardId c == toCardId card -> do
+          attrs' <- runMessage msg a
+          let metadata = getMetadata attrs'
+          pure $ NormanWithers $ attrs' & setMeta (metadata {playedFromTopOfDeck = True})
+        _ -> NormanWithers <$> runMessage msg a
+    _ -> NormanWithers <$> runMessage msg a

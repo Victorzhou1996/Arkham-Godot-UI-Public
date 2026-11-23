@@ -1,0 +1,168 @@
+{-# OPTIONS_GHC -Wno-orphans #-}
+
+module Arkham.Helpers.Query where
+
+import Arkham.Asset.Types (Field (..))
+import Arkham.Card
+import Arkham.Classes.HasGame
+import Arkham.Classes.Query
+import Arkham.EncounterSet (EncounterSet)
+import Arkham.Event.Types (Field (..))
+import {-# SOURCE #-} Arkham.Game ()
+import Arkham.GameEnv
+import Arkham.Helpers.Scenario
+import Arkham.Id
+import Arkham.Investigator.Types (Field (..))
+import Arkham.Matcher
+import Arkham.Name
+import Arkham.Phase (MythosPhaseStep)
+import Arkham.Prelude
+import Arkham.Projection
+import Arkham.Scenario.Types (Field (..))
+import Arkham.Skill.Types (Field (..))
+
+{- | The investigator the game records as lead, whether or not they are still in
+play. @LeadInvestigator@ matches against @gameLeadInvestigatorId@, but
+'getInvestigatorsMatching' drops eliminated investigators before the matcher
+runs, so the plain matcher goes blank the moment the lead is eliminated.
+-}
+getRecordedLead :: (HasCallStack, HasGame m) => m (Maybe InvestigatorId)
+getRecordedLead = selectOne $ IncludeEliminated LeadInvestigator
+
+-- Once every investigator is eliminated there is no live lead, but the game
+-- still records the most recently appointed one: ChooseLeadInvestigator runs
+-- whenever the current lead is eliminated, and no-ops when nobody is left. Per
+-- FFG, "the most recently appointed lead investigator" resolves instructions
+-- addressed to the lead, so prefer them over an arbitrary eliminated
+-- investigator (which was whoever sorted first by id). See issue #5420. The
+-- final fallback only matters if the recorded lead is no longer an entity at
+-- all.
+getLead :: (HasCallStack, HasGame m) => m InvestigatorId
+getLead = fromJustNote "No lead found" <$> getLeadMay
+
+getLeadMay :: (HasCallStack, HasGame m) => m (Maybe InvestigatorId)
+getLeadMay =
+  runMaybeT
+    $ MaybeT (selectOne LeadInvestigator)
+    <|> MaybeT getRecordedLead
+    <|> MaybeT (selectOne $ IncludeEliminated Anyone)
+
+getCurrentMythosPhaseStep :: HasGame m => m (Maybe MythosPhaseStep)
+getCurrentMythosPhaseStep = getMythosPhaseStep
+
+inTurnOrder :: HasGame m => [InvestigatorId] -> m [InvestigatorId]
+inTurnOrder xs =
+  getTurnOrder <&> \case
+    [] -> xs -- not set yet
+    ito -> filter (`elem` xs) ito
+
+instance HasGame m => HasPlayer m where
+  getPlayer = field InvestigatorPlayerId
+
+maybeSomeInvestigator :: HasGame m => Maybe InvestigatorId -> m (Maybe InvestigatorId)
+maybeSomeInvestigator (Just iid) = pure (Just iid)
+maybeSomeInvestigator Nothing = selectOne ActiveInvestigator
+
+getActiveInvestigatorId :: (HasCallStack, HasGame m) => m InvestigatorId
+getActiveInvestigatorId = selectJust ActiveInvestigator
+
+getInvestigatorPlayers :: HasGame m => m [(InvestigatorId, PlayerId)]
+getInvestigatorPlayers = selectWithField InvestigatorPlayerId UneliminatedInvestigator
+getInvestigators :: HasGame m => m [InvestigatorId]
+getInvestigators = inTurnOrder =<< select UneliminatedInvestigator
+
+allInvestigators :: HasGame m => m [InvestigatorId]
+allInvestigators = inTurnOrder =<< select Anyone
+
+{- | Every investigator still in the campaign, ignoring the elimination flags.
+
+For use between scenarios, where @defeated@ and @resigned@ say what happened in
+the scenario that just ended rather than anything about now. Killed and driven
+insane are the lasting exclusion: those investigators leave the campaign.
+-}
+campaignInvestigators :: HasGame m => m [InvestigatorId]
+campaignInvestigators =
+  inTurnOrder =<< select (IncludeEliminated $ not_ KilledInvestigator <> not_ InsaneInvestigator)
+
+allPlayers :: HasGame m => m [PlayerId]
+allPlayers = getAllPlayers
+
+getLeadPlayer :: (HasCallStack, HasGame m) => m PlayerId
+getLeadPlayer = maybe getActivePlayer (field InvestigatorPlayerId) =<< getLeadMay
+selectAssetController :: HasGame m => AssetId -> m (Maybe InvestigatorId)
+selectAssetController aid =
+  ((<|>) . join <$> fieldMay AssetController aid)
+    <*> (join <$> fieldMay DiscardedAssetController aid)
+
+selectEventController :: HasGame m => EventId -> m (Maybe InvestigatorId)
+selectEventController = fieldMay EventController
+
+selectSkillController :: HasGame m => SkillId -> m (Maybe InvestigatorId)
+selectSkillController = fieldMay SkillController
+
+getPlayerCount :: HasGame m => m Int
+getPlayerCount = selectCount Anyone
+
+{- | Get a set aside card
+
+Some cards may be double sided and completely different types
+like Daniel Chesterfield. In these cases, we want to consider
+the card a match, but "flip" it to the correct side.
+
+This logic is a bit too generous and we may want to specify
+on double sided cards which card code is on the other side.
+-}
+getSetAsideCard :: (HasCallStack, HasGame m) => CardDef -> m Card
+getSetAsideCard def = selectJust (SetAsideCardMatch $ cardIs def) >>= asSideOf def
+
+getSetAsideCardMaybe :: (HasCallStack, HasGame m) => CardDef -> m (Maybe Card)
+getSetAsideCardMaybe def = selectOne (SetAsideCardMatch $ cardIs def) >>= traverse (asSideOf def)
+
+{- | Flip a double-sided card to the side @def@ names. A card the setup substituted in for
+@def@ is left alone: it is standing in for that card, not another side of it.
+-}
+asSideOf :: HasGame m => CardDef -> Card -> m Card
+asSideOf def card
+  | exactCardCode card == exactCardCode def = pure card
+  | otherwise = do
+      aliases <- getCardCodeAliases
+      pure
+        $ if lookup (toCardCode card) aliases == Just def.cardCode
+          then card
+          else lookupCard def.cardCode card.id
+
+withSetAsideCard :: (HasCallStack, HasGame m) => CardDef -> (Card -> m ()) -> m ()
+withSetAsideCard def body = getSetAsideCardMaybe def >>= traverse_ body
+
+getSetAsideEncounterSet :: HasGame m => EncounterSet -> m [Card]
+getSetAsideEncounterSet encounterSet =
+  scenarioFieldMap ScenarioSetAsideCards (filter ((== Just encounterSet) . getEncounterSet))
+
+maybeGetSetAsideCard :: (HasCallStack, HasGame m) => CardDef -> m (Maybe Card)
+maybeGetSetAsideCard def = runMaybeT do
+  guardInScenario
+  card <- selectMaybeT $ SetAsideCardMatch $ cardIs def
+  lift $ asSideOf def card
+
+maybeGetSetAsideEncounterCard :: HasGame m => CardDef -> m (Maybe EncounterCard)
+maybeGetSetAsideEncounterCard def = runMaybeT do
+  guardInScenario
+  card <- selectMaybeT $ SetAsideCardMatch $ cardIs def
+  hoistMaybe . preview _EncounterCard =<< lift (asSideOf def card)
+
+getSetAsideCardsMatching :: (HasCallStack, HasGame m) => CardMatcher -> m [Card]
+getSetAsideCardsMatching = select . SetAsideCardMatch
+
+getJustLocationByName :: (HasCallStack, HasGame m) => Name -> m LocationId
+getJustLocationByName name = fromJustNote ("Missing " <> show name) <$> getLocationByName name
+
+getLocationByName :: HasGame m => Name -> m (Maybe LocationId)
+getLocationByName name = selectOne matcher
+ where
+  matcher = case (nameTitle name, nameSubtitle name) of
+    (title, Just subtitle) -> LocationWithFullTitle title subtitle
+    (title, Nothing) -> LocationWithTitle title
+
+enemiesAt
+  :: (HasGame m, IsLocationMatcher locationMatcher) => locationMatcher -> m [EnemyId]
+enemiesAt = select . EnemyAt . toLocationMatcher

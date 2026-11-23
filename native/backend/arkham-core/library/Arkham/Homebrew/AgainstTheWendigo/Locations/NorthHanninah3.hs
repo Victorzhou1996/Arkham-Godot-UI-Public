@@ -1,0 +1,33 @@
+module Arkham.Homebrew.AgainstTheWendigo.Locations.NorthHanninah3 (northHanninah3) where
+
+import Arkham.Homebrew.AgainstTheWendigo.CardDefs.Locations qualified as Cards
+import Arkham.Homebrew.AgainstTheWendigo.Helpers
+import Arkham.Location.Import.Lifted
+
+newtype NorthHanninah3 = NorthHanninah3 LocationAttrs
+  deriving anyclass IsLocation
+  deriving newtype (Show, Eq, ToJSON, FromJSON, Entity)
+
+{- "This location is connected to the River locations directly to the North
+or South and connected to the Wild locations directly to the East or West."
+-}
+northHanninah3 :: LocationCard NorthHanninah3
+northHanninah3 =
+  locationWith NorthHanninah3 Cards.northHanninah3 3 (PerPlayer 1) connectsToAdjacent
+
+instance HasModifiersFor NorthHanninah3 where
+  -- The scenario's river rule; see 'riverMovementBan'.
+  getModifiersFor (NorthHanninah3 a) = riverMovementBan a
+
+instance HasAbilities NorthHanninah3 where
+  getAbilities (NorthHanninah3 a) = extendRevealed a $ riverActions a
+
+instance RunMessage NorthHanninah3 where
+  runMessage msg l@(NorthHanninah3 attrs) = runQueueT $ case msg of
+    UseThisAbility iid (isSource attrs -> True) 1 -> do
+      resolveWalkAlongTheRiver (attrs.ability 1) iid
+      pure l
+    UseThisAbility iid (isSource attrs -> True) 2 -> do
+      resolveNavigate (attrs.ability 2) iid
+      pure l
+    _ -> NorthHanninah3 <$> liftRunMessage msg attrs

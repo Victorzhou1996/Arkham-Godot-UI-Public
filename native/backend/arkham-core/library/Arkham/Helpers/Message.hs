@@ -1,0 +1,910 @@
+module Arkham.Helpers.Message (module Arkham.Helpers.Message, module X) where
+
+import Arkham.Prelude
+
+import Arkham.Classes.HasQueue as X hiding (push, pushAll)
+import Arkham.Helpers.Message.Discard as X
+import Arkham.Message as X
+
+import Arkham.Ability.Types (Ability, abilitySource)
+import Arkham.Capability
+import Arkham.Card
+import Arkham.Classes.HasGame
+import Arkham.Classes.HasQueue qualified as Queue
+import Arkham.Classes.Query
+import Arkham.Cost
+import Arkham.DamageEffect
+import Arkham.Deck
+import Arkham.Deck qualified as Deck
+import Arkham.Draw.Types
+import Arkham.Enemy.Creation
+import Arkham.Exception
+import Arkham.Field
+import Arkham.Helpers.Investigator ()
+import Arkham.Helpers.Query
+import Arkham.Helpers.Window
+import Arkham.Id
+import Arkham.Label (mkLabel)
+import Arkham.Location.Grid
+import Arkham.Location.Types (Location)
+import Arkham.Matcher
+import Arkham.Placement
+import Arkham.Resolution
+import Arkham.Search
+import Arkham.Source
+import Arkham.Target
+import Arkham.Timing qualified as Timing
+import Arkham.Token qualified as Token
+import Arkham.Window (Window (..), WindowType, defaultWindows, mkAfter, mkWindow)
+import Arkham.Window qualified as Window
+import Control.Monad.Trans
+
+drawCards :: Sourceable source => InvestigatorId -> source -> Int -> Message
+drawCards i source n = DrawCards i $ newCardDraw source i n
+
+drawCardsWith
+  :: Sourceable source
+  => InvestigatorId
+  -> source
+  -> Int
+  -> (CardDraw Message -> CardDraw Message)
+  -> Message
+drawCardsWith i source n f = DrawCards i $ f $ newCardDraw source i n
+
+drawEncounterCard :: Sourceable source => InvestigatorId -> source -> Message
+drawEncounterCard i source = drawEncounterCards i source 1
+
+drawEncounterCardEdit
+  :: Sourceable source => InvestigatorId -> source -> (CardDraw Message -> CardDraw Message) -> Message
+drawEncounterCardEdit i source = drawEncounterCardsEdit i source 1
+
+drawEncounterCards :: Sourceable source => InvestigatorId -> source -> Int -> Message
+drawEncounterCards i source n = DrawCards i $ newCardDraw source Deck.EncounterDeck n
+
+drawEncounterCardsEdit
+  :: Sourceable source
+  => InvestigatorId -> source -> Int -> (CardDraw Message -> CardDraw Message) -> Message
+drawEncounterCardsEdit = drawEncounterCardsWith
+
+drawCardsIfCan
+  :: (MonadRandom m, Sourceable source, HasGame m, ToId investigator InvestigatorId)
+  => investigator
+  -> source
+  -> Int
+  -> m (Maybe Message)
+drawCardsIfCan i source n = do
+  canDraw <- can.draw.cards (sourceToFromSource source) (asId i)
+  pure $ guard canDraw $> drawCards (asId i) source n
+
+drawCardsIfCanWith
+  :: (MonadRandom m, Sourceable source, HasGame m, ToId investigator InvestigatorId)
+  => investigator
+  -> source
+  -> Int
+  -> (CardDraw Message -> CardDraw Message)
+  -> m (Maybe Message)
+drawCardsIfCanWith i source n f = do
+  canDraw <- can.draw.cards (sourceToFromSource source) (asId i)
+  pure $ guard canDraw $> drawCardsWith (asId i) source n f
+
+drawEncounterCardsWith
+  :: Sourceable source
+  => InvestigatorId -> source -> Int -> (CardDraw Message -> CardDraw Message) -> Message
+drawEncounterCardsWith i source n f = DrawCards i $ f $ newCardDraw source Deck.EncounterDeck n
+
+sourceToFromSource :: Sourceable source => source -> FromSource
+sourceToFromSource (toSource -> source) = case source of
+  AbilitySource s _ -> sourceToFromSource s
+  UseAbilitySource _ s _ -> sourceToFromSource s
+  InvestigatorSource _ -> FromPlayerCardEffect
+  AssetSource _ -> FromPlayerCardEffect
+  EventSource _ -> FromPlayerCardEffect
+  SkillSource _ -> FromPlayerCardEffect
+  _ -> FromOtherSource
+
+drawCardsAction :: Sourceable source => InvestigatorId -> source -> Int -> Message
+drawCardsAction i source n = DrawCards i $ asDrawAction $ newCardDraw source i n
+
+resolveWithWindow :: HasGame m => Message -> WindowType -> m [Message]
+resolveWithWindow msg window' = do
+  whenWindow <- checkWindows [mkWindow Timing.When window']
+  atIfWindow <- checkWindows [mkWindow Timing.AtIf window']
+  afterWindow <- checkWindows [mkWindow Timing.After window']
+  pure [When msg, whenWindow, atIfWindow, msg, After msg, afterWindow]
+
+dealAdditionalDamage :: HasQueue Message m => InvestigatorId -> Int -> [Message] -> m ()
+dealAdditionalDamage iid amount additionalMessages = do
+  mMsg <- findFromQueue $ \case
+    InvestigatorDamage iid' _ n _ | iid' == iid -> n > 0
+    InvestigatorDoAssignDamage iid' _ _ _ n _ [] [] | iid' == iid -> n > 0
+    _ -> False
+  case mMsg of
+    Just damageMsg -> do
+      let
+        newMsg = case damageMsg of
+          InvestigatorDamage _ source' n horror ->
+            InvestigatorDamage iid source' (n + amount) horror
+          InvestigatorDoAssignDamage _ source' strategy matcher n horror [] [] ->
+            InvestigatorDoAssignDamage
+              iid
+              source'
+              strategy
+              matcher
+              (n + amount)
+              horror
+              []
+              []
+          _ -> error "dealAdditionalDamage: impossible"
+      replaceMessage damageMsg $ newMsg : additionalMessages
+    Nothing -> throwIO $ InvalidState "No damage occured for additional damage"
+
+dealAdditionalHorror :: HasQueue Message m => InvestigatorId -> Int -> [Message] -> m ()
+dealAdditionalHorror iid amount additionalMessages = do
+  mMsg <- findFromQueue $ \case
+    InvestigatorDamage iid' _ _ n | iid' == iid -> n > 0
+    InvestigatorDoAssignDamage iid' _ _ _ _ n [] [] | iid' == iid -> n > 0
+    CheckDefeated _ (InvestigatorTarget iid') -> iid == iid'
+    _ -> False
+  case mMsg of
+    Just horrorMsg -> do
+      let
+        newMsg = case horrorMsg of
+          InvestigatorDamage _ source' damage n ->
+            InvestigatorDamage iid source' damage (n + amount)
+          InvestigatorDoAssignDamage _ source' strategy matcher damage n [] [] ->
+            InvestigatorDoAssignDamage
+              iid
+              source'
+              strategy
+              matcher
+              damage
+              (n + amount)
+              []
+              []
+          CheckDefeated source target -> PlaceAdditionalDamage target source 0 amount
+          _ -> error "dealAdditionalHorror: impossible"
+      replaceMessage horrorMsg $ newMsg : additionalMessages
+    Nothing -> throwIO $ InvalidState "No horror occured for additional horror"
+
+cancelHorror
+  :: (Sourceable source, HasGame m, HasQueue Message m) => InvestigatorId -> source -> Int -> m ()
+cancelHorror iid (toSource -> source) amount = do
+  push $ CancelHorror iid amount
+  ignoreWindow <- checkWindows [mkAfter (Window.CancelledOrIgnoredCardOrGameEffect source Nothing)]
+  push ignoreWindow
+
+createEnemy
+  :: (MonadRandom m, IsCard card, IsEnemyCreationMethod creationMethod)
+  => card
+  -> creationMethod
+  -> m (EnemyCreation Message)
+createEnemy (toCard -> card) (toEnemyCreationMethod -> cMethod) = do
+  enemyId <- getRandom
+  pure
+    $ MkEnemyCreation
+      { enemyCreationCard = card
+      , enemyCreationEnemyId = enemyId
+      , enemyCreationMethod = cMethod
+      , enemyCreationBefore = []
+      , enemyCreationAfter = []
+      , enemyCreationExhausted = False
+      , enemyCreationTarget = Nothing
+      , enemyCreationInvestigator = Nothing
+      }
+
+createEnemyWith
+  :: (MonadRandom m, IsCard card, IsEnemyCreationMethod creationMethod)
+  => card
+  -> creationMethod
+  -> (EnemyCreation Message -> EnemyCreation Message)
+  -> m (EnemyId, Message)
+createEnemyWith card creationMethod f = do
+  creation <- f <$> createEnemy card creationMethod
+  pure (enemyCreationEnemyId creation, CreateEnemy creation)
+
+createEnemyWith_
+  :: (MonadRandom m, IsCard card, IsEnemyCreationMethod creationMethod)
+  => card
+  -> creationMethod
+  -> (EnemyCreation Message -> EnemyCreation Message)
+  -> m Message
+createEnemyWith_ card creationMethod f = snd <$> createEnemyWith card creationMethod f
+
+createEnemyWithPlacement :: MonadRandom m => Card -> Placement -> m (EnemyId, Message)
+createEnemyWithPlacement c placement = do
+  creation <- createEnemy c placement
+  pure (enemyCreationEnemyId creation, CreateEnemy creation)
+
+createEnemyWithPlacement_ :: MonadRandom m => Card -> Placement -> m Message
+createEnemyWithPlacement_ c placement = snd <$> createEnemyWithPlacement c placement
+
+createEnemyAt :: MonadRandom m => Card -> LocationId -> Maybe Target -> m (EnemyId, Message)
+createEnemyAt c lid mTarget = do
+  creation <- createEnemy c lid
+  pure (enemyCreationEnemyId creation, CreateEnemy $ creation {enemyCreationTarget = mTarget})
+
+createEnemyAtEdit
+  :: MonadRandom m
+  => Card
+  -> LocationId
+  -> Maybe Target
+  -> (EnemyCreation Message -> EnemyCreation Message)
+  -> m (EnemyId, Message)
+createEnemyAtEdit c lid mTarget f = do
+  creation <- createEnemy c lid
+  pure (enemyCreationEnemyId creation, CreateEnemy $ f $ creation {enemyCreationTarget = mTarget})
+
+createEnemyAt_ :: MonadRandom m => Card -> LocationId -> Maybe Target -> m Message
+createEnemyAt_ c lid mTarget = snd <$> createEnemyAt c lid mTarget
+
+createEnemyAtLocationMatchingEdit
+  :: MonadRandom m
+  => Card -> LocationMatcher -> (EnemyCreation Message -> EnemyCreation Message) -> m (EnemyId, Message)
+createEnemyAtLocationMatchingEdit c matcher f = do
+  creation <- createEnemy c matcher
+  pure (enemyCreationEnemyId creation, CreateEnemy $ f creation)
+
+createEnemyAtLocationMatching :: MonadRandom m => Card -> LocationMatcher -> m (EnemyId, Message)
+createEnemyAtLocationMatching c matcher = do
+  creation <- createEnemy c matcher
+  pure (enemyCreationEnemyId creation, CreateEnemy creation)
+
+createEnemyAtLocationMatching_ :: MonadRandom m => Card -> LocationMatcher -> m Message
+createEnemyAtLocationMatching_ c matcher = snd <$> createEnemyAtLocationMatching c matcher
+
+createEnemyEngagedWithPrey :: MonadRandom m => Card -> m (EnemyId, Message)
+createEnemyEngagedWithPrey c = do
+  creation <- createEnemy c SpawnEngagedWithPrey
+  pure (enemyCreationEnemyId creation, CreateEnemy creation)
+
+createEnemyEngagedWithPrey_ :: MonadRandom m => Card -> m Message
+createEnemyEngagedWithPrey_ = fmap snd . createEnemyEngagedWithPrey
+
+placeLocation :: MonadRandom m => Card -> m (LocationId, Message)
+placeLocation c = do
+  locationId <- getRandom
+  pure (locationId, PlaceLocation locationId c)
+
+placeLocationWith :: MonadRandom m => Card -> Update Location -> m (LocationId, Message)
+placeLocationWith c update = do
+  locationId <- getRandom
+  pure (locationId, PlaceLocationWith locationId c update)
+
+placeLocationInGrid :: MonadRandom m => Pos -> Card -> m (LocationId, Message)
+placeLocationInGrid pos c = do
+  locationId <- getRandom
+  pure (locationId, Run [PlaceLocation locationId c, PlaceGrid (GridLocation pos locationId)])
+
+placeLocation_ :: MonadRandom m => Card -> m Message
+placeLocation_ = fmap snd . placeLocation
+
+placeLocationWith_ :: MonadRandom m => Card -> Update Location -> m Message
+placeLocationWith_ card update = snd <$> placeLocationWith card update
+
+placeSetAsideLocation
+  :: (HasCallStack, MonadRandom m, HasGame m) => CardDef -> m (LocationId, Message)
+placeSetAsideLocation = placeLocation <=< getSetAsideCard
+
+placeSetAsideLocation_ :: (MonadRandom m, HasGame m) => CardDef -> m Message
+placeSetAsideLocation_ = placeLocation_ <=< getSetAsideCard
+
+placeSetAsideLocationWith_
+  :: (MonadRandom m, HasGame m) => CardDef -> Update Location -> m Message
+placeSetAsideLocationWith_ def update = (`placeLocationWith_` update) =<< getSetAsideCard def
+
+placeSetAsideLocations :: (MonadRandom m, HasGame m) => [CardDef] -> m [Message]
+placeSetAsideLocations = traverse placeSetAsideLocation_
+
+placeLocationCard :: (CardGen m, HasGame m) => CardDef -> m (LocationId, Message)
+placeLocationCard = placeLocation <=< genCard
+
+placeLocationCardInGrid :: (CardGen m, HasGame m) => Pos -> CardDef -> m (LocationId, Message)
+placeLocationCardInGrid pos = placeLocationInGrid pos <=< genCard
+
+placeLocationCard_ :: (HasGame m, CardGen m) => CardDef -> m Message
+placeLocationCard_ = placeLocation_ <=< genCard
+
+placeLocationCards_ :: (CardGen m, HasGame m) => [CardDef] -> m [Message]
+placeLocationCards_ = traverse placeLocationCard_
+
+scenarioResolution :: Int -> Message
+scenarioResolution = ScenarioResolution . Resolution
+
+pattern R1 :: Message
+pattern R1 = ScenarioResolution (Resolution 1)
+
+pattern R2 :: Message
+pattern R2 = ScenarioResolution (Resolution 2)
+
+pattern R3 :: Message
+pattern R3 = ScenarioResolution (Resolution 3)
+
+pattern R4 :: Message
+pattern R4 = ScenarioResolution (Resolution 4)
+
+pattern R5 :: Message
+pattern R5 = ScenarioResolution (Resolution 5)
+
+pattern R6 :: Message
+pattern R6 = ScenarioResolution (Resolution 6)
+
+pattern R7 :: Message
+pattern R7 = ScenarioResolution (Resolution 7)
+
+pattern R8 :: Message
+pattern R8 = ScenarioResolution (Resolution 8)
+
+pattern R9 :: Message
+pattern R9 = ScenarioResolution (Resolution 9)
+
+pattern R10 :: Message
+pattern R10 = ScenarioResolution (Resolution 10)
+
+gainSurge :: (Sourceable a, Targetable a) => a -> Message
+gainSurge a = GainSurge (toSource a) (toTarget a)
+
+toDiscard :: (Sourceable source, Targetable target) => source -> target -> Message
+toDiscard source target = Discard Nothing (toSource source) (toTarget target)
+
+toDiscardBy
+  :: (Sourceable source, Targetable target) => InvestigatorId -> source -> target -> Message
+toDiscardBy iid source target = Discard (Just iid) (toSource source) (toTarget target)
+
+pushAllM :: (IsMessage msg, HasQueue Message m) => m [msg] -> m ()
+pushAllM mmsgs = do
+  msgs <- mmsgs
+  Queue.pushAll $ map toMessage msgs
+
+pushAll :: (IsMessage msg, HasQueue Message m) => [msg] -> m ()
+pushAll = pushAllM . pure
+
+push :: (IsMessage msg, HasQueue Message m) => msg -> m ()
+push = Queue.push . toMessage
+
+pushM :: (HasQueue Message m, IsMessage msg) => m msg -> m ()
+pushM mmsg = mmsg >>= push
+
+pushWhenM :: (HasQueue Message m, IsMessage msg) => m Bool -> msg -> m ()
+pushWhenM condM = whenM condM . pushAll . pure
+
+pushWhen :: (HasQueue Message m, IsMessage msg) => Bool -> msg -> m ()
+pushWhen cond = when cond . push
+
+pushIfAny
+  :: (HasQueue Message m, MonoFoldable (t a), IsMessage msg) => t a -> msg -> m ()
+pushIfAny collection = when (notNull collection) . push
+
+removeMessageType :: HasQueue Message m => MessageType -> m ()
+removeMessageType msgType = withQueue_ $ \queue ->
+  let
+    (before, after) = break ((== Just msgType) . messageType) queue
+    remaining = drop 1 after
+   in
+    before <> remaining
+
+addToHand :: IsCard a => InvestigatorId -> a -> Message
+addToHand i (toCard -> c) = AddToHand i [c]
+
+addToDiscard :: IsCard a => InvestigatorId -> a -> Message
+addToDiscard i (toCard -> c) = go c
+ where
+  go = \case
+    VengeanceCard c' -> go c'
+    PlayerCard c' -> AddToDiscard (fromMaybe i c'.owner) c'
+    EncounterCard c' -> AddToEncounterDiscard c'
+
+drawToHand :: IsCard a => InvestigatorId -> a -> Message
+drawToHand i (toCard -> c) = DrawToHand i [c]
+
+drawToHandFrom :: (IsCard a, IsDeck deck) => InvestigatorId -> deck -> a -> Message
+drawToHandFrom i (toDeck -> deck) (toCard -> c) = DrawToHandFrom i deck [c]
+
+shuffleIntoDeck :: (IsDeck deck, Targetable target) => deck -> target -> Message
+shuffleIntoDeck (toDeck -> deck) (toTarget -> target) = ShuffleIntoDeck deck target
+
+shuffleCardsIntoDeck
+  :: (IsDeck deck, MonoFoldable cards, Element cards ~ card, IsCard card) => deck -> cards -> Message
+shuffleCardsIntoDeck (toDeck -> deck) = ShuffleCardsIntoDeck deck . map toCard . toList
+
+shuffleCardsIntoTopOfDeck
+  :: (IsDeck deck, MonoFoldable cards, Element cards ~ card, IsCard card)
+  => deck -> Int -> cards -> Message
+shuffleCardsIntoTopOfDeck (toDeck -> deck) n = ShuffleCardsIntoTopOfDeck deck n . map toCard . toList
+
+shuffleCardsIntoBottomOfDeck
+  :: (IsDeck deck, MonoFoldable cards, Element cards ~ card, IsCard card)
+  => deck -> Int -> cards -> Message
+shuffleCardsIntoBottomOfDeck (toDeck -> deck) n =
+  ShuffleCardsIntoBottomOfDeck deck n . map toCard . toList
+
+findEncounterCard
+  :: (Targetable target, IsCardMatcher cardMatcher)
+  => InvestigatorId
+  -> target
+  -> [ScenarioZone]
+  -> cardMatcher
+  -> Message
+findEncounterCard iid (toTarget -> target) zones (toCardMatcher -> cardMatcher) =
+  FindEncounterCard iid target zones cardMatcher LeadChooses
+
+placeLabeledLocationCards_ :: (HasGame m, CardGen m) => Text -> [CardDef] -> m [Message]
+placeLabeledLocationCards_ lbl cards = do
+  startIndex <- getStartIndex 1
+  concatForM (withIndexN startIndex cards) $ \(idx, card) -> do
+    (location, placement) <- placeLocationCard card
+    pure [placement, SetLocationLabel location (lbl <> tshow idx)]
+ where
+  getStartIndex n = do
+    alreadyTaken <- selectAny $ LocationWithLabel (mkLabel $ lbl <> tshow n)
+    if alreadyTaken then getStartIndex (n + 1) else pure n
+
+placeLabeledLocationCards
+  :: (HasGame m, CardGen m) => Text -> [CardDef] -> m ([LocationId], [Message])
+placeLabeledLocationCards lbl cards = fmap fold
+  . concatForM (withIndex1 cards)
+  $ \(idx, card) -> do
+    (location, placement) <- placeLocationCard card
+    pure [([location], [placement, SetLocationLabel location (lbl <> tshow idx)])]
+
+placeLabeledLocations_ :: (HasGame m, CardGen m) => Text -> [Card] -> m [Message]
+placeLabeledLocations_ lbl cards = do
+  startIndex <- getStartIndex 1
+  concatForM (withIndexN startIndex cards) $ \(idx, card) -> do
+    (location, placement) <- placeLocation card
+    pure [placement, SetLocationLabel location (lbl <> tshow idx)]
+ where
+  getStartIndex n = do
+    alreadyTaken <- selectAny $ LocationWithLabel (mkLabel $ lbl <> tshow n)
+    if alreadyTaken then getStartIndex (n + 1) else pure n
+
+placeLabeledLocations
+  :: (HasGame m, CardGen m) => Text -> [Card] -> m ([LocationId], [Message])
+placeLabeledLocations lbl cards = fmap fold
+  . concatForM (withIndex1 cards)
+  $ \(idx, card) -> do
+    (location, placement) <- placeLocation card
+    pure [([location], [placement, SetLocationLabel location (lbl <> tshow idx)])]
+
+placeLabeledLocationsFrom
+  :: (HasGame m, CardGen m) => Text -> Int -> [Card] -> m ([LocationId], [Message])
+placeLabeledLocationsFrom lbl n cards = fmap fold
+  . concatForM (withIndex cards)
+  $ \(idx, card) -> do
+    (location, placement) <- placeLocation card
+    pure [([location], [placement, SetLocationLabel location (lbl <> tshow (n + idx))])]
+
+putCardIntoPlay :: IsCard card => InvestigatorId -> card -> Message
+putCardIntoPlay iid card = putCardIntoPlayWithWindows iid card (defaultWindows iid)
+
+putCardIntoPlayWithWindows :: IsCard card => InvestigatorId -> card -> [Window] -> Message
+putCardIntoPlayWithWindows iid (toCard -> card) ws = PutCardIntoPlay iid card Nothing NoPayment ws
+
+putCardIntoPlayWithAdditionalCosts :: IsCard card => InvestigatorId -> card -> Message
+putCardIntoPlayWithAdditionalCosts iid (toCard -> card) = putCardIntoPlayWithAdditionalCostsAndWindows iid card (defaultWindows iid)
+
+putCardIntoPlayWithAdditionalCostsAndWindows
+  :: IsCard card => InvestigatorId -> card -> [Window] -> Message
+putCardIntoPlayWithAdditionalCostsAndWindows iid (toCard -> card) ws = PutCardIntoPlayWithAdditionalCosts iid card Nothing NoPayment ws
+
+placeLabeledLocation
+  :: (MonadRandom m, HasGame m) => Text -> Card -> m (LocationId, Message)
+placeLabeledLocation lbl card = do
+  idx <- getStartIndex (1 :: Int)
+  (location, placement) <- placeLocation card
+  pure (location, Run [placement, SetLocationLabel location (lbl <> tshow idx)])
+ where
+  getStartIndex n = do
+    alreadyTaken <- selectAny $ LocationWithLabel (mkLabel $ lbl <> tshow n)
+    if alreadyTaken then getStartIndex (n + 1) else pure n
+
+assignDamageLabel :: Sourceable source => InvestigatorId -> source -> Int -> UI Message
+assignDamageLabel iid source damage = DamageLabel iid [assignDamage iid source damage]
+
+assignHorrorLabel :: Sourceable source => InvestigatorId -> source -> Int -> UI Message
+assignHorrorLabel iid source horror = HorrorLabel iid [assignHorror iid source horror]
+
+assignDamage :: Sourceable source => InvestigatorId -> source -> Int -> Message
+assignDamage iid (toSource -> source) damage = InvestigatorAssignDamage iid source DamageAny damage 0
+
+assignDamageWithStrategy
+  :: Sourceable source => InvestigatorId -> source -> DamageStrategy -> Int -> Message
+assignDamageWithStrategy iid (toSource -> source) damageStrategy damage = InvestigatorAssignDamage iid source damageStrategy damage 0
+
+assignHorror :: Sourceable source => InvestigatorId -> source -> Int -> Message
+assignHorror iid (toSource -> source) horror = InvestigatorAssignDamage iid source DamageAny 0 horror
+
+assignDamageAndHorror :: Sourceable source => InvestigatorId -> source -> Int -> Int -> Message
+assignDamageAndHorror iid (toSource -> source) damage horror = InvestigatorAssignDamage iid source DamageAny damage horror
+
+directDamage :: Sourceable source => InvestigatorId -> source -> Int -> Message
+directDamage iid (toSource -> source) damage = InvestigatorDirectDamage iid source damage 0
+
+directHorror :: Sourceable source => InvestigatorId -> source -> Int -> Message
+directHorror iid (toSource -> source) horror = InvestigatorDirectDamage iid source 0 horror
+
+directDamageAndHorror :: Sourceable source => InvestigatorId -> source -> Int -> Int -> Message
+directDamageAndHorror iid (toSource -> source) damage horror = InvestigatorDirectDamage iid source damage horror
+
+findAndDrawEncounterCard :: IsCardMatcher a => InvestigatorId -> a -> Message
+findAndDrawEncounterCard investigator cardMatcher = FindAndDrawEncounterCard investigator (toCardMatcher cardMatcher) IncludeDiscard
+
+findAndDrawEncounterCardFromEncounterDeck :: IsCardMatcher a => InvestigatorId -> a -> Message
+findAndDrawEncounterCardFromEncounterDeck investigator cardMatcher = FindAndDrawEncounterCard investigator (toCardMatcher cardMatcher) ExcludeDiscard
+
+ready :: Targetable target => target -> Message
+ready = Ready . toTarget
+
+chooseEngageEnemy :: Sourceable source => InvestigatorId -> source -> Message
+chooseEngageEnemy iid (toSource -> source) = ChooseEngageEnemy iid source Nothing mempty False
+
+search
+  :: (Targetable target, Sourceable source, AsId investigator, IdOf investigator ~ InvestigatorId)
+  => investigator
+  -> source
+  -> target
+  -> [(Zone, ZoneReturnStrategy)]
+  -> ExtendedCardMatcher
+  -> FoundCardsStrategy
+  -> Message
+search (asId -> iid) (toSource -> source) (toTarget -> target) zones matcher strategy = Do (Search $ mkSearch Searching iid source target zones matcher strategy)
+
+lookAt
+  :: (Targetable target, Sourceable source)
+  => InvestigatorId
+  -> source
+  -> target
+  -> [(Zone, ZoneReturnStrategy)]
+  -> ExtendedCardMatcher
+  -> FoundCardsStrategy
+  -> Message
+lookAt iid (toSource -> source) (toTarget -> target) zones matcher strategy = Search $ mkSearch Looking iid source target zones matcher strategy
+
+revealing
+  :: (Targetable target, Sourceable source)
+  => InvestigatorId
+  -> source
+  -> target
+  -> Zone
+  -> Message
+revealing iid (toSource -> source) (toTarget -> target) zone = Search $ mkSearch Revealing iid source target [(zone, PutBack)] (basic AnyCard) ReturnCards
+
+revealingEdit
+  :: (Targetable target, Sourceable source)
+  => InvestigatorId
+  -> source
+  -> target
+  -> Zone
+  -> (Search -> Search)
+  -> Message
+revealingEdit iid (toSource -> source) (toTarget -> target) zone f = Search $ f $ mkSearch Revealing iid source target [(zone, PutBack)] (basic AnyCard) ReturnCards
+
+takeResources :: Sourceable source => InvestigatorId -> source -> Int -> Message
+takeResources iid (toSource -> source) n = TakeResources iid n source False
+
+gainResourcesIfCan
+  :: (HasGame m, Sourceable source, ToId a InvestigatorId)
+  => a
+  -> source
+  -> Int
+  -> m (Maybe Message)
+gainResourcesIfCan a source n = do
+  canGainResources <- can.gain.resources (sourceToFromSource source) (asId a)
+  pure $ guard canGainResources $> takeResources (asId a) source n
+
+assignEnemyDamage :: DamageAssignment -> EnemyId -> Message
+assignEnemyDamage da eid = DealDamage (EnemyTarget eid) da
+
+nonAttackEnemyDamage
+  :: (AsId enemy, IdOf enemy ~ EnemyId, Sourceable a)
+  => Maybe InvestigatorId -> a -> Int -> enemy -> Message
+nonAttackEnemyDamage miid source damage enemy = DealDamage (EnemyTarget (asId enemy)) (nonAttack miid source damage)
+
+placeDoom :: (Sourceable source, Targetable target) => source -> target -> Int -> Message
+placeDoom (toSource -> source) (toTarget -> target) n = PlaceDoom source target n
+
+placeHorror :: (Sourceable source, Targetable target) => source -> target -> Int -> Message
+placeHorror (toSource -> source) (toTarget -> target) n = PlaceHorror source target n
+
+addToVictory
+  :: (ToId investigator InvestigatorId, Targetable target) => investigator -> target -> Message
+addToVictory (asId -> iid) (toTarget -> target) = AddToVictory (Just iid) target
+
+addToVictory_ :: Targetable target => target -> Message
+addToVictory_ (toTarget -> target) = AddToVictory Nothing target
+
+-- This is obviously very complicated, but it feels like it shouldn't be
+-- However we find the correct message and only remove the amount indicated
+cancelDoom :: HasQueue Message m => Target -> Int -> m ()
+cancelDoom target n = do
+  replaceAllMessagesMatching
+    \case
+      CheckWindows [window] -> case windowType window of
+        Window.WouldPlaceDoom _ target' _ -> target == target'
+        _ -> False
+      Do (CheckWindows [window]) -> case windowType window of
+        Window.WouldPlaceDoom _ target' _ -> target == target'
+        _ -> False
+      _ -> False
+    \case
+      CheckWindows [window] -> case windowType window of
+        Window.WouldPlaceDoom source' target' n' ->
+          [CheckWindows [window {windowType = Window.WouldPlaceDoom source' target' (n' - n)}] | n' - n > 0]
+        _ -> error "mismatched"
+      Do (CheckWindows [window]) -> case windowType window of
+        Window.WouldPlaceDoom source' target' n' ->
+          [ Do (CheckWindows [window {windowType = Window.WouldPlaceDoom source' target' (n' - n)}])
+          | n' - n > 0
+          ]
+        _ -> error "mismatched"
+      _ -> error "mismatched"
+
+  let
+    findNewAmount [] = error "mismatches"
+    findNewAmount (Do (PlaceDoom _ target' n') : _) | target == target' = n' - n
+    findNewAmount (DoBatch _ (PlaceDoom _ target' n') : _) | target == target' = n' - n
+    findNewAmount (_ : rest) = findNewAmount rest
+
+    replaceWindowTypeDoomAmount m = \case
+      Window.WouldPlaceDoom source' target' _ -> Window.WouldPlaceDoom source' target' m
+      Window.PlacedDoom source' target' _ -> Window.PlacedDoom source' target' m
+      _ -> error "mismatched"
+
+    replaceWindowDoomAmount m w =
+      w {windowType = replaceWindowTypeDoomAmount m (windowType w)}
+
+    replaceDoomAmount m = \case
+      CheckWindows ws -> CheckWindows (map (replaceWindowDoomAmount m) ws)
+      Do (CheckWindows ws) -> Do (CheckWindows (map (replaceWindowDoomAmount m) ws))
+      Do (PlaceTokens source' target' Token.Doom _) | target == target' -> Do (PlaceTokens source' target' Token.Doom m)
+      DoBatch bId (PlaceTokens source' target' Token.Doom _) | target == target' -> DoBatch bId (PlaceTokens source' target' Token.Doom m)
+      other -> other
+
+  replaceAllMessagesMatching
+    \case
+      Would _ msgs -> flip any msgs $ \case
+        Do (PlaceDoom _ target' _) -> target == target'
+        DoBatch _ (PlaceDoom _ target' _) -> target == target'
+        _ -> False
+      _ -> False
+    \case
+      Would batchId msgs ->
+        let
+          newAmount = findNewAmount msgs
+          msgs' = map (replaceDoomAmount newAmount) msgs
+         in
+          [Would batchId msgs' | newAmount > 0]
+      _ -> error "mismatched"
+
+checkDefeated :: (Sourceable source, Targetable target) => source -> target -> Message
+checkDefeated source target = CheckDefeated (toSource source) (toTarget target)
+
+placeDoomOnAgenda :: Sourceable source => source -> Message
+placeDoomOnAgenda source = PlaceDoomOnAgenda (toSource source) 1 CanNotAdvance
+
+handleTargetChoice
+  :: (Sourceable source, Targetable target) => InvestigatorId -> source -> target -> Message
+handleTargetChoice iid (toSource -> source) (toTarget -> target) = HandleTargetChoice iid source target
+
+handleSkillTestNesting
+  :: (MonadTrans t, HasQueue Message m, HasQueue Message (t m))
+  => SkillTestId
+  -> Message
+  -> a
+  -> t m a
+  -> t m a
+handleSkillTestNesting sid msg a action = do
+  push $ NextSkillTest sid
+  inSkillTestWindow <- lift $ fromQueue $ elem EndSkillTestWindow
+  if inSkillTestWindow
+    then do
+      lift do
+        -- nested-aware: a suspended window effect ('pendingWindowEffect') can sit inside
+        -- a Simultaneously batch, out of a flat scan's reach. Already-glued messages are
+        -- inside MovedWithSkillTest, which is not a group, so they stay with their test.
+        msgs <- popMessagesMatchingNested \case
+          MoveWithSkillTest _ -> True
+          _ -> False
+        insertAfterMatching (msg : map (MovedWithSkillTest sid) msgs) (== EndSkillTestWindow)
+      pure a
+    else do
+      mapQueue \case
+        MoveWithSkillTest x -> x
+        x -> x
+      action
+
+handleSkillTestNesting_
+  :: (MonadTrans t, HasQueue Message m, HasQueue Message (t m))
+  => SkillTestId
+  -> Message
+  -> t m ()
+  -> t m ()
+handleSkillTestNesting_ sid msg action = handleSkillTestNesting sid msg () action
+
+{- | Sources of every ability a queued 'ResolveWindowInitiations' still has to resolve.
+The ResolvedAbility sweep keeps their parked entities alive: a materialised
+initiation is an in-flight ability, and its source must still be able to claim
+'UseAbility' after leaving play (Caught in the Crossfire discards itself on its
+first resolution). #5743
+-}
+queuedInitiationSources :: HasQueue Message m => m [Source]
+queuedInitiationSources = fromQueue (concatMap go)
+ where
+  go = \case
+    Priority inner -> go inner
+    Retain inner -> go inner
+    MoveWithSkillTest inner -> go inner
+    MovedWithSkillTest _ inner -> go inner
+    Simultaneously inner -> concatMap go inner
+    Run inner -> concatMap go inner
+    ResolveWindowInitiations _ _ pending -> [abilitySource ability | (ability, _, _) <- pending]
+    _ -> []
+
+{- | The initiations a question's 'ResolveWindowInitiations' marker still owes.
+
+Walks exactly where 'initiationsAsk' parks the marker (an 'AbilityLabel' follow-up under a
+window choose) rather than generically: 'WindowAsk' is hot, and a window ask with hundreds
+of choices is a shape this engine has produced before.
+-}
+pendingInitiations :: Question Message -> [(Ability, [Window], [Message])]
+pendingInitiations = goQuestion
+ where
+  goQuestion = \case
+    QuestionLabel _ _ q -> goQuestion q
+    PayCostQuestion _ q -> goQuestion q
+    QuestionWithSource _ _ q -> goQuestion q
+    WindowChooseOne cs -> fromChoices cs
+    ChooseOne cs -> fromChoices cs
+    PlayerWindowChooseOne cs -> fromChoices cs
+    _ -> []
+  fromChoices = concatMap \case
+    AbilityLabel _ _ _ before msgs -> concatMap go (before <> msgs)
+    _ -> []
+  go = \case
+    Priority inner -> go inner
+    Retain inner -> go inner
+    MoveWithSkillTest inner -> go inner
+    MovedWithSkillTest _ inner -> go inner
+    Simultaneously inner -> concatMap go inner
+    Run inner -> concatMap go inner
+    ResolveWindowInitiations _ _ pending -> pending
+    _ -> []
+
+{- | Whether this question is the ONLY place some in-flight effect still exists.
+
+'ResolveWindowInitiations' pops the effect a When damage window stands in front of (the
+@Damaged@/@CheckDefeated@ behind it, see 'pendingWindowEffect') OUT of the queue and parks
+it in the marker it hands to 'initiationsAsk'. 'ClearUI' wipes @gameQuestion@ ahead of every
+answer, so from then until the initiation is used that ask is the last copy: discarding it
+destroys the effect, and re-deriving the set cannot bring it back because its own pop now
+finds nothing. Such a window therefore re-checks ITSELF -- nobody else may queue a
+@Do (CheckWindows ws)@ for it, and no other seat answering may drop it. #5798
+
+Deliberately NOT true of every initiation ask. Only damage windows hold anything, and a
+Forced ability in any other window (Rex's Curse on a would-be success, Dream Gate at the end
+of the phase) still wants the ordinary trailing re-check -- suppressing it there changes the
+flow of every Forced window ability in the game.
+-}
+holdsPendingWindowEffects :: Question Message -> Bool
+holdsPendingWindowEffects = any (\(_, _, effects) -> notNull effects) . pendingInitiations
+
+{- | Windows the queue still owes a check. A window's 'EndCheckWindow' can fire while one
+of its initiations is still in flight -- 'handleSkillTestNesting' glues the continuation
+behind 'EndSkillTestWindow', but not the window's close -- and that close depth-filters
+the recorded use away, so the trailing @Do (CheckWindows ws)@ re-derives a Forced ability
+that already initiated (Evil Past asked for its 2 horror twice, #5772).
+-}
+queuedWindowChecks :: HasQueue Message m => m [Window]
+queuedWindowChecks = fromQueue (concatMap go)
+ where
+  go = \case
+    Priority inner -> go inner
+    Retain inner -> go inner
+    MoveWithSkillTest inner -> go inner
+    MovedWithSkillTest _ inner -> go inner
+    Simultaneously inner -> concatMap go inner
+    Run inner -> concatMap go inner
+    CheckWindows ws -> ws
+    Do (CheckWindows ws) -> ws
+    ResolveWindowInitiations _ ws _ -> ws
+    _ -> []
+
+{- | Consume this initiation out of the queued 'ResolveWindowInitiations' marker and
+give the pending effects it was holding back to the queue.
+
+Removing the entry is what marks the initiation as done -- the recorded ability use
+cannot be relied on for that, because the continuation fires after the window has
+closed, where the use is depth-filtered away. The marker may already be glued to a test
+('MoveWithSkillTest'/'MovedWithSkillTest') or travelling in an ordinary transport
+wrapper; the rewrite preserves whatever carries it. Does nothing when no marker holds
+this initiation -- initiations outside a materialised queue keep their effects in the
+queue itself. #5743
+
+Where they go back depends on whether the marker still owes initiations. While others
+remain they resolve right behind this use, so each initiation resolves IN FULL before the
+next is offered (Caught in the Crossfire reduces each enemy's damage behind its own
+test). On the last one they go behind the marker instead: a window holding a Forced
+ability is worked through in two rounds, and the marker's @Do (CheckWindows ws)@ still
+owes the OPTIONAL reactions a look. Releasing there landed the damage first, so a
+reaction that changes the amount was ignored whenever the damaged entity also had a
+Forced trigger on the same window -- Nathaniel Cho's extra damage went missing against a
+Guardian Elder Thing (#5751).
+
+Either way they ride 'MoveWithSkillTest' so 'handleSkillTestNesting' keeps gluing them
+behind a nested test.
+-}
+releaseInitiationEffects
+  :: HasQueue Message m => InvestigatorId -> Ability -> [Window] -> m ()
+releaseInitiationEffects iid ability ws = pushAll . map MoveWithSkillTest =<< withQueue go
+ where
+  go [] = ([], [])
+  go (msg : rest) = case rewrite msg of
+    Just (msg', effects)
+      | exhausted msg' -> (msg' : map MoveWithSkillTest effects <> rest, [])
+      | otherwise -> (msg' : rest, effects)
+    Nothing -> let (rest', effects) = go rest in (msg : rest', effects)
+  exhausted = \case
+    Priority inner -> exhausted inner
+    Retain inner -> exhausted inner
+    MoveWithSkillTest inner -> exhausted inner
+    MovedWithSkillTest _ inner -> exhausted inner
+    ResolveWindowInitiations _ _ pending -> null pending
+    _ -> False
+  chosen (ability', ws', _) = ability' == ability && ws' == ws
+  rewrite = \case
+    Priority inner -> rewrap Priority inner
+    Retain inner -> rewrap Retain inner
+    MoveWithSkillTest inner -> rewrap MoveWithSkillTest inner
+    MovedWithSkillTest sid inner -> rewrap (MovedWithSkillTest sid) inner
+    ResolveWindowInitiations iid' initiationWindows pending
+      | iid == iid'
+      , any chosen pending ->
+          Just
+            ( ResolveWindowInitiations iid' initiationWindows (filter (not . chosen) pending)
+            , concat [effs | entry@(_, _, effs) <- pending, chosen entry]
+            )
+    _ -> Nothing
+  rewrap f inner = (\(inner', effects) -> (f inner', effects)) <$> rewrite inner
+
+createAssetAt :: MonadRandom m => Card -> Placement -> m (AssetId, Message)
+createAssetAt c placement = do
+  assetId <- getRandom
+  pure (assetId, CreateAssetAt assetId c placement)
+
+createAssetAt_ :: MonadRandom m => Card -> Placement -> m Message
+createAssetAt_ c placement = snd <$> createAssetAt c placement
+
+createTreacheryAt :: MonadRandom m => Card -> Placement -> m (TreacheryId, Message)
+createTreacheryAt c placement = do
+  treacheryId <- getRandom
+  pure (treacheryId, CreateTreacheryAt treacheryId c placement)
+
+createTreacheryAt_ :: MonadRandom m => Card -> Placement -> m Message
+createTreacheryAt_ c placement = snd <$> createTreacheryAt c placement
+
+{- | The investigator an already-queued elimination is going to take out, if this
+message is one. X. qualified throughout, because "Arkham.Matcher" has window
+matchers by the same names.
+-}
+pendingElimination :: Message -> Maybe InvestigatorId
+pendingElimination = \case
+  X.InvestigatorDefeated _ iid -> Just iid
+  X.InvestigatorWhenDefeated _ iid -> Just iid
+  X.InvestigatorIsDefeated _ iid -> Just iid
+  X.InvestigatorKilled _ iid -> Just iid
+  X.InvestigatorWhenEliminated _ iid _ -> Just iid
+  X.InvestigatorEliminated iid -> Just iid
+  X.Resign iid -> Just iid
+  X.InvestigatorResigned iid -> Just iid
+  _ -> Nothing
+
+isPendingElimination :: Message -> Bool
+isPendingElimination = isJust . pendingElimination
+
+{- | Every investigator with an elimination still waiting in the queue.
+
+"Each investigator is defeated" queues one defeat per investigator, so the first
+one to resolve still sees the others as candidates for anything that asks who is
+left standing.
+-}
+getPendingEliminations :: HasQueue Message m => m [InvestigatorId]
+getPendingEliminations = mapMaybe (pendingElimination . stripQueueWrappers) <$> peekQueue

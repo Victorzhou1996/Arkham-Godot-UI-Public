@@ -1,0 +1,867 @@
+module Arkham.Helpers.Playable where
+
+import Arkham.Actions (isOrActions)
+import Arkham.Asset.Types (Field (..))
+import Arkham.Calculation
+import Arkham.Card
+import Arkham.ClassSymbol
+import Arkham.Classes.HasGame
+import Arkham.Classes.Query
+import Arkham.Cost
+import Arkham.Criteria qualified as Criteria
+import {-# SOURCE #-} Arkham.Game
+import Arkham.Helpers.Action (getActionCost, hasEvadeActions, hasFightActions)
+import Arkham.Helpers.Card (
+  cardInFastWindows,
+  getModifiedCardCost,
+  getPotentiallyModifiedCardCost,
+  passesLimits,
+ )
+import Arkham.Helpers.Cost (getCanAffordCost, getCanAffordCost_, getSpendableResources)
+import Arkham.Helpers.Criteria (passesCriteria)
+import Arkham.Helpers.Customization (customizedSlots)
+import Arkham.Helpers.Game (withDepthGuard)
+import Arkham.Helpers.Investigator (getAsIfInHandCards)
+import Arkham.Helpers.Location (getLocationOf)
+import Arkham.Helpers.Modifiers (
+  getFullModifiers,
+  getModifiers,
+  hasModifier,
+  toModifiers,
+  withModifiers,
+  withModifiersOf,
+ )
+import Arkham.Helpers.Query (getActiveInvestigatorId, getInvestigators)
+import Arkham.Helpers.Slot
+import Arkham.Id
+import Arkham.Investigator.Types (Field (..), Investigator, InvestigatorAttrs (..))
+import Arkham.Keyword qualified as Keyword
+import Arkham.Matcher hiding (DuringTurn)
+import Arkham.Matcher.Window qualified as Window
+import Arkham.Modifier
+import Arkham.Name
+import Arkham.Prelude
+import Arkham.Projection
+import Arkham.Source
+import Arkham.Taboo.Types
+import Arkham.Window
+import Control.Lens (over)
+import Data.Data.Lens (biplate)
+
+getPlayableCards
+  :: ( HasCallStack
+     , HasGame m
+     , Sourceable source
+     , AsId investigator
+     , IdOf investigator ~ InvestigatorId
+     )
+  => source -> investigator -> CostStatus -> [Window] -> m [Card]
+getPlayableCards source investigator costStatus windows' = do
+  let iid = asId investigator
+  cached (PlayableCardsKey iid (toSource source) costStatus windows') do
+    asIfInHandCards <- getAsIfInHandCards iid
+    otherPlayersPlayableCards <- getOtherPlayersPlayableCards iid costStatus windows'
+    playableDiscards <- getPlayableDiscards source iid costStatus windows'
+    hand <- field InvestigatorHand iid
+    playableHandCards <-
+      filterPlayable investigator source costStatus windows' (hand <> asIfInHandCards)
+    -- A discard card permitted by CanPlayTopmostOfDiscard/CanPlayFromDiscard is
+    -- collected by both getAsIfInHandCards and getPlayableDiscards; dedupe.
+    pure $ nub $ playableHandCards <> playableDiscards <> otherPlayersPlayableCards
+
+getPlayableCardsMatch
+  :: ( HasCallStack
+     , IsCardMatcher cardMatcher
+     , HasGame m
+     , Sourceable source
+     , AsId investigator
+     , IdOf investigator ~ InvestigatorId
+     )
+  => source -> investigator -> CostStatus -> [Window] -> cardMatcher -> m [Card]
+getPlayableCardsMatch source investigator costStatus windows' cardMatcher =
+  filterCards cardMatcher <$> getPlayableCards source investigator costStatus windows'
+
+getPlayableDiscards
+  :: (HasGame m, Sourceable source, AsId investigator, IdOf investigator ~ InvestigatorId)
+  => source -> investigator -> CostStatus -> [Window] -> m [Card]
+getPlayableDiscards source investigator costStatus windows' = do
+  attrs <- getAttrs @Investigator (asId investigator)
+  modifiers <- getModifiers (asId investigator)
+  filterM
+    (getIsPlayable (asId investigator) source costStatus windows')
+    (possibleCards attrs modifiers)
+ where
+  possibleCards attrs@InvestigatorAttrs {..} modifiers =
+    map (PlayerCard . snd) $ filter (canPlayFromDiscard attrs modifiers) (withIndex investigatorDiscard)
+  canPlayFromDiscard attrs modifiers (n, card) =
+    cdPlayableFromDiscard (toCardDef card) || any (allowsPlayFromDiscard attrs n card) modifiers
+  allowsPlayFromDiscard InvestigatorAttrs {..} 0 card (CanPlayTopmostOfDiscard (mcardType, traits)) =
+    let cardMatcher = maybe AnyCard CardWithType mcardType <> foldMap CardWithTrait traits
+        allMatches = filter (`cardMatch` cardMatcher) investigatorDiscard
+     in case allMatches of
+          (topmost : _) -> topmost == card
+          _ -> False
+  allowsPlayFromDiscard InvestigatorAttrs {..} _ card (CanPlayFromDiscard cardMatcher) =
+    let allMatches = filter (`cardMatch` cardMatcher) investigatorDiscard
+     in card `elem` allMatches
+  allowsPlayFromDiscard _ _ _ _ = False
+
+filterPlayable
+  :: ( HasCallStack
+     , HasGame m
+     , Sourceable source
+     , AsId investigator
+     , IdOf investigator ~ InvestigatorId
+     )
+  => investigator
+  -> source
+  -> CostStatus
+  -> [Window]
+  -> [Card]
+  -> m [Card]
+filterPlayable investigator source costStatus windows' cards =
+  filterM (getIsPlayable investigator source costStatus windows') cards
+
+getIsPlayable
+  :: ( HasCallStack
+     , HasGame m
+     , Sourceable source
+     , AsId investigator
+     , IdOf investigator ~ InvestigatorId
+     )
+  => investigator
+  -> source
+  -> CostStatus
+  -> [Window]
+  -> Card
+  -> m Bool
+getIsPlayable (asId -> iid) source costStatus windows' c = do
+  availableResources <- getSpendableResources iid
+  getIsPlayableWithResources iid source availableResources costStatus windows' c
+
+-- | Check whether an already-initiated card play remains legal. The original
+-- play window has already been validated and is no longer available while
+-- resolving reactions to playing the card, so only that check is omitted.
+getIsPlayableAfterInitiation
+  :: ( HasCallStack
+     , HasGame m
+     , Sourceable source
+     , AsId investigator
+     , IdOf investigator ~ InvestigatorId
+     )
+  => investigator
+  -> source
+  -> CostStatus
+  -> [Window]
+  -> Card
+  -> m Bool
+getIsPlayableAfterInitiation (asId -> iid) source costStatus windows' c = do
+  availableResources <- getSpendableResources iid
+  getIsPlayableWithResources' True iid source availableResources costStatus windows' c
+
+withReducedCost
+  :: ( HasGame m
+     , Sourceable source
+     , ToId investigator InvestigatorId
+     )
+  => investigator -> source -> Int -> ReaderT Game m a -> m a
+withReducedCost (asId -> iid) source n = withModifiersOf iid source [ReduceCostOf AnyCard n]
+
+getIsPlayableWithResources
+  :: forall m source investigator
+   . ( HasCallStack
+     , HasGame m
+     , Sourceable source
+     , AsId investigator
+     , IdOf investigator ~ InvestigatorId
+     )
+  => investigator
+  -> source
+  -> Int
+  -> CostStatus
+  -> [Window]
+  -> Card
+  -> m Bool
+getIsPlayableWithResources = getIsPlayableWithResources' False
+
+getIsPlayableWithResources'
+  :: forall m source investigator
+   . ( HasCallStack
+     , HasGame m
+     , Sourceable source
+     , AsId investigator
+     , IdOf investigator ~ InvestigatorId
+     )
+  => Bool
+  -> investigator
+  -> source
+  -> Int
+  -> CostStatus
+  -> [Window]
+  -> Card
+  -> m Bool
+getIsPlayableWithResources' initiated investigator source resources costStatus windows card =
+  playabilityPlayable <$> getCardPlayabilityWithResources initiated investigator source resources costStatus windows card
+
+-- Both flags come from the same legal context. In particular, being playable
+-- during a turn, or without spending an action, does not imply being Fast.
+data CardPlayability = CardPlayability
+  { playabilityPlayable :: Bool
+  , playabilityFast :: Bool
+  }
+
+getCardPlayability
+  :: (HasCallStack, HasGame m, Sourceable source)
+  => InvestigatorId -> source -> CostStatus -> [Window] -> Card -> m CardPlayability
+getCardPlayability iid source costStatus windows card = do
+  resources <- getSpendableResources iid
+  getCardPlayabilityWithResources False iid source resources costStatus windows card
+
+getCardPlayabilityWithResources
+  :: forall m source investigator
+   . (HasCallStack, HasGame m, Sourceable source, AsId investigator, IdOf investigator ~ InvestigatorId)
+  => Bool -> investigator -> source -> Int -> CostStatus -> [Window] -> Card -> m CardPlayability
+getCardPlayabilityWithResources _ _ _ _ _ _ (VengeanceCard _) = pure $ CardPlayability False False
+getCardPlayabilityWithResources _ _ _ _ _ _ (EncounterCard _) = pure $ CardPlayability False False
+getCardPlayabilityWithResources
+  playAlreadyInitiated
+  (asId -> iid)
+  (toSource -> source)
+  availableResources
+  costStatus
+  windows'
+  c@(PlayerCard _) = do
+    -- This asks "can iid play c", but the matcher language answers relative to
+    -- the game's active investigator: You/NotYou (Game.hs) and the
+    -- {Asset,Card,}PerformableAbility arms all read activeInvestigatorIdL rather
+    -- than the investigator we were handed. Evaluating another seat's hand while
+    -- they are not active therefore answers about the wrong investigator, and
+    -- their cards silently vanish from their own player window (#5612: Knowledge
+    -- is Power dropped because its criteria were checked against the other
+    -- investigator, who controls neither Tome). Establish the scope here, once
+    -- per card, so every caller of getIsPlayable/filterPlayable/getPlayableCards
+    -- is covered.
+    --
+    -- Skip re-entry when iid is already active (the overwhelming common case:
+    -- solo, and your own turn): asActive adds a ReaderT layer whose HasGame cache
+    -- is a no-op, and cache keys are not namespaced by active investigator, so
+    -- delegating the live cache across the swap would be unsound. Same trade-off
+    -- as getCanPerformAbility (Helpers/Ability.hs).
+    active <- getActiveInvestigatorId
+    if active == iid then run else asActive iid run
+   where
+    run :: forall n. HasGame n => n CardPlayability
+    run =
+      if c.kind `elem` [PlayerTreacheryType, PlayerEnemyType]
+        then pure $ CardPlayability False False
+        else do
+          ignoreContexts <- hasModifier iid IgnorePlayableModifierContexts
+          contexts :: [(CardMatcher, [ModifierType])] <-
+            concat . mapMaybe (preview _PlayableModifierContexts) <$> getModifiers iid
+          base <- go
+          others <-
+            traverse
+              (\(matcher, ctx) -> do
+                result <- withModifiers iid (toModifiers iid ctx) go
+                pure $ if cardMatch c matcher then result else CardPlayability False False)
+              (if ignoreContexts then [] else contexts)
+          pure $ CardPlayability
+            (any playabilityPlayable $ base : others)
+            (any playabilityFast $ base : others)
+    go :: forall n. HasGame n => n CardPlayability
+    go = do
+        -- Boolean path: short-circuit. A card rejected by a cheap check (type,
+        -- cost, play window, ...) must not pay for the expensive criteria /
+        -- fight-evade checks. The diagnostic path (getPlayabilityChecks) passes
+        -- False to compute every reason.
+      result <- getPlayabilityResultWithResources
+          True
+          playAlreadyInitiated
+          iid
+          source
+          availableResources
+          costStatus
+          windows'
+          c
+      let playable = all (isNothing . snd) $ playabilityChecks result
+      pure $ CardPlayability playable (playable && playabilityInFastWindow result)
+
+getOtherPlayersPlayableCards
+  :: HasGame m => InvestigatorId -> CostStatus -> [Window] -> m [Card]
+getOtherPlayersPlayableCards iid costStatus windows' = do
+  mods <- getModifiers iid
+  forMaybeM mods $ \case
+    PlayableCardOf _ c -> do
+      playable <- getIsPlayable iid (toSource iid) costStatus windows' c
+      pure $ guard playable $> c
+    _ -> pure Nothing
+
+{- | Whether a modifier forbids playing a card outright, leaving cost, timing,
+criteria and limits alone.
+
+This is the "Play restrictions" check, and the only part of playability that is
+a flat prohibition rather than a thing that changes from moment to moment --
+which is why 'getPlayProhibitions' can hand it to the client as "you cannot play
+this, and here is what is stopping you". One predicate for both, so the badge in
+hand cannot disagree with whether the engine offers the card.
+-}
+preventsPlay :: Card -> ModifierType -> Bool
+preventsPlay c = \case
+  -- Weaknesses do not interact with the class system (FAQ 1.35)
+  CanOnlyUseCardsInRole role ->
+    isNothing (cdCardSubType def)
+      && null (cdClassSymbols def `intersect` setFromList [Mythos, Neutral, role])
+  CannotPlay matcher -> cardMatch c matcher
+  CannotPutIntoPlay matcher -> cardMatch c matcher
+  _ -> False
+ where
+  def = toCardDef c
+
+{- | For each card the investigator could be asked to play -- their hand, plus
+whatever an effect lets them play from elsewhere -- the modifiers that forbid
+playing it, in full, so a caller can say which effect is responsible.
+
+A whole zone at a time, because the modifiers are read once rather than per
+card. The zone is the one 'getPlayableCards' draws from, so a hunch deck's top
+card or a discard an effect opened up is explained like anything in hand.
+
+Player cards only: an encounter card in hand is unplayable by its type, not by
+anything an effect did, and reporting it as forbidden would be a lie.
+-}
+getPlayProhibitions :: HasGame m => InvestigatorId -> m [(Card, [Modifier])]
+getPlayProhibitions iid = do
+  hand <- field InvestigatorHand iid
+  asIfInHand <- getAsIfInHandCards iid
+  mods <- getFullModifiers iid
+  pure [(c, prohibiting mods c) | c <- nub (hand <> asIfInHand)]
+ where
+  prohibiting mods = \case
+    c@(PlayerCard _) -> filter (preventsPlay c . modifierType) mods
+    _ -> []
+
+getPlayabilityChecks
+  :: ( HasCallStack
+     , HasGame m
+     , Sourceable source
+     , AsId investigator
+     , IdOf investigator ~ InvestigatorId
+     )
+  => investigator -> source -> CostStatus -> [Window] -> Card -> m [(Text, Maybe Text)]
+getPlayabilityChecks (asId -> iid) source costStatus windows' c = do
+  availableResources <- getSpendableResources iid
+  -- Diagnostic path: compute every check so the UI can report all reasons.
+  getPlayabilityChecksWithResources False False iid source availableResources costStatus windows' c
+
+getPlayabilityChecksWithResources
+  :: forall m source
+   . ( HasCallStack
+     , HasGame m
+     , Sourceable source
+     )
+  => Bool
+  {- ^ Short-circuit: stop at the first failed (cheap) check instead of
+  computing every check. Used by the boolean playability path; the
+  diagnostic path passes False to gather all failure reasons.
+  -}
+  -> Bool
+  {- ^ The card play was already initiated, so its original play window was validated. -}
+  -> InvestigatorId
+  -> source
+  -> Int
+  -> CostStatus
+  -> [Window]
+  -> Card
+  -> m [(Text, Maybe Text)]
+getPlayabilityChecksWithResources shortCircuit initiated iid source resources costStatus windows card =
+  playabilityChecks <$> getPlayabilityResultWithResources shortCircuit initiated iid source resources costStatus windows card
+
+data PlayabilityCheckResult = PlayabilityCheckResult
+  { playabilityChecks :: [(Text, Maybe Text)]
+  , playabilityInFastWindow :: Bool
+  }
+
+getPlayabilityResultWithResources
+  :: forall m source. (HasCallStack, HasGame m, Sourceable source)
+  => Bool -> Bool -> InvestigatorId -> source -> Int -> CostStatus -> [Window] -> Card -> m PlayabilityCheckResult
+getPlayabilityResultWithResources _ _ _ _ _ _ _ (VengeanceCard _) =
+  pure $ PlayabilityCheckResult [("Card type", Just "Vengeance cards are not playable")] False
+getPlayabilityResultWithResources _ _ _ _ _ _ _ (EncounterCard _) =
+  pure $ PlayabilityCheckResult [("Card type", Just "Encounter cards are not playable")] False
+getPlayabilityResultWithResources
+  shortCircuit
+  playAlreadyInitiated
+  iid
+  (toSource -> source)
+  availableResources
+  costStatus
+  windows'
+  c@(PlayerCard _) =
+  withDepthGuard 3 (PlayabilityCheckResult [] False) $ do
+    let pcDef = toCardDef c
+
+    -- Card type check
+    let
+      cardTypeOk = c.kind `notElem` [PlayerTreacheryType, PlayerEnemyType] && cdCardType pcDef /= SkillType
+      cardTypeDetail = if cardTypeOk then Nothing else Just $ tshow (cdCardType pcDef) <> " cards cannot be played"
+
+    -- Uniqueness check
+    let title = nameTitle (cdName pcDef)
+    uniquenessOk <- case (cdUnique pcDef, cdCardType pcDef) of
+      (True, AssetType) ->
+        not <$> case nameSubtitle (cdName pcDef) of
+          Nothing -> selectAny (InPlayAsset $ AssetWithTitle title)
+          Just subtitle -> selectAny (InPlayAsset $ AssetWithFullTitle title subtitle)
+      -- unique events that remain in play: The Raven Quill, Shrine of the Moirai
+      (True, EventType) ->
+        not <$> case nameSubtitle (cdName pcDef) of
+          Nothing -> selectAny (EventWithTitle title)
+          Just subtitle -> selectAny (EventWithFullTitle title subtitle)
+      _ -> pure True
+    let uniquenessDetail = if uniquenessOk then Nothing else Just $ "A copy of \"" <> title <> "\" is already in play"
+
+    -- Bob Jenkins check
+    let
+      bobJenkinsPlay = case toCardOwner c of
+        Just owner -> do
+          isBobCard <-
+            andM
+              [ pure $ c `cardMatch` card_ (#asset <> #item)
+              , owner <=~> affectsOthers (colocatedWith @InvestigatorId "08016")
+              ]
+          pure $ guard isBobCard $> ("08016" :: InvestigatorId)
+        Nothing -> pure Nothing
+    mPlayedBy <- case source of
+      AbilitySource (InvestigatorSource "08016") 1 -> bobJenkinsPlay
+      UseAbilitySource _ (InvestigatorSource "08016") 1 -> bobJenkinsPlay
+      _ -> pure Nothing
+    let isBobJenkins = isJust mPlayedBy
+
+    -- Play restrictions check
+    --
+    -- A "you cannot play" prohibition belongs to the investigator doing the
+    -- playing, which is not always the hand the card is in: Bob Jenkins plays
+    -- an Item out of a colocated teammate's hand, under *their* control, so it
+    -- is Bob who has to be allowed to play it. The teammate's Dissonant Voices
+    -- does not stop him and his own does (#5957). Matches PlayableCardExists
+    -- and PlayCard, which both ask this of Bob.
+    modifiers <- getModifiers iid
+    restrictionModifiers <- maybe (pure modifiers) getModifiers mPlayedBy
+    let
+      playRestrictionsOk = none (preventsPlay c) restrictionModifiers
+      playRestrictionsDetail =
+        if playRestrictionsOk then Nothing else Just "A modifier is preventing this card from being played"
+
+    mTaboo <- field InvestigatorTaboo iid
+
+    cardModifiers <- getModifiers c
+
+    {- Play-window pre-gate (performance only; no behavioural change).
+
+    The play-window check is the most discriminating check while resolving a
+    forced/reaction window -- during a LeavePlay or Discarded window essentially
+    nothing in hand is playable -- yet it sits after the resource-cost block,
+    which is now the most expensive part of this function. It is also the last
+    remaining input to 'cheapFail', so the resource block cannot be gated on
+    cheapFail the way limits/slots/action-cost are.
+
+    The exact check needs 'needsChuckFergus', which only the resource block can
+    compute, so it cannot simply be hoisted. Instead run it permissively with
+    'needsChuckFergus = False'. That is the monotone direction: it can only make
+    the ChuckFergus2Modifier case of 'applyModifierWith' -- and hence
+    'canBecomeFast' and the window -- MORE likely to pass. So a card rejected by
+    the pre-gate provably fails the exact check, and all the resource work for it
+    is dead. When the gate passes we fall through and compute exactly as before.
+
+    Boolean path only: the diagnostic path passes shortCircuit=False and still
+    computes and reports every reason.
+    -}
+    let
+      goNoAction = \case
+        UnpaidCost NoAction -> True
+        PaidCost -> True
+        AuxiliaryCost _ inner -> goNoAction inner
+        _ -> False
+      noAction = isNothing (cdFastWindow pcDef) && goNoAction costStatus
+      duringTurnWindow' = mkWhen (DuringTurn iid)
+      -- A non-fast card may be played in an action-taking context: a genuine
+      -- DuringTurn window OR the NonFast window (the latter is present during a
+      -- granted "as if it were your turn" action). See #4894.
+      notFastWindow = duringTurnWindow' `elem` windows' || mkWhen NonFast `elem` windows'
+      applyModifierWith needsChuck m val = case m of
+        BecomesFast _ -> True
+        CanBecomeFast cardMatcher -> cardMatch c cardMatcher
+        ChuckFergus2Modifier cardMatcher _ ->
+          not needsChuck
+            && cardMatch c cardMatcher
+            && (maybe True (< TabooList24) mTaboo || notFastWindow)
+        _ -> val
+      canBecomeFastWith needsChuck =
+        CannotPlay FastCard
+          `notElem` modifiers
+          && foldr (applyModifierWith needsChuck) False (nub $ cardModifiers <> modifiers)
+      canBecomeFastWindowWith needsChuck =
+        guard (canBecomeFastWith needsChuck)
+          $> fromMaybe
+            (Window.DuringTurn You)
+            (listToMaybe [w | BecomesFast w <- cardModifiers <> modifiers])
+      matchesFastWindowWith needsChuck =
+        maybe
+          (pure False)
+          (cardInFastWindows iid source c windows')
+          (cdFastWindow pcDef <|> canBecomeFastWindowWith needsChuck)
+      playWindowOkGiven inFast =
+        playAlreadyInitiated
+          || (isNothing (cdFastWindow pcDef) && notFastWindow)
+          || inFast
+          || isBobJenkins
+          || noAction
+      playWindowDetailFor ok =
+        if ok
+          then Nothing
+          else
+            if isJust (cdFastWindow pcDef)
+              then Just "Fast card: not in a valid fast window"
+              else Just "Not in a valid play window (not during your turn)"
+
+    permissiveWindowOk <- playWindowOkGiven <$> matchesFastWindowWith False
+
+    if shortCircuit && not permissiveWindowOk
+      then pure $ PlayabilityCheckResult [("Play window", playWindowDetailFor False)] False
+      else do
+        -- Resource cost check
+        iids <- filter (/= iid) <$> getInvestigators
+        iidsWithModifiers <- for iids \iid' -> (iid',) <$> getModifiers iid'
+        canHelpPay <-
+          iidsWithModifiers & filterM \(_iid', modifiers') -> do
+            modifiers' & anyM \case
+              CanSpendResourcesOnCardFromInvestigator iMatcher cMatcher -> runValidT do
+                guard $ cardMatch c cMatcher
+                guard $ CannotAffectOtherPlayersWithPlayerEffectsExceptDamage `notElem` modifiers'
+                liftGuardM $ iid <=~> iMatcher
+              _ -> pure False
+        resourcesFromAssets <-
+          sum <$> for ((iid, modifiers) : iidsWithModifiers) \(iid', modifiers') -> do
+            sum <$> for modifiers' \case
+              CanSpendUsesAsResourceOnCardFromInvestigator assetId uType iMatcher cMatcher | cardMatch c cMatcher -> do
+                let canAffect = iid == iid' || CannotAffectOtherPlayersWithPlayerEffectsExceptDamage `notElem` modifiers'
+                canContribute <- (canAffect &&) <$> iid <=~> iMatcher
+                if canContribute
+                  then fieldMap AssetUses (findWithDefault 0 uType) assetId
+                  else pure 0
+              _ -> pure 0
+        additionalResources <-
+          (resourcesFromAssets +)
+            . sum
+            <$> traverse (field InvestigatorResources . fst) canHelpPay
+        let
+          alternateResourceCost = \case
+            AlternateResourceCost cardMatcher cost | c `cardMatch` cardMatcher -> Just cost
+            CanModify (AlternateResourceCost cardMatcher cost) | c `cardMatch` cardMatcher -> Just cost
+            _ -> Nothing
+          alternateResourceCosts = mapMaybe alternateResourceCost modifiers
+        canAffordAlternateResourceCost <- case alternateResourceCosts of
+          [] -> pure False
+          _ -> anyM (getCanAffordCost iid source (pcDef.actions) windows') alternateResourceCosts
+        mBaseModifiedCardCost <- getModifiedCardCost iid c
+        mModifiedCardCost <-
+          maybe (pure Nothing) (fmap Just . getPotentiallyModifiedCardCost iid c True) mBaseModifiedCardCost
+        mModifiedCardCostWithChuckFergus <-
+          maybe (pure Nothing) (fmap Just . getPotentiallyModifiedCardCost iid c False) mBaseModifiedCardCost
+        let
+          auxiliaryCosts =
+            case costStatus of
+              AuxiliaryCost x _ -> [x]
+              _ -> []
+          auxiliaryResourceCosts = totalResourceCost (mconcat auxiliaryCosts)
+          totalAvailable = availableResources + additionalResources
+          canAffordCost' = case mModifiedCardCost of
+            Nothing -> False
+            Just modifiedCardCost ->
+              modifiedCardCost + auxiliaryResourceCosts <= totalAvailable
+          canAffordWithChuck = case mModifiedCardCostWithChuckFergus of
+            Nothing -> False
+            Just modifiedCardCostWithChuckFergus ->
+              modifiedCardCostWithChuckFergus + auxiliaryResourceCosts <= totalAvailable
+          canAffordCost = canAffordCost' || canAffordWithChuck
+          needsChuckFergus = not canAffordCost' && canAffordWithChuck
+          resourceCostDetail =
+            if costStatus == PaidCost || canAffordCost || canAffordAlternateResourceCost
+              then Nothing
+              else
+                let need = maybe 0 (+ auxiliaryResourceCosts) mModifiedCardCost
+                 in Just $ "Need " <> tshow need <> " resources, have " <> tshow totalAvailable
+
+
+        -- Reaction windows only retain the PlayCard/PlayEvent window, not the
+        -- original window in which the player initiated the card. Treat that
+        -- timing as already satisfied while still validating criteria, targets,
+        -- limits, slots, and restrictions without reaction-provided modifiers.
+        inFastWindow <- matchesFastWindowWith needsChuckFergus
+        let
+          playWindowOk = playWindowOkGiven inFastWindow
+          playWindowDetail = playWindowDetailFor playWindowOk
+
+        -- Cheap-check short-circuit gate. If any cheap check has already failed the
+        -- card is unplayable regardless of criteria/actions, so skip the expensive
+        -- criteria and fight/evade/investigate checks. Only active on the boolean
+        -- playability path; the diagnostic path passes shortCircuit=False and so
+        -- still computes (and reports) every check.
+        let
+          cheapFail =
+            shortCircuit
+              && any
+                isJust
+                [ cardTypeDetail
+                , uniquenessDetail
+                , playRestrictionsDetail
+                , resourceCostDetail
+                , playWindowDetail
+                ]
+
+        -- Criteria check (skipped when a cheap check already failed)
+        criteriaDetail <-
+          if cheapFail
+            then pure Nothing
+            else do
+              let
+                handleCriteriaReplacement _ (CanPlayWithOverride (Criteria.CriteriaOverride cOverride)) = Just cOverride
+                handleCriteriaReplacement m _ = m
+                resolvedCriteria =
+                  foldl'
+                    handleCriteriaReplacement
+                    (replaceYouMatcher iid $ over biplate (replaceThisCard' c) $ cdCriteria pcDef)
+                    cardModifiers
+              criteriaOk <-
+                maybe
+                  (pure True)
+                  (passesCriteria iid (Just (c, costStatus)) source (CardIdSource c.id) windows')
+                  resolvedCriteria
+              if criteriaOk
+                then pure Nothing
+                else case resolvedCriteria of
+                  Nothing -> pure (Just "No criteria defined but check failed")
+                  Just (Criteria.Criteria items) -> do
+                    failed <-
+                      filterM
+                        (\ctr -> not <$> passesCriteria iid (Just (c, costStatus)) source (CardIdSource c.id) windows' ctr)
+                        items
+                    pure $ Just $ "Failed: " <> mconcat (intersperse ", " (map tshow failed))
+                  Just ctr -> pure $ Just $ "Not met: " <> tshow ctr
+
+        -- Limits check (skipped when a cheap check already failed, like the
+        -- fight/evade/investigate checks below)
+        limitsOk <-
+          if cheapFail
+            then pure True
+            else passesLimits (if isBobJenkins then fromMaybe iid c.owner else iid) c
+        let limitsDetail = if limitsOk then Nothing else Just "Per-round or per-game limit has been reached"
+
+        -- Slots check
+        let effectiveSlots = customizedSlots c
+        slotsOk <-
+          if cheapFail || null effectiveSlots
+            then pure True
+            else do
+              possibleSlots <- getPotentialSlots c iid
+              pure $ null $ effectiveSlots \\ possibleSlots
+        let slotsDetail = if slotsOk then Nothing else Just $ "No available slot of type: " <> tshow effectiveSlots
+
+        -- Evade/Fight actions check
+        let cardHasOrActions = isOrActions (cdActions pcDef)
+        let hasEvade =
+              #evade
+                `elem` pcDef.actions
+                && not (cdOverrideActionPlayableIfCriteriaMet pcDef && #evade `elem` pcDef.actions)
+        -- Only the fight/evade checks consume these, and those are gated on
+        -- 'cheapFail' too, so computing them for an already-failed card is waste.
+        ac <-
+          if cheapFail
+            then pure 0
+            else do
+              attrs <- getAttrs @Investigator iid
+              getActionCost attrs (pcDef.actions <> [#play | costStatus == UnpaidCost NeedsAction])
+        let
+          -- An action-taking context for iid: a genuine DuringTurn window for iid, or
+          -- the NonFast window (present during a granted action). See #4894.
+          isActionWindow = \case
+            (windowType -> DuringTurn iid') -> iid == iid'
+            (windowType -> NonFast) -> True
+            _ -> False
+          doAsIfTurn = any isActionWindow windows'
+          actionWindows = defaultWindows iid <> windows'
+          -- Only widen the playability probe for this exact card when a modifier says
+          -- the card may be played at another location (Miguel's Knapsack, etc.).
+          -- This does not alter generic fight/evade actions: it is scoped to this
+          -- card's playability check and uses AsIfAt only for candidate locations
+          -- granted by a matching CanPlayAtLocation modifier.
+          canPlayAtLocationMatchers =
+            [ lmatch
+            | CanModify (CanPlayAtLocation cmatch lmatch) <- modifiers
+            , cardMatch c cmatch
+            ]
+          actionCostModifiers = toModifiers GameSource [ActionCostModifier (-ac)]
+          grantedLocationModifiers lid = do
+            acMods <- actionCostModifiers
+            asIfAtModifiers <- toModifiers (CardIdSource c.id) [AsIfAt lid]
+            pure $ acMods <> asIfAtModifiers
+          checkEvadeAtCurrentLocation = withModifiers iid actionCostModifiers do
+            if inFastWindow || doAsIfTurn
+              then
+                asIfTurn iid $ hasEvadeActions iid (CardIdSource c.id) (Window.DuringYourAction You) actionWindows
+              else hasEvadeActions iid (CardIdSource c.id) (Window.DuringYourAction You) actionWindows
+          checkEvadeAtGrantedLocation lid = withModifiers iid (grantedLocationModifiers lid) do
+            if inFastWindow || doAsIfTurn
+              then
+                asIfTurn iid $ hasEvadeActions iid (CardIdSource c.id) (Window.DuringYourAction You) actionWindows
+              else hasEvadeActions iid (CardIdSource c.id) (Window.DuringYourAction You) actionWindows
+          checkEvadeLocalOrGranted = do
+            localOk <- checkEvadeAtCurrentLocation
+            if localOk || null canPlayAtLocationMatchers
+              then pure localOk
+              else do
+                lids <- nub . concat <$> traverse select canPlayAtLocationMatchers
+                anyM checkEvadeAtGrantedLocation lids
+        evadeOk <-
+          if hasEvade && not cheapFail
+            then checkEvadeLocalOrGranted
+            else pure True
+        let evadeDetail = if evadeOk then Nothing else Just "No enemy at your location that can be evaded"
+
+        -- Fight actions check (only if card has fight action)
+        let hasFight =
+              #fight
+                `elem` pcDef.actions
+                && not (cdOverrideActionPlayableIfCriteriaMet pcDef && #fight `elem` pcDef.actions)
+        fightOk <-
+          if hasFight && not cheapFail
+            then do
+              let
+                checkFightAtCurrentLocation = withModifiers iid actionCostModifiers do
+                  if inFastWindow || doAsIfTurn
+                    then
+                      asIfTurn iid $ hasFightActions iid (CardIdSource c.id) (Window.DuringYourAction You) actionWindows
+                    else hasFightActions iid (CardIdSource c.id) (Window.DuringYourAction You) actionWindows
+                checkFightAtGrantedLocation lid = withModifiers iid (grantedLocationModifiers lid) do
+                  if inFastWindow || doAsIfTurn
+                    then
+                      asIfTurn iid $ hasFightActions iid (CardIdSource c.id) (Window.DuringYourAction You) actionWindows
+                    else hasFightActions iid (CardIdSource c.id) (Window.DuringYourAction You) actionWindows
+              localOk <- checkFightAtCurrentLocation
+              if localOk || null canPlayAtLocationMatchers
+                then pure localOk
+                else do
+                  lids <- nub . concat <$> traverse select canPlayAtLocationMatchers
+                  anyM checkFightAtGrantedLocation lids
+            else pure True
+        let fightDetail = if fightOk then Nothing else Just "No enemy at your location that can be fought"
+
+        -- Investigate check (only if card has investigate action)
+        let hasInvestigate = #investigate `elem` pcDef.actions && not cardHasOrActions
+        investigateOk <-
+          if hasInvestigate && not cheapFail
+            then do
+              mloc <- getLocationOf iid
+              case mloc of
+                Nothing -> pure False
+                Just loc -> andM [loc <=~> InvestigatableLocation, not <$> hasModifier iid (CannotInvestigateLocation loc)]
+            else pure True
+        investigateDetail <-
+          if investigateOk
+            then pure Nothing
+            else do
+              mloc <- getLocationOf iid
+              pure $ Just $ case mloc of
+                Nothing -> "You are not at a location"
+                Just _ -> "Your location cannot be investigated"
+
+        -- Action cost check
+        let
+          goActionCost = \case
+            PaidCost -> 0
+            UnpaidCost NoAction -> max 0 $ subtract 1 ac
+            UnpaidCost NeedsAction -> ac
+            AuxiliaryCost _ inner -> goActionCost inner
+          actionCost = goActionCost costStatus
+        -- These feed only 'actionCostOk' below, which is itself gated on
+        -- 'cheapFail'. Gathering them for an already-failed card costs a
+        -- 'c <=~> match' query per modifier, per card, per window.
+        additionalCosts <-
+          if cheapFail
+            then pure []
+            else (modifiers <> cardModifiers) & mapMaybeM \case
+              AdditionalCost n -> pure (guard (costStatus /= PaidCost) $> n)
+              AdditionalPlayCostOf match additionalCost -> do
+                isMatch' <- c <=~> match
+                pure $ guard isMatch' $> additionalCost
+              _ -> pure Nothing
+        investigateCosts <- runDefaultMaybeT [] do
+          guard $ not cheapFail
+          guard $ case costStatus of
+            UnpaidCost _ -> True
+            _ -> False
+          guard $ #investigate `elem` pcDef.actions
+          lid <- MaybeT $ getLocationOf iid
+          mods <- lift $ getModifiers lid
+          pure [m | AdditionalCostToInvestigate m <- mods]
+        let
+          sealingToCost = \case
+            Keyword.Sealing matcher -> Just $ SealCost matcher
+            Keyword.SealUpTo n matcher -> Just $ UpTo (Fixed n) (SealCost matcher)
+            Keyword.SealOneOf (m1 :| rest) -> Just $ OrCost $ mapMaybe sealingToCost (m1 : rest)
+            Keyword.SealUpToX _ -> Nothing
+          sealedChaosTokenCost = flip mapMaybe (setToList $ cdKeywords pcDef) $ \case
+            Keyword.Seal sealing -> if costStatus == PaidCost then Nothing else sealingToCost sealing
+            _ -> Nothing
+        resignCosts <- runDefaultMaybeT [] do
+          guard $ not cheapFail
+          guard $ #resign `elem` pcDef.actions
+          lid <- MaybeT $ field InvestigatorLocation iid
+          mods <- lift $ getModifiers lid
+          pure [m | AdditionalCostToResign m <- mods]
+        actionCostOk <-
+          if cheapFail
+            then pure True
+            else
+              getCanAffordCost_ iid (CardIdSource c.id) c.actions windows' False
+                $ fold
+                $ [ActionCost actionCost | actionCost > 0 && not inFastWindow && costStatus /= PaidCost]
+                <> additionalCosts
+                <> investigateCosts
+                <> auxiliaryCosts
+                <> resignCosts
+                <> sealedChaosTokenCost
+                <> [fromMaybe mempty (cdAdditionalCost pcDef) | costStatus /= PaidCost]
+        let actionCostDetail =
+              if actionCostOk
+                then Nothing
+                else Just $ "Cannot afford action cost (" <> tshow actionCost <> " action(s) required)"
+
+        let
+          checks =
+            [ ("Card type", cardTypeDetail)
+            , ("Uniqueness", uniquenessDetail)
+            , ("Play restrictions", playRestrictionsDetail)
+            , ("Resource cost", resourceCostDetail)
+            , ("Criteria", criteriaDetail)
+            , ("Play window", playWindowDetail)
+            , ("Limits", limitsDetail)
+            ]
+              <> [("Slots", slotsDetail) | not (null effectiveSlots)]
+              <> if cardHasOrActions && hasEvade && hasFight
+                then
+                  [
+                    ( "Fight or Evade"
+                    , if fightOk || evadeOk then Nothing else Just "No enemy that can be fought or evaded"
+                    )
+                  ]
+                else
+                  [("Evade actions", evadeDetail) | hasEvade]
+                    <> [("Fight actions", fightDetail) | hasFight]
+                    <> [("Investigate", investigateDetail) | hasInvestigate]
+                    <> [("Action cost", actionCostDetail)]
+        pure $ PlayabilityCheckResult checks inFastWindow
+     where
+      replaceThisCard' :: Card -> Source -> Source
+      replaceThisCard' c' = \case
+        ThisCard -> CardCostSource (toCardId c')
+        s -> s

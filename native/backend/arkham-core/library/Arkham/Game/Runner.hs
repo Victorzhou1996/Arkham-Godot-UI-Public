@@ -1,0 +1,4996 @@
+{-# OPTIONS_GHC -Wno-orphans #-}
+
+module Arkham.Game.Runner where
+
+import Arkham.Ability
+import Arkham.Act
+import Arkham.Act.Types (Field (..))
+import Arkham.Action qualified as Action
+import Arkham.ActiveCost
+import Arkham.Agenda
+import Arkham.Agenda.Types (Field (..), doomL)
+import Arkham.Asset
+import Arkham.Asset.Cards qualified as Assets
+import Arkham.Asset.Types (Asset, AssetAttrs (..), Field (..), assetIsStory)
+import Arkham.Attack
+import Arkham.Calculation qualified as Calc
+import Arkham.Campaign.Option
+import Arkham.Campaign.Types hiding (campaign, modifiersL)
+import Arkham.CampaignLog
+import Arkham.Campaigns.TheScarletKeys.Key.Id
+import Arkham.Campaigns.TheScarletKeys.Keys
+import Arkham.Card
+import Arkham.Card.PlayerCard
+import Arkham.Card.Settings
+import Arkham.Classes
+import Arkham.Classes.HasGame
+import Arkham.Cost qualified as Cost
+import Arkham.DamageEffect
+import Arkham.Debug
+import Arkham.Debug.CardDestination
+import Arkham.Debug.SkillTest
+import Arkham.Deck qualified as Deck
+import Arkham.Decklist
+import Arkham.Decklist.RandomBasicWeakness (
+  RandomBasicWeaknessContext (..),
+  sampleRandomBasicWeaknessMatching,
+ )
+import Arkham.Difficulty
+import Arkham.Effect
+import Arkham.Effect.Types (EffectAttrs (effectFinished, effectOnDisable))
+import Arkham.Effect.Window (EffectWindow (EffectCardResolutionWindow))
+import Arkham.Enemy
+import Arkham.Enemy.Creation (EnemyCreation (..), EnemyCreationMethod (..))
+import Arkham.Enemy.Runner (getPreyMatcher)
+import Arkham.Enemy.Types (Enemy, EnemyAttrs (..), Field (..), delayEngagementL)
+import Arkham.Enemy.Types qualified as Field
+import Arkham.EnemyLocation hiding (EnemyLocation)
+import Arkham.EnemyLocation.Types (EnemyLocationAttrs (..))
+import Arkham.Entities
+import Arkham.Event
+import Arkham.Event.Types
+import Arkham.Game.Base
+import Arkham.Game.Diff
+import Arkham.Game.Json ()
+import Arkham.Game.Outcome
+import Arkham.Game.Settings (
+  activeUltimatumsAndBoons,
+  settingsAsIfRuling,
+  settingsCustomRandomWeaknessPools,
+  settingsRolledUltimatumOrBoon,
+  settingsScreamedAllies,
+  settingsUltimatumsAndBoons,
+  settingsUltimatumsAndBoonsEnabled,
+ )
+import Arkham.Game.State
+import Arkham.Game.Utils
+import Arkham.GameEnv
+import Arkham.GameT (GameT)
+import Arkham.Helpers
+import Arkham.Helpers.Ability (abilityRidesAlong, isForcedAbility)
+import Arkham.Helpers.Action (getPreventedActions, getPreventedPlayerAbilities)
+import Arkham.Helpers.ChaosBag (getBagChaosTokens)
+import Arkham.Helpers.Criteria
+import Arkham.Helpers.Customization
+import Arkham.Helpers.Enemy (getModifiedKeywords, spawnAt)
+import Arkham.Helpers.Investigator hiding (findCard, investigator)
+import Arkham.Helpers.Log (hasCampaignOption)
+import Arkham.Helpers.Message hiding (
+  InvestigatorDamage,
+  InvestigatorDefeated,
+  InvestigatorResigned,
+  createEnemy,
+ )
+import Arkham.Helpers.Modifiers hiding (createWindowModifierEffect)
+import Arkham.Helpers.Phases (runEnemyPhase)
+import Arkham.Helpers.Playable
+import Arkham.Helpers.Query
+import Arkham.Helpers.Ref
+import Arkham.Helpers.Scenario
+import Arkham.Helpers.Slot (retainSlotAssets, slotSource)
+import Arkham.Helpers.Source
+import Arkham.Helpers.Window hiding (getAsset, getEnemy, getLocation)
+import Arkham.History
+import Arkham.I18n
+import Arkham.Id
+import Arkham.Investigator (
+  InvestigatorForm (..),
+  becomeHomunculus,
+  becomeShatteredSelf,
+  becomeYithian,
+  lookupInvestigator,
+  returnFromShatteredSelf,
+  returnToBody,
+ )
+import Arkham.Investigator.Cards qualified as Investigators
+import Arkham.Investigator.Types (Investigator, InvestigatorAttrs (..))
+import Arkham.Investigator.Types qualified as Investigator
+import Arkham.Keyword qualified as Keyword
+import Arkham.Location
+import Arkham.Location.Types (Field (..), LocationAttrs (..), updateLocation)
+import Arkham.Log qualified as Log
+import Arkham.Matcher hiding (
+  AssetCard,
+  AssetDefeated,
+  AssetExhausted,
+  Discarded,
+  DuringTurn,
+  EncounterCardSource,
+  EnemyAttacks,
+  EventCard,
+  FastPlayerWindow,
+  InvestigatorDefeated,
+  InvestigatorEliminated,
+  LocationCard,
+  PlayCard,
+  RevealLocation,
+  SkillCard,
+  StoryCard,
+ )
+import Arkham.Message qualified as Msg
+import Arkham.Message.Lifted (removeLocation)
+import Arkham.Message.Lifted qualified as Lifted
+import Arkham.Modifier (Modifier (Modifier, modifierSource, modifierType))
+import Arkham.Movement
+import Arkham.Name
+import Arkham.Phase
+import Arkham.Placement
+import Arkham.Placement qualified as Placement
+import Arkham.Prelude
+import Arkham.Projection
+import Arkham.Scenario
+import Arkham.Scenario.Options
+import Arkham.Scenario.Types hiding (foundCardsL, scenario)
+import Arkham.Skill
+import Arkham.Skill.Types (Field (..), Skill, SkillAttrs (..))
+import Arkham.Skill.Types qualified as Skill
+import Arkham.SkillTest.Runner
+import Arkham.SkillTestResult
+import Arkham.Source
+import Arkham.Spawn
+import Arkham.Story
+import Arkham.Story.Types (Field (..), StoryAttrs (..))
+import Arkham.Story.Types qualified as Story
+import Arkham.Target
+import Arkham.Tarot qualified as Tarot
+import Arkham.Timing qualified as Timing
+import Arkham.Token qualified as Token
+import Arkham.Treachery
+import Arkham.Treachery.Types (
+  Field (..),
+  Treachery,
+  drawnFromL,
+  treacheryPlacement,
+  treacheryWaiting,
+ )
+import Arkham.UltimatumsAndBoons.Types
+import Arkham.Window (Window (..), mkAfter, mkCancel, mkWhen, mkWindow)
+import Arkham.Window qualified as Window
+import Arkham.Zone qualified as Zone
+import Control.Lens (each, itraverseOf, itraversed, non, over, set)
+import Data.Aeson (Result (..))
+import Data.Data.Lens (biplate)
+import Data.IntMap.Strict qualified as IntMap
+import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
+import Data.These
+import Data.These.Lens
+import Data.Typeable
+
+getInvestigatorsInOrder :: HasGame m => m [InvestigatorId]
+getInvestigatorsInOrder = do
+  g <- getGame
+  pure $ g ^. playerOrderL
+
+{- | The revelation messages to push for a card that is resolving its revelation,
+honouring 'AdditionalRevelations' ("resolve its revelation effect an additional
+time"). Only the revelation itself repeats: callers keep the surrounding
+@When revelation@ and @After revelation@ single, so the card is discarded once,
+marked resolved once, and surges at most once no matter how many times its
+revelation resolves.
+-}
+resolveRevelations :: [ModifierType] -> Message -> [Message]
+resolveRevelations modifiers' revelation =
+  replicate (1 + max 0 (sum [n | AdditionalRevelations n <- modifiers'])) revelation
+
+-- | Whether a departing investigator is kept for a possible return.
+data Departure = SetAside | ForgetSeat
+  deriving stock Eq
+
+{- | Take an investigator out of the game between scenarios.
+
+'SetAside' keeps the whole entity in 'gameRetiredInvestigators', so rejoining
+restores the xp and trauma the campaign log recorded for them. 'ForgetSeat' is for
+an investigator who never played: nothing remembers them afterwards.
+-}
+removeSeat :: Departure -> InvestigatorId -> Game -> Game
+removeSeat departure iid g = case Map.lookup iid (g ^. entitiesL . investigatorsL) of
+  Nothing -> g
+  Just investigator ->
+    g
+      & (retiredInvestigatorsL %~ if departure == SetAside then Map.insert iid investigator else id)
+      & (entitiesL . investigatorsL .~ remaining)
+      & (playersL .~ remainingPlayers)
+      & (playerOrderL .~ order)
+      & (playerCountL %~ max 1 . subtract 1)
+      & (inHandEntitiesL %~ Map.delete iid)
+      & (committedEntitiesL %~ Map.delete iid)
+      & (inDiscardEntitiesL %~ Map.delete iid)
+      & (phaseHistoryL %~ Map.delete iid)
+      & (turnHistoryL %~ Map.delete iid)
+      & (roundHistoryL %~ Map.delete iid)
+      & (questionL %~ Map.delete pid)
+      & (modifiersL %~ Map.delete (InvestigatorTarget iid))
+      & (cardUsesL %~ Map.map (filter (/= iid)))
+      & (activeInvestigatorIdL %~ replaceIid)
+      & (leadInvestigatorIdL %~ replaceIid)
+      & (turnPlayerInvestigatorIdL %~ fmap replaceIid)
+      & (activePlayerIdL %~ replacePid)
+   where
+    pid = attr investigatorPlayerId investigator
+    remaining = Map.delete iid (g ^. entitiesL . investigatorsL)
+    order = filter (/= iid) (gamePlayerOrder g)
+    remainingPlayers = filter (/= pid) (gamePlayers g)
+    -- The departing seat can be the lead or the active one; hand those to whoever
+    -- is left rather than leaving the game pointing at an absent investigator.
+    heir = fromMaybe iid (headMay order <|> headMay (Map.keys remaining))
+    heirPid = fromMaybe pid (headMay remainingPlayers)
+    replaceIid x = if x == iid then heir else x
+    replacePid x = if x == pid then heirPid else x
+
+-- fight/evade choices coerce as-if-enemy locations and assets into EnemyId, so
+-- only a real enemy counts as the event's target
+setEventEnemyTarget :: HasGame m => EventId -> EnemyId -> Game -> m Game
+setEventEnemyTarget eid enemyId g = do
+  isEnemy <- selectAny $ EnemyWithId enemyId
+  pure $ if isEnemy then setEventTarget eid (EnemyTarget enemyId) g else g
+
+{- | First target an event picks sticks, later choices are not what it targeted.
+A card in hand or discard is skipped: no "targets an X" matcher reads
+'CardIdTarget', and recording it would hide the real target behind an earlier
+discard\/play choice (Blood Rite picks the card to discard before its enemy).
+-}
+setEventTarget :: EventId -> Target -> Game -> Game
+setEventTarget _ (CardIdTarget _) = id
+setEventTarget eid target =
+  entitiesL . eventsL . ix eid %~ overAttrs \attrs ->
+    if isJust attrs.target then attrs else attrs {eventTarget = Just target}
+
+{- | The innermost event still resolving, i.e. the first pending 'FinishedEvent'
+in the queue. An event played during another event's resolution pushes its own
+'FinishedEvent' in front, so the first one found is the one whose messages are
+running now.
+-}
+resolvingEventId :: [Message] -> Maybe EventId
+resolvingEventId = go
+ where
+  go [] = Nothing
+  go (m : ms) = case m of
+    FinishedEvent eid -> Just eid
+    Run xs -> go (xs <> ms)
+    Simultaneously xs -> go (xs <> ms)
+    Would _ xs -> go (xs <> ms)
+    MoveWithSkillTest x -> go (x : ms)
+    Do x -> go (x : ms)
+    Priority x -> go (x : ms)
+    Retain x -> go (x : ms)
+    _ -> go ms
+
+{- | Whether a seat's window ask consists solely of non-blocking reactions (plus the Skip
+Triggers button). Such an ask is dropped unless some other seat is stopping the window
+anyway -- see the @WindowAsk@ handler. A question with no ability choices at all is not
+"only non-blocking": it has something real to offer.
+-}
+questionIsOnlyNonBlocking :: HasGame m => Question Message -> m Bool
+questionIsOnlyNonBlocking q = case q of
+  ChooseOne cs -> go cs
+  WindowChooseOne cs -> go cs
+  PlayerWindowChooseOne cs -> go cs
+  _ -> pure False
+ where
+  go cs = if null [() | AbilityLabel {} <- cs] then pure False else allM ok cs
+  ok = \case
+    AbilityLabel {investigatorId = i, ability = ab, windows = ws} -> abilityRidesAlong i ws ab
+    SkipTriggersButton {} -> pure True
+    _ -> pure False
+
+-- | Card codes recorded in 'cardUsesL' that carry a limit matching the predicate.
+cardUsesMatching :: (CardLimit -> Bool) -> Game -> [CardCode]
+cardUsesMatching p g =
+  map cdCardCode
+    . filter (any p . cdLimits)
+    . mapMaybe lookupCardDef
+    $ Map.keys (view cardUsesL g)
+
+isPerRoundLimit :: CardLimit -> Bool
+isPerRoundLimit = \case
+  MaxPerRound _ -> True
+  MaxPerTraitPerRound _ _ -> True
+  LimitPerRound _ -> True
+  _ -> False
+
+isPerTurnLimit :: CardLimit -> Bool
+isPerTurnLimit = \case
+  MaxPerTurn _ -> True
+  _ -> False
+
+{- | Stop the game, recording how it ended.
+
+@mverdict@ is what the ending declared, if it declared anything ('GameOverWith').
+Without one the outcome is inferred -- from the campaign's step and resolutions,
+or, for a standalone, from the resolution the scenario reached. The mode is
+collapsed to the campaign here, which drops the scenario, so the outcome is
+computed first.
+-}
+endGame :: Maybe Verdict -> Game -> GameT Game
+endGame mverdict g = do
+  clearQueue
+  pure $ g & (gameStateL .~ IsOver) & (modeL .~ newMode) & (outcomeL .~ outcome)
+ where
+  mode = g ^. modeL
+  newMode = case mode of
+    This c -> This c
+    That c -> That c
+    These c1 _ -> This c1
+  ending = g ^. lastResolutionL
+  outcome = case mverdict of
+    Just verdict -> Just $ GameOutcome verdict ending Recorded
+    Nothing -> case modeCampaign mode of
+      Just c ->
+        let attrs = toAttrs c
+         in withEnding
+              <$> inferCampaignOutcome
+                (campaignId attrs)
+                (campaignStep attrs)
+                (campaignCompletedSteps attrs)
+                (campaignResolutions attrs)
+      Nothing -> standaloneOutcome <$> ending
+  -- The resolution the game actually saw beats the one reconstructed from the
+  -- campaign's records, which cannot tell which scenario was last.
+  withEnding o = o {outcomeEnding = ending <|> outcomeEnding o}
+
+{- | The state a turn is played out of, shared by beginning one ('BeginTurn') and
+picking a suspended one back up ('Arkham.Question.ResumeTurnPlayer'). The
+windows are the caller's business; this is only the bookkeeping, and a resumed
+turn needs all of it -- in particular the undo boundary, so an undo from inside
+the resumed turn lands at its first action and not back in the mythos phase.
+-}
+turnStartState :: InvestigatorId -> PlayerId -> Game -> Game
+turnStartState x player g =
+  g
+    & (activeInvestigatorIdL .~ x)
+    & (activePlayerIdL .~ player)
+    & (turnPlayerInvestigatorIdL ?~ x)
+    & (activeAbilitiesL .~ mempty)
+    & (logBlockStackL .~ mempty)
+    & (actionRemovedEntitiesL .~ mempty)
+    & (tombstonesL .~ mempty)
+    & (entitiesL %~ clearRemovedEntities)
+    -- +1 because the batch processing the turn's start ends at the next Ask
+    -- (the investigator's first action choice). We want undo to land there,
+    -- not at the prior batch (which would be the choose-player question or
+    -- the end of mythos).
+    & (undoTurnStepL ?~ (gameScenarioSteps g + 1))
+
+runGameMessage :: Runner Game
+runGameMessage msg g = case msg of
+  -- ClearUI is pushed exactly once per accepted answer (Api Games.Shared), so
+  -- it marks the parked question as consumed. Without this, a queue that
+  -- drains without reaching a new Ask leaves the answered question on the
+  -- game; the client re-poses it and the questionVersion staleness guard in
+  -- Entity.Answer accepts the resubmit, re-running its effects (#5151). Any
+  -- seats still owed a question are re-asked by the AskMap the answer
+  -- branches append after this message -- or, for a seat inside a multi-seat
+  -- barrier, restored from its durable slot by the barrier itself (the
+  -- published map is only ever a projection of those slots).
+  ClearUI -> pure $ g & questionL .~ mempty
+  BeginSimultaneousAsk bid policy slots continuation -> do
+    let
+      barrier =
+        SimultaneousAsk
+          { saPolicy = policy
+          , saSlots = slots
+          , saDeferred = mempty
+          , saContinuation = continuation
+          }
+    -- A barrier with no seats (e.g. an all-AI table) is joined on creation, so it
+    -- never lands in state at all.
+    if isJoined barrier
+      then pushAll continuation >> pure g
+      else do
+        push $ AskMap slots
+        pure $ g & simultaneousAsksL . at bid ?~ barrier
+  SeatResolved bid pid -> case lookup bid (gameSimultaneousAsks g) of
+    -- Already released (or never opened): a seat resolving twice is a no-op.
+    Nothing -> pure g
+    Just barrier -> do
+      let barrier' = barrier {saSlots = Map.delete pid (saSlots barrier)}
+      if isJoined barrier'
+        then do
+          -- The join is decided purely by the pending set, so whichever seat happens
+          -- to resolve last releases the barrier. No queue position, no "is another
+          -- seat still parked" check, no last-seat race.
+          --
+          -- Every seat's deferred setup runs before the continuation, one seat at a
+          -- time, so the campaign cannot move on with a seat's setup outstanding.
+          pushAll (saDeferred barrier' <> saContinuation barrier')
+          pure $ g & simultaneousAsksL %~ Map.delete bid
+        else do
+          -- Re-park the seats still waiting, restoring each from its durable slot
+          -- (the ClearUI for this seat's answer wiped the published map).
+          push $ AskMap (saSlots barrier')
+          pure $ g & simultaneousAsksL . at bid ?~ barrier'
+  DeferPastSimultaneousAsk pid msgs -> case barrierSeat pid g of
+    Just (bid, barrier) ->
+      pure $ g & simultaneousAsksL . at bid ?~ barrier {saDeferred = saDeferred barrier <> msgs}
+    Nothing -> do
+      -- No barrier for this seat. Preserve the pre-barrier behaviour exactly: defer
+      -- past a queued DoneChoosingDecks if one is pending (The Dream Eaters' own
+      -- sequential deck prompts), otherwise run now (single player / standalone /
+      -- tests). This subsumes the per-call-site Morrígan insertAfterMatchingOrNow.
+      insertAfterMatchingOrNow msgs (== DoneChoosingDecks)
+      pure g
+  AfterThisTestResolves _sid msgs -> do
+    insertAfterMatching [AfterSkillTestQuiet msgs] (== EndSkillTestWindow)
+    pure g
+  RemovePlayerCardFromGame addToRemovedFromGame card -> do
+    when addToRemovedFromGame $ push $ RemovedFromGame card
+    pure g
+  SetAsIfAtIgnored iid True -> pure $ g & asIfAtIgnoredL %~ insertSet iid
+  SetAsIfAtIgnored iid False -> pure $ g & asIfAtIgnoredL %~ deleteSet iid
+  SetLocationOffset lid x y -> pure $ g & locationOffsetsL %~ insertMap lid (x, y)
+  SetCustomRandomWeaknessPool enabled sets -> do
+    pid <- getActivePlayer
+    push $ SetPlayerCustomRandomWeaknessPool pid enabled sets
+    pure g
+  SetPlayerCustomRandomWeaknessPool pid enabled sets -> do
+    let updated =
+          g & settingsL %~ \settings ->
+            settings
+              { settingsCustomRandomWeaknessPools =
+                  insertMap pid (enabled, setFromList sets) settings.settingsCustomRandomWeaknessPools
+              }
+    let available = fromMaybe mempty (getTransient $ gameCollectionCards g) <> gameCustomCards g
+    defs <- runReaderT (getCustomRandomWeaknessCards pid) $ updated & customCardsL .~ available
+    let snapshots = Map.restrictKeys available (setFromList $ map toCardCode defs)
+    pure $ updated & customCardsL %~ (snapshots <>)
+  SetAsIfRuling ruling -> do
+    currentWindows <- concat <$> getWindowStack
+    when (any (\w -> Window.windowType w == Window.FastPlayerWindow) currentWindows) do
+      push $ Do (CheckWindows currentWindows)
+    pure $ g {gameSettings = g.gameSettings {settingsAsIfRuling = ruling}}
+  SetUltimatumsAndBoonsEnabled enabled ->
+    pure $ g {gameSettings = g.gameSettings {settingsUltimatumsAndBoonsEnabled = enabled}}
+  RecordScreamedAlly code ->
+    pure
+      $ g
+        { gameSettings =
+            g.gameSettings {settingsScreamedAllies = insertSet code (settingsScreamedAllies g.gameSettings)}
+        }
+  ResetLocationOffsets -> pure $ g & locationOffsetsL .~ mempty
+  SetCardOwner cardId iid -> do
+    -- Debug: force one card's owner to iid across every representation it lives in
+    -- (store, hand/deck/discard/underneath/bonded, and any in-play skill/asset entity).
+    -- Used to repair promo/alt-art games where deck-load stamped a normalized-away owner.
+    let reown pc = pc {pcOwner = Just iid}
+        fixPc pc = if toCardId pc == cardId then reown pc else pc
+        fixCard c = if toCardId c == cardId then overPlayerCard reown c else c
+        fixInv a =
+          a
+            { investigatorDeck = fmap fixPc (investigatorDeck a)
+            , investigatorDiscard = map fixPc (investigatorDiscard a)
+            , investigatorHand = map fixCard (investigatorHand a)
+            , investigatorCardsUnderneath = map fixCard (investigatorCardsUnderneath a)
+            , investigatorBondedCards = map fixCard (investigatorBondedCards a)
+            }
+        fixSkill a = if toCardId a == cardId then a {skillOwner = iid} else a
+        fixAsset a = if toCardId a == cardId then a {assetOwner = Just iid} else a
+    for_ (lookup cardId (g ^. cardsL)) $ replaceCard cardId . fixCard
+    pure
+      $ g
+      & cardsL
+      %~ Map.adjust fixCard cardId
+      & entitiesL
+      . investigatorsL
+      %~ Map.map (overAttrs fixInv)
+      & entitiesL
+      . skillsL
+      %~ Map.map (overAttrs fixSkill)
+      & entitiesL
+      . assetsL
+      %~ Map.map (overAttrs fixAsset)
+  SetGameRunWindows b -> pure $ g & runWindowsL .~ b
+  SetGameState s -> pure $ g & gameStateL .~ s
+  ChoosingDecks -> pure $ g & entitiesL . investigatorsL .~ mempty & gameStateL .~ IsChooseDecks (g ^. playersL)
+  UpgradingDecks -> pure $ g & gameStateL .~ IsChooseDecks (g ^. playersL)
+  DoneChoosingDecks -> pure $ g & gameStateL .~ IsActive
+  DoneUpgradingDecks -> pure $ g & gameStateL .~ IsActive
+  IncreaseCustomization iid cardCode customization choices -> do
+    cards <- select $ OwnedBy (InvestigatorWithId iid) <> basic (CardWithCardCode cardCode)
+
+    cards' <- forMaybeM cards \case
+      card@(PlayerCard pc) -> do
+        case customizationIndex card customization of
+          Nothing -> pure Nothing
+          Just i -> do
+            let card' =
+                  pc
+                    { pcCustomizations =
+                        IntMap.alter
+                          (Just . maybe (1, choices) (bimap (+ 1) (const choices)))
+                          i
+                          (pcCustomizations pc)
+                    }
+            replaceCard card.id (PlayerCard card')
+            pure $ Just card'
+      _ -> pure Nothing
+
+    let swapCard c d = if d.id == c.id then c else d
+
+    pure
+      $ g
+      & entitiesL
+      %~ (\e -> foldr (over biplate . swapCard) e cards')
+      & actionRemovedEntitiesL
+      %~ (\e -> foldr (over biplate . swapCard) e cards')
+      & inHandEntitiesL
+      %~ (\e -> foldr (over biplate . swapCard) e cards')
+      & committedEntitiesL
+      %~ (\e -> foldr (over biplate . swapCard) e cards')
+      & inDiscardEntitiesL
+      %~ (\e -> foldr (over biplate . swapCard) e cards')
+      & inSearchEntitiesL
+      %~ (\e -> foldr (over biplate . swapCard) e cards')
+      & focusedCardsL
+      %~ (\e -> foldr (over biplate . swapCard) e cards')
+      & removedFromPlayL
+      %~ (\e -> foldr (over biplate . swapCard) e cards')
+      & activeCardL
+      %~ (\e -> foldr (over biplate . swapCard) e cards')
+      & resolvingCardL
+      %~ (\e -> foldr (over biplate . swapCard) e cards')
+  ReplaceInvestigator oldIid decklist -> do
+    playerId <- getPlayer oldIid
+    dl <- loadDecklist decklist
+    -- The card pool is fixed once chosen (in the app or by the deck), so a later
+    -- decklist can only ever supply one we don't have yet.
+    let keptCardPool = attr investigatorCardPool =<< Map.lookup oldIid (gameInvestigators g)
+    let iid' = dl.investigator
+    let deck = dl.cards
+    let sideDeck = dl.extra
+    let
+      setCardAttachments (cCode, attachments) =
+        flip Map.alter cCode \case
+          Nothing -> Just $ defaultPerCardSettings {cardAttachments = attachments}
+          Just current -> Just $ current {cardAttachments = attachments}
+    let investigator =
+          updateAttrs (lookupInvestigator iid' playerId) \ia ->
+            ia
+              { investigatorTaboo = dl.taboo
+              , investigatorCardPool = keptCardPool <|> dl.cardPool
+              , investigatorMutated = tabooMutated' dl.taboo (coerce iid')
+              , investigatorSettings =
+                  let settings = investigatorSettings ia
+                   in settings
+                        { perCardSettings =
+                            foldr setCardAttachments (perCardSettings settings) (mapToList dl.attachments)
+                        }
+              }
+    let iid = toId investigator
+    when (notNull sideDeck) $ push $ LoadSideDeck iid sideDeck
+    push
+      $ if iid /= oldIid
+        then InitDeck $ InitDeckAttrs iid dl.url (Just decklist) (Deck deck)
+        else UpgradeDeck iid dl.url (Deck deck)
+    let activeInvestigatorF =
+          if gameActiveInvestigatorId g == oldIid then set activeInvestigatorIdL iid else id
+        turnPlayerInvestigatorF =
+          if gameTurnPlayerInvestigatorId g == Just oldIid
+            then set turnPlayerInvestigatorIdL (Just iid)
+            else id
+    pure
+      $ g
+      & ( entitiesL
+            . investigatorsL
+            %~ insertEntity investigator
+            . Map.filter ((/= playerId) . attr investigatorPlayerId)
+        )
+      & activeInvestigatorF
+      & turnPlayerInvestigatorF
+      & (playerOrderL %~ map (\current -> if current == oldIid then iid else current))
+      & (leadInvestigatorIdL %~ \current -> if current == oldIid then iid else current)
+  LoadDeck _ deck -> do
+    let cards' = Map.fromList [(c.id, toCard c) | c <- deck.cards]
+    pure $ g & cardsL <>~ cards'
+  LoadDecklist playerId decklist -> do
+    let
+      invalid =
+        case gameMode g of
+          This (Campaign c) -> invalidCards c
+          That _ -> []
+          These (Campaign c) _ -> invalidCards c
+
+    -- if the player is changing decks during the game (i.e. prologue investigators) we need to replace the old investigator
+    let mOldInvestigator = find ((== playerId) . attr investigatorPlayerId) (toList $ gameInvestigators g)
+        mOldId = toId <$> mOldInvestigator
+        replaceIds = InvestigatorId "00000" : toList mOldId
+        keptCardPool = attr investigatorCardPool =<< mOldInvestigator
+
+    dl <- loadDecklist decklist
+    let invalids = filter ((`elem` invalid) . toCardCode) dl.cards
+    unless (null invalids)
+      $ error
+      $ "Decklist contains invalid cards for this campaign: "
+      <> show (map toName invalids)
+    let iid' = dl.investigator
+    let deck = dl.cards
+    let sideDeck = dl.extra
+    let
+      setCardAttachments (cCode, attachments) =
+        flip Map.alter cCode \case
+          Nothing -> Just $ defaultPerCardSettings {cardAttachments = attachments}
+          Just current -> Just $ current {cardAttachments = attachments}
+    let investigator =
+          updateAttrs (lookupInvestigator iid' playerId) \ia ->
+            ia
+              { investigatorTaboo = dl.taboo
+              , investigatorCardPool = keptCardPool <|> dl.cardPool
+              , investigatorMutated = tabooMutated' dl.taboo (coerce iid')
+              , investigatorSettings =
+                  let settings = ia.settings
+                   in settings
+                        { perCardSettings =
+                            foldr setCardAttachments (perCardSettings settings) (mapToList dl.attachments)
+                        }
+              }
+    let iid = toId investigator
+    when (notNull sideDeck) $ push $ LoadSideDeck iid sideDeck
+    push $ InitDeck $ InitDeckAttrs iid dl.url (Just decklist) (Deck deck)
+    let activeInvestigatorF =
+          if gameActiveInvestigatorId g `elem` replaceIds then set activeInvestigatorIdL iid else id
+        turnPlayerInvestigatorF =
+          if gameTurnPlayerInvestigatorId g `elem` map Just replaceIds
+            then set turnPlayerInvestigatorIdL (Just iid)
+            else id
+    pure
+      $ g
+      & ( entitiesL
+            . investigatorsL
+            %~ insertEntity investigator
+            . Map.filter ((/= playerId) . attr investigatorPlayerId)
+        )
+      & activeInvestigatorF
+      & turnPlayerInvestigatorF
+  UpgradeDecklist investigatorId decklist -> do
+    -- An alternate-art deck still upgrades the existing entity. Keep generated
+    -- main/side card ownership on that actual target, not the submitted alias.
+    cards <- map (setPlayerCardOwner investigatorId) <$> loadDecklistCards slots decklist
+    dl <- loadDecklist decklist
+    investigator <- getInvestigator investigatorId
+    let playerId = attr investigatorPlayerId investigator
+    let iid' = dl.investigator
+    let sideDeck = map (setPlayerCardOwner investigatorId) dl.extra
+    let
+      setCardAttachments (cCode, attachments) =
+        flip Map.alter cCode \case
+          Nothing -> Just $ defaultPerCardSettings {cardAttachments = attachments}
+          Just current -> Just $ current {cardAttachments = attachments}
+    let investigator' =
+          overAttrs
+            ( \ia ->
+                ia
+                  { investigatorTaboo = dl.taboo
+                  , investigatorCardPool = ia.cardPool <|> dl.cardPool
+                  , investigatorMutated = tabooMutated' dl.taboo (coerce iid')
+                  , investigatorSettings =
+                      let settings = investigatorSettings ia
+                       in settings
+                            { perCardSettings =
+                                foldr setCardAttachments (perCardSettings settings) (mapToList dl.attachments)
+                            }
+                  }
+            )
+            investigator
+    when (notNull sideDeck) $ push $ LoadSideDeck investigatorId sideDeck
+    push $ UpgradeDeck investigatorId decklist.url (Deck cards)
+
+    pure
+      $ g
+      & ( entitiesL
+            . investigatorsL
+            %~ insertEntity investigator'
+            . Map.filter ((/= playerId) . attr investigatorPlayerId)
+        )
+  SetInvestigator playerId investigator -> do
+    -- if the player is changing decks during the game (i.e. prologue investigators) we need to replace the old investigator
+    let mOldId = toId <$> find ((== playerId) . attr investigatorPlayerId) (toList $ gameInvestigators g)
+        replaceIds = InvestigatorId "00000" : toList mOldId
+
+    let iid = toId investigator
+    let activeInvestigatorF =
+          if gameActiveInvestigatorId g `elem` replaceIds then set activeInvestigatorIdL iid else id
+        turnPlayerInvestigatorF =
+          if gameTurnPlayerInvestigatorId g `elem` map Just replaceIds
+            then set turnPlayerInvestigatorIdL (Just iid)
+            else id
+        replaceF x = if Just x == mOldId then iid else x
+    pure
+      $ g
+      & ( entitiesL
+            . investigatorsL
+            %~ insertEntity investigator
+            . Map.filter ((/= playerId) . attr investigatorPlayerId)
+        )
+      & activeInvestigatorF
+      & turnPlayerInvestigatorF
+      & playerOrderL
+      %~ map replaceF
+      & leadInvestigatorIdL
+      %~ replaceF
+  RetireInvestigator iid -> pure $ removeSeat SetAside iid g
+  RemoveInvestigatorFromCampaign iid -> pure $ removeSeat ForgetSeat iid g
+  UnretireInvestigator iid -> case Map.lookup iid (gameRetiredInvestigators g) of
+    Nothing -> pure g
+    Just investigator -> do
+      let pid = attr investigatorPlayerId investigator
+      pure
+        $ g
+        & (retiredInvestigatorsL %~ Map.delete iid)
+        & (entitiesL . investigatorsL %~ insertEntity investigator)
+        & (playersL %~ \ps -> if pid `elem` ps then ps else ps <> [pid])
+        & (playerOrderL %~ \po -> if iid `elem` po then po else po <> [iid])
+        & (playerCountL %~ (+ 1))
+  JoinCampaign pid ->
+    pure
+      $ g
+      & (playersL %~ \ps -> if pid `elem` ps then ps else ps <> [pid])
+      & (playerCountL %~ (+ 1))
+  Run msgs -> g <$ pushAll msgs
+  -- The main loop unwraps 'Priority' before 'runMessage' ever sees it, so this
+  -- only fires for a 'Priority' running inside a 'Simultaneously' branch (which
+  -- calls 'runMessage' directly). Without it the wrapped message -- every
+  -- 'Priority $ EarnAchievement' or 'Priority $ SetGlobal' pushed from a
+  -- simultaneous defeat -- was silently dropped. Jumping the queue is
+  -- meaningless inside a branch, so degrade to a plain push.
+  Priority msg' -> g <$ push msg'
+  -- Only the main loop can run a 'Simultaneously' (it needs to capture each
+  -- branch's queue), so one that itself ends up as a branch -- the interleave
+  -- splices branch output verbatim -- reached 'runMessage' and was dropped
+  -- along with everything inside it. Push it back so the loop picks it up.
+  Simultaneously {} -> g <$ push msg
+  If wType _ -> do
+    window <- checkWindows [mkWindow Timing.AtIf wType]
+    g <$ pushAll [window, Do msg]
+  Do (If _ msgs) -> g <$ pushAll msgs
+  IfEnemyExists eMatcher msgs -> do
+    whenM (selectAny eMatcher) $ pushAll msgs
+    pure g
+  IfCardExists cMatcher msgs -> do
+    whenM (selectAny cMatcher) $ pushAll msgs
+    pure g
+  ClearInvestigators -> do
+    pure
+      $ g
+      & (entitiesL . investigatorsL .~ mempty)
+      & (activeInvestigatorIdL .~ InvestigatorId "00000")
+      & (leadInvestigatorIdL .~ InvestigatorId "00000")
+  BeginAction ->
+    pure
+      $ g
+      & (inActionL .~ True)
+      & (actionCanBeUndoneL .~ True)
+      & (actionDiffL .~ [])
+      & (actionSnapshotL .~ Transient Nothing)
+      & (undoActionStepL ?~ gameScenarioSteps g)
+  FinishAction -> do
+    iid <- getActiveInvestigatorId
+    let
+      historyItem = HistoryItem HistoryActionsCompleted 1
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      setTurnHistory =
+        if turn then turnHistoryL %~ insertHistory iid historyItem else id
+    pure
+      $ g
+      & (inActionL .~ False)
+      & (actionCanBeUndoneL .~ False)
+      & (actionDiffL .~ [])
+      & (actionSnapshotL .~ Transient Nothing)
+      & (inDiscardEntitiesL .~ mempty)
+      & (phaseHistoryL %~ insertHistory iid historyItem)
+      & setTurnHistory
+  ActionCannotBeUndone -> pure $ g & actionCanBeUndoneL .~ False
+  UndoAction -> do
+    -- gameActionDiff contains a list of diffs, in order, to revert the game
+    -- The gameActionDiff will be empty after this so we do not need the diffs to store any data
+    pure $ foldl' unsafePatch g (gameActionDiff g)
+  ForTarget GameTarget (EndOfScenario _) -> do
+    persistedAssets <- select $ AssetWithModifier Persist
+    let
+      survivingEffects =
+        Map.keysSet
+          $ filterMap (or . sequence [effectIsForResolution, effectIsForNextGame])
+          $ g
+          ^. entitiesL
+          . effectsL
+      sourceGone = \case
+        ActSource _ -> True
+        AgendaSource _ -> True
+        EnemyAttackSource _ -> True
+        EnemyDefeatSource _ -> True
+        EnemySource _ -> True
+        EventSource _ -> True
+        LocationSource _ -> True
+        ScenarioSource -> True
+        SkillSource _ -> True
+        SkillTestSource _ -> True
+        StorySource _ -> True
+        TreacherySource _ -> True
+        AssetSource aid -> aid `notElem` persistedAssets
+        EffectSource eid -> eid `Set.notMember` survivingEffects
+        AbilitySource s _ -> sourceGone s
+        IndexedSource _ s -> sourceGone s
+        PaymentSource s -> sourceGone s
+        UseAbilitySource _ s _ -> sourceGone s
+        BothSource x y -> sourceGone x || sourceGone y
+        ProxySource x y -> sourceGone x || sourceGone y
+        _ -> False
+      targetGone = \case
+        ActTarget _ -> True
+        AgendaTarget _ -> True
+        EnemyTarget _ -> True
+        EventTarget _ -> True
+        LocationTarget _ -> True
+        ScenarioTarget -> True
+        SkillTarget _ -> True
+        SkillTestTarget _ -> True
+        StoryTarget _ -> True
+        TreacheryTarget _ -> True
+        AssetTarget aid -> aid `notElem` persistedAssets
+        EffectTarget eid -> eid `Set.notMember` survivingEffects
+        BothTarget x y -> targetGone x || targetGone y
+        ProxyTarget x y -> targetGone x || targetGone y
+        LabeledTarget _ t -> targetGone t
+        SkillTestInitiatorTarget t -> targetGone t
+        _ -> False
+      keeps m = maybe (not $ sourceGone m.source) (`Set.member` survivingEffects) m.effect
+      -- 'preloadModifiers' will not rebuild this in campaign mode, so a row left
+      -- here outlives the entity that published it for the whole interlude.
+      pruneModifiers =
+        Map.filter notNull
+          . Map.map (filter keeps)
+          . Map.filterWithKey (\target _ -> not (targetGone target))
+      update g' =
+        g'
+          & (entitiesL . assetsL %~ Map.filterWithKey (\k _ -> k `elem` persistedAssets))
+          & (entitiesL . locationsL .~ mempty)
+          & (entitiesL . enemiesL .~ mempty)
+          & (entitiesL . enemyLocationsL .~ mempty)
+          & (entitiesL . actsL .~ mempty)
+          & (entitiesL . agendasL .~ mempty)
+          & (entitiesL . treacheriesL .~ mempty)
+          & (entitiesL . eventsL .~ mempty)
+          & (entitiesL . effectsL %~ filterMap (or . sequence [effectIsForResolution, effectIsForNextGame]))
+          & (entitiesL . skillsL .~ mempty)
+          & (entitiesL . storiesL .~ mempty)
+          & (encounterDiscardEntitiesL .~ defaultEntities)
+          & (skillTestL .~ Nothing)
+          & (skillTestResultsL .~ Nothing)
+          & (inDiscardEntitiesL .~ mempty)
+          & (inHandEntitiesL .~ mempty)
+          & (committedEntitiesL .~ mempty)
+          & (inSearchEntitiesL .~ mempty)
+          & (focusedCardsL .~ mempty)
+          & (focusedChaosTokensL .~ mempty)
+          & (activeCardL .~ Nothing)
+          & (activeAbilitiesL .~ mempty)
+          & (logBlockStackL .~ mempty)
+          & (actionRemovedEntitiesL .~ mempty)
+          & (tombstonesL .~ mempty)
+          & (activeAbilitiesL .~ mempty)
+          & (modifiersL %~ pruneModifiers)
+          -- A scenario-ending action (e.g. Resign) leaves the game "in action"
+          -- with a revert diff/snapshot pointing at the entities we just tore
+          -- down. Clear the action bookkeeping so we don't persist a stale diff
+          -- that fails to apply on reload (see handleActionDiff / unsafePatch).
+          & (inActionL .~ False)
+          & (actionDiffL .~ [])
+          & (actionCanBeUndoneL .~ False)
+          & (actionSnapshotL .~ Transient Nothing)
+    case gameMode g of
+      These c _ -> pure $ update $ g & (modeL .~ This c)
+      _ -> pure $ update g
+  ForTarget GameTarget ResetGame -> do
+    persistedAssets <- select (AssetWithModifier Persist)
+    let keepCardCache =
+          Persist `elem` map modifierType (Map.findWithDefault [] GameTarget (gameModifiers g))
+    -- investigatorSlots is not part of gameEntities, so it survives the wipe below with
+    -- dangling AssetIds. `ForInvestigators [] ResetGame` normally rebuilds it right after,
+    -- but skipInvestigatorSetup (Hemlock Vale's afterPrelude) skips that message (#5593).
+    let assetSurvives aid = aid `elem` persistedAssets
+    let slotSourceGone = \case
+          AssetSource aid -> not (assetSurvives aid)
+          EventSource _ -> True
+          BothSource x y -> slotSourceGone x || slotSourceGone y
+          ProxySource x y -> slotSourceGone x || slotSourceGone y
+          _ -> False
+    let pruneSlots attrs =
+          attrs
+            { investigatorSlots =
+                Map.map
+                  (map (retainSlotAssets assetSurvives) . filter (not . slotSourceGone . slotSource))
+                  (investigatorSlots attrs)
+            }
+    pure
+      $ g
+      & (encounterDiscardEntitiesL .~ defaultEntities)
+      & (skillTestL .~ Nothing)
+      & (skillTestResultsL .~ Nothing)
+      & (entitiesL . assetsL %~ Map.filterWithKey (\k _ -> k `elem` persistedAssets))
+      & (entitiesL . investigatorsL . each %~ overAttrs pruneSlots)
+      & (entitiesL . locationsL .~ mempty)
+      & (entitiesL . enemiesL .~ mempty)
+      & (entitiesL . enemyLocationsL .~ mempty)
+      & (entitiesL . actsL .~ mempty)
+      & (entitiesL . agendasL .~ mempty)
+      & (entitiesL . treacheriesL .~ mempty)
+      & (entitiesL . eventsL .~ mempty)
+      & (entitiesL . effectsL %~ filterMap effectIsForNextGame)
+      & (entitiesL . skillsL .~ mempty)
+      & (entitiesL . storiesL .~ mempty)
+      & (entitiesL . scarletKeysL .~ mempty)
+      & (entitiesL . concealedL .~ mempty)
+      & (modeL %~ fmap (\s -> toResultDefault s (toJSON s)))
+      & (inDiscardEntitiesL .~ mempty)
+      & (inHandEntitiesL .~ mempty)
+      & (committedEntitiesL .~ mempty)
+      & (gameStateL .~ IsActive)
+      & (turnPlayerInvestigatorIdL .~ Nothing)
+      & (focusedCardsL .~ mempty)
+      & (focusedChaosTokensL .~ mempty)
+      & (activeCardL .~ Nothing)
+      & (activeAbilitiesL .~ mempty)
+      & (logBlockStackL .~ mempty)
+      & (playerOrderL .~ (g ^. entitiesL . investigatorsL . to keys))
+      & (actionRemovedEntitiesL .~ mempty)
+      & (tombstonesL .~ mempty)
+      & (activeAbilitiesL .~ mempty)
+      & (foundCardsL .~ mempty)
+      & (highlightedCardsL .~ mempty)
+      & (cardUsesL .~ mempty)
+      & (windowStackL .~ mempty)
+      & (windowDepthL .~ 0)
+      & (windowTickStackL .~ [])
+      & (phaseHistoryL .~ mempty)
+      & (turnHistoryL .~ mempty)
+      & (roundHistoryL .~ mempty)
+      & (cardsL %~ if keepCardCache then id else const mempty)
+      -- See EndOfScenario: drop action bookkeeping so a reset never persists a
+      -- stale revert diff against torn-down entities.
+      & (inActionL .~ False)
+      & (actionDiffL .~ [])
+      & (actionCanBeUndoneL .~ False)
+      & (actionSnapshotL .~ Transient Nothing)
+  StartScenario sid mopts -> do
+    -- NOTE: The campaign log and player decks need to be copied over for
+    -- standalones because we effectively reset it here when we `setScenario`.
+    let
+      keepCardCache =
+        Persist `elem` map modifierType (Map.findWithDefault [] GameTarget (gameModifiers g))
+      difficulty = these difficultyOf difficultyOfScenario (const . difficultyOf) (g ^. modeL)
+      -- Read a value from the current mode that only exists for a STANDALONE
+      -- scenario (the @That@ arm); campaigns (the @This@/@These@ arms) get the
+      -- fallback. A standalone scenario restarts itself here (That -> That), so
+      -- these reads carry the prior scenario's state across the rebuild.
+      extractStandaloneOnly :: a -> (Scenario -> a) -> a
+      extractStandaloneOnly fallback extractor = these (const fallback) extractor (\_ _ -> fallback) (g ^. modeL)
+      mCampaignLog = extractStandaloneOnly Nothing (Just . attr scenarioStandaloneCampaignLog)
+      playerDecks = extractStandaloneOnly mempty (attr scenarioPlayerDecks)
+      setCampaignLog = case mCampaignLog of
+        Nothing -> id
+        Just cl -> overAttrs (standaloneCampaignLogL .~ cl)
+
+      -- Carry the scenario meta across the rebuild (e.g. Epic Multiplayer's
+      -- "epicMultiplayer" flag from setInitialScenarioMeta). Without this, the
+      -- fresh lookupScenario resets meta to Null and the scenario's Setup picks
+      -- its non-epic branch. Standalone only — a campaign moving to a NEW scenario
+      -- must not inherit the prior scenario's meta.
+      scenarioMetaValue = extractStandaloneOnly Null (attr scenarioMeta)
+      setScenarioMeta' = overAttrs (\s -> s {scenarioMeta = scenarioMetaValue})
+
+      -- Likewise carry the standalone scenario's counts across the rebuild. At
+      -- game start the only counts present are external mirrors (e.g. Epic
+      -- Multiplayer's EpicShared pool values injected just before StartScenario) —
+      -- there is no scenario-local progress yet — so a group's shared enemy/pool
+      -- is correctly populated at Setup instead of reading 0.
+      scenarioCountsValue = extractStandaloneOnly mempty (attr scenarioCounts)
+      setScenarioCounts' = overAttrs (\s -> s {scenarioCounts = scenarioCounts s <> scenarioCountsValue})
+
+      standalone = isNothing $ modeCampaign $ g ^. modeL
+      activeVariants = activeUltimatumsAndBoons (gameSettings g)
+      -- Ultimatum of Malevolence: use the Hard/Expert reference side while
+      -- nominally playing Easy/Standard. Only the reference side flips; the
+      -- chaos bag still builds from the real difficulty.
+      useHardExpertReference =
+        Ultimatum UltimatumOfMalevolence `member` activeVariants && difficulty `elem` [Easy, Standard]
+      setUseHardExpertReference = overAttrs (\s -> s {scenarioUseHardExpertReference = useHardExpertReference})
+      setPlayerDecks = overAttrs (playerDecksL .~ playerDecks)
+      opts =
+        (fromMaybe defaultScenarioOptions mopts)
+          { scenarioOptionsStandalone = standalone
+          , scenarioOptionsPerformTarotReading = gamePerformTarotReadings g
+          }
+    -- Ultimatum of Ultimatums (campaign only): roll one non-deckbuilding,
+    -- non-chaos-bag entry for this game only. Re-rolled every StartScenario;
+    -- cleared when the ultimatum isn't active.
+    let
+      -- A Refraction belongs to one campaign or scenario, so rolling one into
+      -- any other game would do nothing but confuse the log.
+      eligibleForRoll entry =
+        not (affectsDeckbuildingOrChaosBag entry)
+          && not (isRefraction entry)
+          && entry
+          `notElem` settingsUltimatumsAndBoons (gameSettings g)
+    rolled <-
+      if not standalone && Ultimatum UltimatumOfUltimatums `member` activeVariants
+        then case nonEmpty (filter eligibleForRoll allUltimatumsAndBoons) of
+          Nothing -> pure Nothing
+          Just pool -> Just <$> sample pool
+        else pure Nothing
+    pushAll
+      $ [HandleOption option | standalone, option <- maybe [] (toList . campaignLogOptions) mCampaignLog]
+      <> [LoadScenario opts]
+    pure
+      $ g
+      & ( modeL
+            %~ setScenario
+              ( setPlayerDecks
+                  $ setCampaignLog
+                  $ setScenarioMeta'
+                  $ setScenarioCounts'
+                  $ setUseHardExpertReference
+                  $ lookupScenario sid difficulty
+              )
+        )
+      & (phaseL .~ InvestigationPhase)
+      & (cardsL %~ if keepCardCache then id else filterMap (not . isEncounterCard))
+      & \g' -> g' {gameSettings = (gameSettings g') {settingsRolledUltimatumOrBoon = rolled}}
+  PerformTarotReading -> do
+    when (gamePerformTarotReadings g) do
+      lead <- getLeadPlayer
+      push
+        $ questionLabel "$label.chooseTarotReadingType" lead
+        $ ChooseOne
+          [ Label "$label.tarotChaos" [PerformReading Tarot.Chaos]
+          , Label "$label.tarotBalance" [PerformReading Tarot.Balance]
+          , Label "$label.tarotChoice" [PerformReading Tarot.Choice]
+          ]
+    pure g
+  SetPerformTarotReadings b -> pure $ g & performTarotReadingsL .~ b
+  RestartScenario -> pure $ g & (phaseL .~ InvestigationPhase)
+  SetPhase phase -> pure $ g & phaseL .~ phase
+  BeginGame -> do
+    let (before, _, after) = frame Window.GameBegins
+    iids <- getInvestigatorsInOrder
+    pushAll $ before : map (`ForInvestigator` BeginGame) iids <> [after]
+    pure g
+  InvestigatorsMulligan -> do
+    iids <- getInvestigatorsInOrder
+    for_ (reverse iids) \iid -> do
+      pushAll [InvestigatorMulligan iid, After (InvestigatorMulligan iid)]
+    pure g
+  InvestigatorMulligan iid -> pure $ g & activeInvestigatorIdL .~ iid
+  Will msg'@(ResolveChaosToken token tokenFace iid) -> do
+    mods <- getModifiers iid
+    let
+      resolutionChoices =
+        flip mapMaybe mods \case
+          CanResolveToken tokenFace' target | tokenFace == tokenFace' -> Just target
+          _ -> Nothing
+    whenWindow <- checkWindows [mkWhen (Window.ResolvesChaosToken iid token)]
+    if null resolutionChoices
+      then pushAll [whenWindow, msg']
+      else do
+        player <- getPlayer iid
+        push
+          $ chooseOne player
+          $ [ targetLabel target [whenWindow, TargetResolveChaosToken target token tokenFace iid]
+            | target <- resolutionChoices
+            ]
+          <> [Label "$label.resolveNormally" [whenWindow, msg']]
+    pure g
+  CreateEffect builder -> do
+    (effectId, effect) <- createEffect builder
+    push (CreatedEffect effectId effect.metadata effect.source effect.target)
+    pure $ g & entitiesL . effectsL %~ insertMap effectId effect
+  CreateChaosTokenValueEffect sid n source target -> do
+    (effectId, effect) <- createChaosTokenValueEffect sid n source target
+    ems <- effectModifiers source [ChaosTokenValueModifier n]
+    push $ CreatedEffect effectId (Just ems) source target
+    pure $ g & entitiesL . effectsL %~ insertMap effectId effect
+  PayCardCost iid card windows' -> do
+    pushAll [BeforeCardCost iid NoAction windows' card.id, Do msg]
+    pure g
+  Do (PayCardCost iid card windows') -> do
+    card' <- Lifted.fetchCard (toCardId card)
+    activeCost <- createActiveCostForCard iid card' NotPlayAction windows'
+    -- _ <- error "This is broken because it also plays the card, rethink cards that call this"
+    push $ CreatedCost (activeCostId activeCost)
+    pure $ g & activeCostL %~ insertMap (activeCostId activeCost) activeCost
+  CancelCost acId -> do
+    pure $ g & activeCostL %~ deleteMap acId
+  PayAdditionalCost iid batchId cost -> do
+    acId <- getRandom
+    let
+      activeCost =
+        ActiveCost
+          { activeCostId = acId
+          , activeCostCosts = cost
+          , activeCostPayments = Cost.NoPayment
+          , activeCostTarget = ForAdditionalCost batchId
+          , activeCostWindows = []
+          , activeCostInitiationTick = Just (gameWindowTick g)
+          , activeCostInvestigator = iid
+          , activeCostSealedChaosTokens = []
+          , activeCostCancelled = False
+          , activeCostChosenOrAction = Nothing
+          , activeCostPendingEventId = Nothing
+          }
+    push $ CreatedCost acId
+    pure $ g & activeCostL %~ insertMap acId activeCost
+  PayForAbility ability windows' -> do
+    acId <- getRandom
+    iid <- toId <$> getActiveInvestigator
+    -- imods <- getModifiers iid
+    modifiers' <- getModifiers (AbilityTarget iid $ abilityToRef ability)
+    -- TODO: we might want to check the ability index and source
+    let
+      -- isMovement = abilityIs ability #move
+      isInvestigate = abilityIs ability #investigate
+      isExplore = abilityIs ability #explore
+      isResign = abilityIs ability #resign
+
+    doDelayAdditionalCosts <- case abilityDelayAdditionalCosts ability of
+      Nothing -> pure False
+      Just delay -> case delay of
+        DelayAdditionalCosts -> pure True
+        DelayAdditionalCostsWhen c -> passesCriteria iid Nothing ability.source ability.source [] c
+    investigateCosts <-
+      if isInvestigate && not doDelayAdditionalCosts
+        then do
+          getMaybeLocation iid >>= \case
+            Just lid -> do
+              mods' <- getModifiers lid
+              pure [c | AdditionalCostToInvestigate c <- mods']
+            _ -> pure []
+        else pure []
+    exploreCosts <-
+      if isExplore && not doDelayAdditionalCosts
+        then do
+          getMaybeLocation iid >>= \case
+            Just lid -> do
+              mods' <- getModifiers lid
+              pure [c | AdditionalCostToExplore c <- mods']
+            _ -> pure []
+        else pure []
+    resignCosts <-
+      if isResign && not doDelayAdditionalCosts
+        then do
+          getMaybeLocation iid >>= \case
+            Just lid -> do
+              mods' <- getModifiers lid
+              pure [c | AdditionalCostToResign c <- mods']
+            _ -> pure []
+        else pure []
+
+    -- Riders declared with 'AdditionalCostToPerformAction' were previously only
+    -- consulted for affordability and never charged; collect them here so they
+    -- are actually paid. Mirrors 'Arkham.Helpers.Ability.performActionCosts'.
+    performActionCosts <-
+      if doDelayAdditionalCosts
+        then pure []
+        else do
+          ownMods <- getModifiers iid
+          locationMods <- getMaybeLocation iid >>= maybe (pure []) getModifiers
+          let
+            matchesAction = \case
+              IsAnyAction -> True
+              IsAction act -> act `elem` abilityActions ability
+              AnyActionTarget ts -> any matchesAction ts
+              _ -> False
+          pure [c | AdditionalCostToPerformAction t c <- ownMods <> locationMods, matchesAction t]
+
+    let
+      costF =
+        case find isSetCost modifiers' of
+          Just (SetAbilityCost c) -> const c
+          _ -> (`applyCostModifiers` modifiers')
+      isSetCost = \case
+        SetAbilityCost _ -> True
+        _ -> False
+      additionalCosts =
+        if doDelayAdditionalCosts
+          then []
+          else
+            abilityAdditionalCosts ability <> flip mapMaybe modifiers' \case
+              AdditionalCost c -> Just c
+              _ -> Nothing
+    -- NOTE: In order for Frozen in Fear to affect free triggered abilities
+    -- like those provided by Shortcut (2) we have to add a 0 value ActionCost
+    -- here so that it can add the additional
+    let
+      fixEnemy =
+        (maybe id replaceThatInvestigator $ getThatInvestigator windows')
+          . (maybe id replaceThatEnemy $ getThatEnemy windows')
+      activeCost =
+        ActiveCost
+          { activeCostId = acId
+          , activeCostCosts =
+              fixEnemy
+                $ mconcat
+                  ( costF (abilityCost ability)
+                      : additionalCosts
+                        ++ investigateCosts
+                        ++ exploreCosts
+                        ++ resignCosts
+                        ++ performActionCosts
+                        ++ [ActionCost 0]
+                  )
+          , activeCostPayments = Cost.NoPayment
+          , activeCostTarget = ForAbility ability
+          , activeCostWindows = windows'
+          , activeCostInitiationTick = Just (gameWindowTick g)
+          , activeCostInvestigator = iid
+          , activeCostSealedChaosTokens = []
+          , activeCostCancelled = False
+          , activeCostChosenOrAction = Nothing
+          , activeCostPendingEventId = Nothing
+          }
+    {- The #cancel window sits ahead of the cost, so an ability cancelled here has not
+    paid anything yet -- unlike the #when window, which `PayCostFinished` opens once the
+    cost is already spent. A canceller answers it with `CancelCostPayment`, which
+    `CreatedCost` then reads to skip the payment entirely. Forced abilities get no
+    activation windows at all, the same way `PayCostFinished` skips theirs. -}
+    isForced <- isForcedAbility iid ability
+    cancelWindow <- checkWindows [mkCancel (Window.ActivateAbility iid windows' ability)]
+    pushAll $ [cancelWindow | not isForced] <> [CreatedCost acId]
+    pure $ g & activeCostL %~ insertMap acId activeCost
+  PayCostFinished acId -> pure $ g & activeCostL %~ deleteMap acId
+  CreateWindowModifierEffect effectWindow effectMetadata source target -> do
+    (effectId, effect) <- createWindowModifierEffect effectWindow effectMetadata source target
+    push (CreatedEffect effectId (Just effectMetadata) source target)
+    pure $ g & entitiesL . effectsL %~ insertMap effectId effect
+  CreateChaosTokenEffect effectMetadata source token -> do
+    (effectId, effect) <- createChaosTokenEffect effectMetadata source token
+    push $ CreatedEffect effectId (Just effectMetadata) source (ChaosTokenTarget token)
+    pure $ g & entitiesL . effectsL %~ insertMap effectId effect
+  CreateOnRevealChaosTokenEffect sid matchr source target message -> do
+    (effectId, effect) <- createOnRevealChaosTokenEffect sid matchr source target message
+    push $ CreatedEffect effectId Nothing source target
+    pure $ g & entitiesL . effectsL %~ insertMap effectId effect
+  CreateOnSucceedByEffect sid matchr source target message -> do
+    (effectId, effect) <- createOnSucceedByEffect sid matchr source target message
+    push $ CreatedEffect effectId Nothing source target
+    pure $ g & entitiesL . effectsL %~ insertMap effectId effect
+  CreateOnFailedByEffect sid matchr source target message -> do
+    (effectId, effect) <- createOnFailedByEffect sid matchr source target message
+    push $ CreatedEffect effectId Nothing source target
+    pure $ g & entitiesL . effectsL %~ insertMap effectId effect
+  CreateOnNextTurnEffect source iid message -> do
+    (effectId, effect) <- createOnNextTurnEffect source iid message
+    push $ CreatedEffect effectId Nothing source (toTarget iid)
+    pure $ g & entitiesL . effectsL %~ insertMap effectId effect
+  CreateEndOfTurnEffect source iid message -> do
+    -- "At the end of your turn" with the turn already over has to resolve now, not
+    -- never: a reaction deferred past a nested skill test (Spiritual Echo (2)'s echoed
+    -- Fight or Investigate) runs after EndTurn, so the effect was created behind its own
+    -- trigger and sat inert until some later turn's EndTurn fired every orphan at once
+    -- (#5945). The phase guard matters: investigatorEndedTurn is only cleared by
+    -- BeginRound/Begin InvestigationPhase, so it stays set through the later phases.
+    turnOver <- case gamePhase g of
+      InvestigationPhase {} -> maybe False (attr investigatorEndedTurn) <$> getInvestigatorMaybe iid
+      _ -> pure False
+    if turnOver
+      then do
+        pushAll message
+        pure g
+      else do
+        (effectId, effect) <- createEndOfTurnEffect source iid message
+        push $ CreatedEffect effectId Nothing source (toTarget iid)
+        pure $ g & entitiesL . effectsL %~ insertMap effectId effect
+  CreateEndOfRoundEffect source message -> do
+    (effectId, effect) <- createEndOfRoundEffect source message
+    push $ CreatedEffect effectId Nothing source GameTarget
+    pure $ g & entitiesL . effectsL %~ insertMap effectId effect
+  DisableEffect effectId -> do
+    -- Only the live effect counts. One duration can be ended by several
+    -- messages -- a move fires MoveAction, Move and ResolvedMovement -- and each
+    -- pushes its own DisableEffect. 'maybeEffect' falls back to the removed
+    -- entities, so the later ones used to find the finished copy and run its
+    -- onDisable body again (Close Watch spawned an enemy per trigger).
+    let mEffect = preview (entitiesL . effectsL . ix effectId) g
+    for_ mEffect \effect ->
+      for_ (attr effectOnDisable effect) pushAll
+    pure
+      $ g
+      & (entitiesL . effectsL %~ deleteMap effectId)
+      & maybe
+        id
+        ( \effect ->
+            actionRemovedEntitiesL
+              . effectsL
+              %~ insertEntity (overAttrs (\a -> a {effectFinished = True}) effect)
+        )
+        mEffect
+  FocusCards cards -> pure $ g & focusedCardsL %~ (cards :)
+  HighlightCards cards -> pure $ g & highlightedCardsL .~ map toCardId cards
+  UnfocusCards -> pure $ g & focusedCardsL %~ drop 1 & highlightedCardsL .~ mempty
+  FoundCards cards -> pure $ g & foundCardsL .~ cards
+  ClearFound FromDeck -> do
+    pure $ g & foundCardsL %~ Map.filterWithKey (\k _ -> not (zoneIsFromDeck k))
+  ClearFound zone -> pure $ g & foundCardsL . at zone ?~ mempty
+  FocusTarotCards cards -> pure $ g & focusedTarotCardsL .~ cards
+  UnfocusTarotCards -> pure $ g & focusedTarotCardsL .~ mempty
+  PutCardOnTopOfDeck _ _ c -> do
+    mSkillId <- selectOne $ SkillWithCardId (toCardId c)
+    let skillsF = maybe id deleteMap mSkillId
+    pure
+      $ g
+      & (focusedCardsL %~ map (filter (/= c)))
+      & (foundCardsL . each %~ filter (/= c))
+      & (entitiesL . skillsL %~ skillsF)
+  PutCardOnBottomOfDeck _ _ c -> do
+    mSkillId <- selectOne $ SkillWithCardId (toCardId c)
+    let skillsF = maybe id deleteMap mSkillId
+    pure
+      $ g
+      & (focusedCardsL %~ map (filter (/= c)))
+      & (foundCardsL . each %~ filter (/= c))
+      & (entitiesL . skillsL %~ skillsF)
+  ShuffleCardsIntoDeck _ cards ->
+    pure
+      $ g
+      & (focusedCardsL %~ map (filter (`notElem` cards)))
+      & (foundCardsL . each %~ filter (`notElem` cards))
+  ShuffleCardsIntoBottomOfDeck _ _ cards ->
+    pure
+      $ g
+      & (focusedCardsL %~ map (filter (`notElem` cards)))
+      & (foundCardsL . each %~ filter (`notElem` cards))
+  FocusChaosTokens tokens -> pure $ g & focusedChaosTokensL <>~ tokens
+  SealChaosToken token -> pure $ g & focusedChaosTokensL %~ filter (/= token)
+  Msg.RevealChaosToken SkillTestSource {} _ token -> pure $ g & focusedChaosTokensL %~ filter (/= token)
+  UnfocusChaosTokens -> pure $ g & focusedChaosTokensL .~ mempty
+  ChoosePlayer iid SetLeadInvestigator -> do
+    pure $ g & leadInvestigatorIdL .~ iid & activeInvestigatorIdL .~ iid
+  ChoosePlayer iid SetTurnPlayer -> do
+    pushAll [BeginTurn iid, After (BeginTurn iid)]
+    pure $ g & activeInvestigatorIdL .~ iid & turnPlayerInvestigatorIdL ?~ iid
+  {- A turn suspended mid-turn is picked back up: the bookkeeping 'BeginTurn'
+  does, with none of its windows, because the turn is not beginning. The queue
+  drain then opens this investigator's action window, so the phase resumes at
+  2.2.1 rather than 2.2. See 'Arkham.Modifier.ResumesSuspendedTurn'. -}
+  ChoosePlayer iid ResumeTurnPlayer -> do
+    player <- getPlayer iid
+    pure $ turnStartState iid player g
+  After (MoveTo (moveTarget -> InvestigatorTarget iid)) -> do
+    -- Where it ended up, as well as that it happened: "moved to a location with
+    -- an enemy" is a question about the destination, and read afterwards, which
+    -- is when the investigator is already standing there.
+    arrived <- field Investigator.InvestigatorLocation iid
+    let
+      historyItems =
+        HistoryItem HistoryMoved 1
+          : [HistoryItem HistoryMovedTo [lid] | lid <- maybeToList arrived]
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      record item =
+        (phaseHistoryL %~ insertHistory iid item)
+          . (if turn then turnHistoryL %~ insertHistory iid item else id)
+    pure $ foldr record g historyItems
+  Arkham.Helpers.Message.Defeated (EnemyTarget eid) _ source _ -> do
+    attrs <- toAttrs <$> getEnemy eid
+    mlid <- field EnemyLocation eid
+    miid <- getSourceController source
+    lead <- getLead
+    -- TODO: This is wrong but history is the way we track if enemies were
+    -- defeated for cards like Kerosene (1), we need a history independent of
+    -- the iid for cases where we aren't looking at a specific investigator
+    mEnemyHealth <- fieldMayJoin EnemyHealth eid
+    let
+      iid = fromMaybe lead miid
+      placement' = maybe (enemyPlacement attrs) AtLocation mlid
+      historyItem =
+        HistoryItem
+          HistoryEnemiesDefeated
+          [ DefeatedEnemyAttrs
+              { defeatedEnemyAttrs = attrs {enemyPlacement = placement'}
+              , defeatedEnemyHealth = fromMaybe 0 mEnemyHealth
+              }
+          ]
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      setTurnHistory =
+        if turn then turnHistoryL %~ insertHistory iid historyItem else id
+    pure $ g & (phaseHistoryL %~ insertHistory iid historyItem) & setTurnHistory
+  Successful (Action.Investigate, LocationTarget lid) iid _ _ _ -> do
+    let
+      historyItem = HistoryItem HistoryLocationsSuccessfullyInvestigated (singleton lid)
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      setTurnHistory =
+        if turn then turnHistoryL %~ insertHistory iid historyItem else id
+    pure $ g & (phaseHistoryL %~ insertHistory iid historyItem) & setTurnHistory
+  ObtainCard cardId -> do
+    pure
+      $ g
+      & (foundCardsL . each %~ deleteFirstMatch ((== cardId) . toCardId))
+      . (focusedCardsL %~ map (filter ((/= cardId) . toCardId)))
+  GameOver -> endGame Nothing g
+  GameOverWith verdict -> endGame (Just verdict) g
+  PlaceLocation lid card ->
+    if isNothing $ g ^. entitiesL . locationsL . at lid
+      then do
+        let location = lookupLocation (toCardCode card) lid (toCardId card)
+        push (PlacedLocation (toName location) (toCardCode card) lid)
+        pure $ g & entitiesL . locationsL . at lid ?~ location
+      else pure g
+  PlaceLocationWith lid card update ->
+    if isNothing $ g ^. entitiesL . locationsL . at lid
+      then do
+        let location = overAttrs (updateLocation [update]) (lookupLocation (toCardCode card) lid (toCardId card))
+        push (PlacedLocation (toName location) (toCardCode card) lid)
+        pure $ g & entitiesL . locationsL . at lid ?~ location
+      else pure g
+  -- Place an enemy-location card directly into play as an enemy-location entity.
+  PlaceEnemyLocation lid card ->
+    if isNothing $ g ^. entitiesL . enemyLocationsL . at lid
+      then do
+        let el = lookupEnemyLocation (toCardCode card) lid (toCardId card)
+        push (PlacedLocation (toName el) (toCardCode card) lid)
+        pure $ g & entitiesL . enemyLocationsL . at lid ?~ el
+      else pure g
+  -- Flip a location to its enemy-location side.
+  -- Removes the location entity and adds an enemy-location entity with the same ID.
+  -- All investigators, enemies, attachments, and tokens are kept per the rules.
+  FlipToEnemyLocation lid card -> do
+    mLocation <- maybeLocation lid
+    let
+      inheritLocationData = case mLocation of
+        Nothing -> id
+        Just location ->
+          let la = toAttrs location
+           in overAttrs \a ->
+                a
+                  { enemyLocationBase =
+                      (enemyLocationBase a)
+                        { locationId = locationId la
+                        , locationCardId = locationCardId la
+                        , locationTokens = locationTokens la
+                        , locationWithoutClues = Token.countTokens Token.Clue (locationTokens la) == 0
+                        , locationLabel = locationLabel la
+                        , locationPosition = locationPosition la
+                        , locationGroup = locationGroup la
+                        , locationPlacement = locationPlacement la
+                        , locationConnectedMatchers = locationConnectedMatchers la
+                        , locationConnectsTo = locationConnectsTo la
+                        , locationDirections = locationDirections la
+                        , locationRevealedConnectedMatchers = locationRevealedConnectedMatchers la
+                        }
+                  }
+      el = inheritLocationData $ lookupEnemyLocation (flippedCardCode $ toCardCode card) lid (toCardId card)
+
+    replaceCard card.id (forceFlipCard card)
+
+    -- Surface the flip as a FlipLocation window so card-level forced/reactive
+    -- abilities ("when this enemy-location is revealed") can hook in via the
+    -- existing FlipLocation matcher. Deliberately no PlacedLocation: a flip is
+    -- not an enters-play event and must not re-place reveal clues or fire
+    -- enters-play windows ("keep all ... tokens on that location").
+    lead <- getLead
+    pushAll
+      [ Msg.CheckWindows [mkWhen (Window.FlipLocation lead lid)]
+      , Msg.CheckWindows [mkAfter (Window.FlipLocation lead lid)]
+      ]
+    pure
+      $ g
+      & (entitiesL . locationsL %~ deleteMap lid)
+      & (entitiesL . enemyLocationsL . at lid ?~ el)
+  -- Flip an enemy-location back to its location side.
+  -- Removes the enemy-location entity and adds a location entity with the same ID.
+  -- All investigators, enemies, attachments, and tokens are kept per the rules.
+  FlipToLocation lid card -> do
+    let
+      mEnemyLocation = preview (entitiesL . enemyLocationsL . ix lid) g
+      inheritEnemyLocationData = case mEnemyLocation of
+        Nothing -> id
+        Just el ->
+          let la = enemyLocationBase (toAttrs el)
+           in overAttrs \a ->
+                a
+                  { locationId = locationId la
+                  , locationCardId = locationCardId la
+                  , locationTokens = locationTokens la
+                  , locationWithoutClues = Token.countTokens Token.Clue (locationTokens la) == 0
+                  , locationLabel = locationLabel la
+                  , locationPosition = locationPosition la
+                  , locationGroup = locationGroup la
+                  , locationPlacement = locationPlacement la
+                  , locationConnectedMatchers = locationConnectedMatchers la
+                  , locationConnectsTo = locationConnectsTo la
+                  , locationDirections = locationDirections la
+                  , locationRevealedConnectedMatchers = locationRevealedConnectedMatchers la
+                  }
+      location = inheritEnemyLocationData $ lookupLocation (flippedCardCode $ toCardCode card) lid (toCardId card)
+
+    replaceCard card.id (forceFlipCard card)
+
+    -- Surface the flip as a FlipLocation window so card-level forced/reactive
+    -- abilities can hook in via the existing FlipLocation matcher. Deliberately
+    -- no PlacedLocation: a flip is not an enters-play event and must not
+    -- re-place reveal clues or fire enters-play windows.
+    lead <- getLead
+    pushAll
+      [ Msg.CheckWindows [mkWhen (Window.FlipLocation lead lid)]
+      , Msg.CheckWindows [mkAfter (Window.FlipLocation lead lid)]
+      ]
+    pure
+      $ g
+      & (entitiesL . enemyLocationsL %~ deleteMap lid)
+      & (entitiesL . locationsL . at lid ?~ location)
+  -- Remove an enemy-location from play (e.g. after defeat).
+  -- Investigators, story assets, and enemies that were here are relocated by
+  -- the scenario per the enemy-location defeat rules; everything else at the
+  -- location leaves play as it would when a location is removed.
+  --
+  -- Match on placement, not on `AtLocation`/`assetAt`/`TreacheryAt`: those resolve a card's
+  -- location through its controller, so a card in the play/threat area of an investigator
+  -- standing here would match and be discarded instead of moving with them.
+  RemoveEnemyLocation lid -> do
+    treacheries <-
+      select
+        $ oneOf [TreacheryWithPlacement (AtLocation lid), TreacheryWithPlacement (AttachedToLocation lid)]
+    pushAll $ concatMap (resolve . toDiscard GameSource) treacheries
+    events <-
+      select $ oneOf [EventWithPlacement (AtLocation lid), EventWithPlacement (AttachedToLocation lid)]
+    pushAll $ concatMap (resolve . toDiscard GameSource) events
+    assets <-
+      select
+        $ oneOf [AssetWithPlacement (AtLocation lid), AssetWithPlacement (AttachedToLocation lid)]
+        <> NotAsset StoryAsset
+    pushAll $ concatMap (resolve . toDiscard GameSource) assets
+    pure $ g & entitiesL . enemyLocationsL %~ deleteMap lid
+  ReplaceLocation lid card replaceStrategy -> do
+    -- if replaceStrategy is swap we also want to copy over revealed, all tokens
+    location <- getLocation lid
+    let
+      oldAttrs = toAttrs location
+      orKey k v = case lookup k (locationGlobalMeta oldAttrs) of
+        Nothing -> v
+        Just v' -> case fromJSON v' of
+          Success v'' -> v''
+          Error _ -> v
+
+      location' =
+        flip overAttrs (lookupLocation (toCardCode card) lid (toCardId card))
+          $ \attrs -> case replaceStrategy of
+            DefaultReplace ->
+              attrs
+                { locationRevealed = orKey "replacedIsRevealed" (locationRevealed attrs)
+                , locationWithoutClues =
+                    orKey "replacedIsWithoutClues" (locationWithoutClues attrs) && oldAttrs.clues == 0
+                , locationTokens = locationTokens oldAttrs
+                , locationCardsUnderneath = locationCardsUnderneath oldAttrs
+                , locationGlobalMeta =
+                    Map.insert "replacedLocation" (toJSON oldAttrs.cardCode) (locationGlobalMeta oldAttrs)
+                }
+            Swap ->
+              attrs
+                { locationTokens = locationTokens oldAttrs
+                , locationRevealed = orKey "replacedIsRevealed" (locationRevealed oldAttrs)
+                , locationCardsUnderneath = locationCardsUnderneath oldAttrs
+                , locationWithoutClues =
+                    orKey "replacedIsWithoutClues" (locationWithoutClues oldAttrs) && oldAttrs.clues == 0
+                , locationGlobalMeta =
+                    Map.insert "replacedLocation" (toJSON oldAttrs.cardCode) (locationGlobalMeta oldAttrs)
+                , locationPosition = locationPosition oldAttrs
+                , locationGroup = locationGroup oldAttrs
+                , locationLabel = locationLabel oldAttrs
+                , locationDirections = locationDirections oldAttrs
+                , locationConnectsTo = locationConnectsTo oldAttrs
+                , -- Swap is the same physical card flipped over, so its flood
+                  -- level carries across (Barrier Core, The Drowned Quarter).
+                  locationFloodLevel = locationFloodLevel oldAttrs
+                }
+    -- todo: should we just run this in place?
+    enemies <- select $ enemyAt lid
+    if replaceStrategy == Swap
+      then pushAll $ map EnemyCheckEngagement enemies
+      else
+        pushAll
+          $ [PlacedLocation (toName card) (toCardCode card) lid]
+          <> map EnemyCheckEngagement enemies
+    pure $ g & entitiesL . locationsL . at lid ?~ location'
+  ReplaceEnemy eid card replaceStrategy -> do
+    -- if replaceStrategy is swap we also want to copy over revealed, all tokens
+    enemy <- getEnemy eid
+    let
+      oldAttrs = toAttrs enemy
+      enemy' =
+        updateAttrs (lookupEnemy (toCardCode card) eid (toCardId card))
+          $ \attrs -> case replaceStrategy of
+            DefaultReplace -> attrs
+            Swap ->
+              attrs
+                { enemyTokens = enemyTokens oldAttrs
+                , enemyPlacement = enemyPlacement oldAttrs
+                , -- Swap is the same physical card flipped over, so an enemy that
+                  -- is its own location keeps its grid cell.
+                  enemyAsSelfLocation = enemyAsSelfLocation oldAttrs
+                , enemyAssignedDamage = enemyAssignedDamage oldAttrs
+                , enemyExhausted = enemyExhausted oldAttrs
+                , enemyMovedFromHunterKeyword = enemyMovedFromHunterKeyword oldAttrs
+                , enemySealedChaosTokens = enemySealedChaosTokens oldAttrs
+                , enemyKeys = enemyKeys oldAttrs
+                , enemySpawnedBy = enemySpawnedBy oldAttrs
+                , enemyDiscardedBy = enemyDiscardedBy oldAttrs
+                , enemyCardsUnderneath = enemyCardsUnderneath oldAttrs
+                , enemyAttacking = enemyAttacking oldAttrs
+                , enemyWantsToAttack = enemyWantsToAttack oldAttrs
+                }
+
+    pushWhen (replaceStrategy == DefaultReplace) $ EnemyCheckEngagement eid
+    when (card.id == toCardId enemy) $ replaceCard card.id card
+    -- todo: should we just run this in place?
+    -- The replacement side enters play now, so it cannot respond to a window whose
+    -- condition already occurred -- including the fight or evade that flipped it.
+    pure
+      $ g
+      & entitiesL
+      . enemiesL
+      . at eid
+      ?~ enemy'
+      & entryTicksL
+      %~ insertMap card.id (gameWindowTick g)
+  Do (DiscardCard iid _ cid) -> do
+    card <- getCard cid
+    if cdCardInHandEffects (toCardDef card)
+      then do
+        let
+          setAssetPlacement :: forall a. Typeable a => a -> a
+          setAssetPlacement a = case eqT @a @Asset of
+            Just Refl -> overAttrs (\attrs -> attrs {assetPlacement = StillInHand iid, assetController = Just iid}) a
+            Nothing -> a
+        pure
+          $ g
+          & actionRemovedEntitiesL
+          %~ (\e -> addCardEntityWith iid setAssetPlacement (unsafeCardIdToUUID card.id) e card)
+      else pure g
+  -- Snapshot an asset on its way out, while its placement is still real: the
+  -- Asset runner's `RemovedFromPlay` handler clobbers it to `OutOfPlay
+  -- RemovedZone`, after which `AssetAt`/`AssetControlledBy` can no longer resolve
+  -- it. `withRemovedEntities` splices this copy back in while a leave-play window
+  -- is open so reactions to the removal can still match what left. #5518
+  RemoveFromPlay (AssetSource aid) -> do
+    parked <-
+      maybeAsset aid <&> \case
+        Nothing -> id
+        Just asset -> tombstonesL . assetsL %~ insertEntity asset
+    pure $ g & parked
+  RemoveAsset aid -> do
+    removedEntitiesF <-
+      if notNull (gameActiveAbilities g)
+        then do
+          -- This might be the source of issues in the future but this means the asset was removed already
+          maybeAsset aid <&> \case
+            Nothing -> id
+            Just asset -> actionRemovedEntitiesL . assetsL %~ insertEntity asset
+        else pure id
+    pure $ g & entitiesL . assetsL %~ deleteMap aid & removedEntitiesF
+  RemoveEvent eid -> do
+    let isMyDiscard = \case
+          Discard _ _ (EventTarget eid') -> eid == eid'
+          _ -> False
+    popMessageMatching_ isMyDiscard
+    withQueue_ $ map $ \case
+      Would bId msgs -> Would bId (filter (not . isMyDiscard) msgs)
+      other -> other
+    event' <- getEvent eid
+    pure
+      $ g
+      & (entitiesL . eventsL %~ deleteMap eid)
+      & (actionRemovedEntitiesL . eventsL %~ insertEntity event')
+  RemoveEnemy eid -> do
+    popMessageMatching_ $ \case
+      Arkham.Helpers.Message.Defeated (EnemyTarget eid') _ _ _ -> eid == eid'
+      _ -> False
+    popMessageMatching_ $ \case
+      Discard _ _ (EnemyTarget eid') -> eid == eid'
+      _ -> False
+    -- enemy might already be gone (i.e. placed in void)
+    maybeEnemy eid >>= \case
+      Nothing -> pure g
+      Just enemy -> do
+        swarms <- select $ SwarmOf eid
+
+        -- a swarm card can itself have swarm cards, so this must happen even
+        -- when the enemy leaving play is a swarm card, otherwise they are
+        -- orphaned with a host that no longer exists
+        pushAll $ map RemoveEnemy swarms
+
+        case attr enemyPlacement enemy of
+          AsSwarm _ c -> case toCardOwner c of
+            Just owner -> push $ PutCardOnBottomOfDeck owner (Deck.InvestigatorDeck owner) c
+            Nothing -> unlessM (hasCampaignOption UseSwarmPlaceholders) $ case c of
+              -- A scenario effect can slide an encounter card under a host enemy
+              -- (Dark Matter's Duplication). There is no owner's deck to return
+              -- it to, so it leaves play to the encounter discard instead.
+              EncounterCard ec -> push $ AddToEncounterDiscard ec
+              _ -> error "Missing owner"
+          _ -> pure ()
+
+        zone <-
+          case attr enemyPlacement enemy of
+            OutOfPlay VictoryDisplayZone -> do
+              mods <- getModifiers enemy.id
+              pure $ if StayInVictory `elem` mods then VictoryDisplayZone else RemovedZone
+            _ -> pure RemovedZone
+
+        pure
+          $ g
+          & entitiesL
+          . enemiesL
+          . ix eid
+          %~ overAttrs (\x -> x {enemyPlacement = OutOfPlay zone})
+  RemoveSkill sid -> do
+    -- A skill leaving play returns any chaos tokens it sealed (e.g. Unrelenting
+    -- (1)). RemoveSkill is the quiet removal path used by obtainCard and by
+    -- direct removeSkill calls; it does not route through RemoveFromPlay, so
+    -- unseal here. This mirrors Skill.Runner's RemoveFromPlay handler and is
+    -- idempotent with it and with any card-level afterSkillTest unseal.
+    for_ (preview (entitiesL . skillsL . ix sid) g) \skill ->
+      pushAll [UnsealChaosToken token | token <- skillSealedChaosTokens (toAttrs skill)]
+    removedEntitiesF <-
+      if notNull (gameActiveAbilities g)
+        then do
+          skill <- getSkill sid
+          pure
+            $ actionRemovedEntitiesL
+            . skillsL
+            %~ insertEntity (overAttrs (Skill.placementL .~ OutOfPlay RemovedZone) skill)
+        else pure id
+    pure $ g & entitiesL . skillsL %~ deleteMap sid & removedEntitiesF
+  When (RemoveEnemy enemy) -> do
+    pushM $ checkWindows [mkWhen (Window.LeavePlay $ toTarget enemy)]
+    pure g
+  RemoveTreachery tid -> do
+    popMessageMatching_ $ \case
+      After (Revelation _ source) -> isSource tid source
+      _ -> False
+
+    push $ After (RemoveTreachery tid)
+
+    maybeTreachery tid >>= \case
+      Nothing -> pure $ g & entitiesL . treacheriesL %~ deleteMap tid
+      Just treachery' ->
+        pure
+          $ g
+          & (entitiesL . treacheriesL %~ deleteMap tid)
+          & (actionRemovedEntitiesL . treacheriesL %~ insertEntity treachery')
+  When (RemoveLocation lid) -> do
+    pushM $ checkWindows [mkWhen (Window.LeavePlay $ toTarget lid)]
+    pure g
+  -- Nothing to sweep from here. Each entity notices that its own location left
+  -- play and discards itself (the `RemovedLocation` cases in the Enemy, Event,
+  -- Asset, Treachery and Investigator runners), and anything *attached* to one
+  -- of those entities rides along on its host's removal instead.
+  --
+  -- Do not move the sweep back here. `enemyAt`/`eventAt`/`assetAt` resolve a
+  -- location transitively through `placementLocation`, so an attachment counts
+  -- as being "at" its host's location -- and because `runGameMessage` is not
+  -- inside `runQueueT`, consecutive pushes here prepend and resolve in reverse
+  -- source order. Together that discarded a Rod of Carnamagos Rot before its
+  -- host enemy ever reached its leave-play window, so the Rot's forced
+  -- `EnemyLeavesPlay #when` reaction never fired and it went to the discard
+  -- pile instead of back to the bonded cards, #5426.
+  --
+  -- `Do (RemovedLocation lid)` is queued as a sibling behind this message (see
+  -- `removedLocation` in Arkham.Message.Lifted.Location) so the location entity
+  -- outlives the entities standing on it.
+  RemovedLocation _ -> pure g
+  Do (RemovedLocation lid) -> do
+    maybeLocation lid >>= \case
+      Nothing -> pure g
+      Just location ->
+        pure
+          $ g
+          & (entitiesL . locationsL %~ deleteMap lid)
+          & (actionRemovedEntitiesL . locationsL %~ Map.insert lid location)
+  SpendClues 0 _ -> pure g
+  SpendClues n iids -> do
+    investigatorsWithClues <- forMaybeM iids \iid' -> do
+      clues <- getSpendableClueCount iid'
+      if clues > 0
+        then do
+          name <- fieldMap Investigator.InvestigatorName toTitle iid'
+          pure $ Just (iid', name, clues)
+        else pure Nothing
+    case investigatorsWithClues of
+      [] -> error "someone needed to spend some clues"
+      [(x, _, _)] -> push $ InvestigatorSpendClues x n
+      _ -> do
+        if sum (map (\(_, _, x) -> x) investigatorsWithClues) == n
+          then pushAll $ map (\(i, _, x) -> InvestigatorSpendClues i x) investigatorsWithClues
+          else do
+            player <- getPlayer (gameLeadInvestigatorId g)
+            rs <- getRandoms
+            let
+              paymentOptions =
+                zipWith
+                  ( \choiceId (iid', name, clues) -> PaymentAmountChoice choiceId iid' 0 clues name $ InvestigatorSpendClues iid' 1
+                  )
+                  rs
+                  investigatorsWithClues
+            push $ Ask player $ ChoosePaymentAmounts "Clues" (Just $ TotalAmountTarget n) paymentOptions
+    pure g
+  AdvanceCurrentAgenda -> do
+    let aids = keys $ g ^. entitiesL . agendasL
+    pushAll [AdvanceAgendaBy aid AgendaAdvancedWithOther | aid <- aids]
+    pure g
+  ReplaceAgenda aid1 card -> do
+    agendaDeckId <- field AgendaDeckId aid1
+    let
+      newAgendaId = AgendaId (toCardCode card)
+      newAgenda = lookupAgenda newAgendaId agendaDeckId (toCardId card)
+
+    let (before, _, after) = frame (Window.EnterPlay $ toTarget newAgenda)
+    pushAll [before, after]
+    pure
+      $ g
+      & (entitiesL . agendasL %~ insertMap newAgendaId newAgenda . deleteMap aid1)
+  ReplaceAct aid1 card -> do
+    actDeckId <- fromMaybe 1 <$> fieldMay ActDeckId aid1
+    let newActId = ActId (toCardCode card)
+    let newAct = either throw id $ lookupAct newActId actDeckId (toCardId card)
+    pure
+      $ g
+      & (entitiesL . actsL %~ insertMap newActId newAct . deleteMap aid1)
+  AddAct deckNum card -> do
+    let aid = ActId $ toCardCode card
+    pure $ g & entitiesL . actsL . at aid ?~ either throw id (lookupAct aid deckNum $ toCardId card)
+  AddAgenda agendaDeckNum card -> do
+    let aid = AgendaId $ toCardCode card
+    mods <- getModifiers aid
+    let startingDoom = sum [n | EntersPlayWithDoom n <- mods]
+    let (before, _, after) = frame (Window.EnterPlay $ toTarget aid)
+    pushAll [before, after]
+    let theAgenda = lookupAgenda aid agendaDeckNum (toCardId card)
+    pure
+      $ g
+      & entitiesL
+      . agendasL
+      . at aid
+      ?~ (if startingDoom > 0 then overAttrs (doomL .~ startingDoom) theAgenda else theAgenda)
+  ReassignHorror source target n -> do
+    let
+      matchesP = \case
+        Window.PlacedToken _ t Token.Horror _ -> t == sourceToTarget source
+        _ -> False
+      rewriteWT = \case
+        Window.PlacedToken s t Token.Horror m
+          | m > n -> [Window.PlacedToken s t Token.Horror (m - n), Window.PlacedToken s target Token.Horror n]
+        Window.PlacedToken s _ Token.Horror _ -> [Window.PlacedToken s target Token.Horror n]
+        other -> [other]
+    replaceWindowMany matchesP rewriteWT
+    pure $ g & entitiesL . investigatorsL %~ map (rewriteUsedAbilityWindows matchesP rewriteWT)
+  ReassignDamage source target n -> do
+    let
+      matchesP = \case
+        Window.PlacedToken _ t Token.Damage _ -> t == sourceToTarget source
+        _ -> False
+      rewriteWT = \case
+        Window.PlacedToken s t Token.Damage m
+          | m > n -> [Window.PlacedToken s t Token.Damage (m - n), Window.PlacedToken s target Token.Damage n]
+        Window.PlacedToken s _ Token.Damage _ -> [Window.PlacedToken s target Token.Damage n]
+        other -> [other]
+    replaceWindowMany matchesP rewriteWT
+    pure $ g & entitiesL . investigatorsL %~ map (rewriteUsedAbilityWindows matchesP rewriteWT)
+  CommitCard iid card -> do
+    let alreadyCommitted = any ((== card.id) . toCardId) (g ^. entitiesL . skillsL)
+    if alreadyCommitted || isNothing (g ^. skillTestL)
+      then pure g
+      else do
+        push $ InvestigatorCommittedCard iid card
+        case card of
+          PlayerCard pc -> case toCardType pc of
+            SkillType -> do
+              skillId <- getRandom
+              let hasInDiscardEffects = cdCardInDiscardEffects (toCardDef card)
+              inDiscard <- selectAny $ inDiscardOf iid <> basic (CardWithId card.id)
+
+              let setPlacement = overAttrs \attrs ->
+                    attrs {skillPlacement = if hasInDiscardEffects && inDiscard then StillInDiscard iid else Unplaced}
+              let skill = setPlacement $ createSkill pc iid skillId
+              push $ InvestigatorCommittedSkill iid skillId
+              mods <- getModifiers card.id
+              unless (NoAdditionalCosts `elem` mods) do
+                for_ (skillAdditionalCost $ toAttrs skill) \cost -> do
+                  let ability = abilityEffect skill [] $ replaceYouMatcher skill.owner cost
+                  push $ PayForAbility ability []
+              pure $ g & entitiesL . skillsL %~ insertMap skillId skill
+            _ -> pure g
+          _ -> pure g
+  SkillTestResults resultsData -> pure $ g & skillTestResultsL ?~ resultsData
+  Do (SkillTestEnds _ iid _) -> do
+    let result = skillTestResult <$> g ^. skillTestL
+    let
+      resultF =
+        case result of
+          Just SucceededBy {} -> \case
+            IfSuccessfulModifier m -> m
+            other -> other
+          Just FailedBy {} -> \case
+            IfFailureModifier m -> m
+            other -> other
+          _ -> id
+
+    skills' <-
+      map (overAttrs (Skill.placementL .~ OutOfPlay RemovedZone))
+        <$> filterMapM (fieldMap SkillPlacement (== Limbo) . toId) (g ^. entitiesL . skillsL)
+
+    skillPairs <- for (mapToList skills') $ \(skillId, skill) -> do
+      card <- field SkillCard skillId
+      mods <- map resultF <$> liftA2 (<>) (getModifiers skillId) (getModifiers $ toCardId card)
+      let
+        modifyAfterPlay cur = \case
+          SetAfterPlay n -> case cur of
+            DevourThis {} -> cur
+            _ -> n
+          _ -> cur
+
+        afterPlay = foldl' modifyAfterPlay (skillAfterPlay $ toAttrs skill) mods
+        -- @skillOwner@ is the investigator who committed the card, which is not
+        -- necessarily who owns it (e.g. Guided by the Unseen (3) commits a card out of the
+        -- performing investigator's deck). A committed card always returns to its owner.
+        owner = fromMaybe (skillOwner $ toAttrs skill) card.owner
+      pure
+        $ if
+          | DevourThis iid' <- afterPlay ->
+              (Run [ObtainCard (toCard skill).id, Devoured iid' (toCard skill)], Nothing)
+          | ReturnToHandAfterTest `elem` mods ->
+              (ReturnToHand owner (SkillTarget skillId), Nothing)
+          | PlaceOnBottomOfDeckInsteadOfDiscard `elem` mods ->
+              ( PutCardOnBottomOfDeck owner (Deck.InvestigatorDeck owner) (toCard skill)
+              , Just skillId
+              )
+          | LeaveCardWhereItIs `elem` mods ->
+              (Run [RemoveFromPlay (toSource skillId)], Just skillId)
+          | CampaignModifier "hollowed" `elem` mods ->
+              (RemoveFromGame (SkillTarget skillId), Nothing)
+          | ShuffleIntoDeckInsteadOfDiscard `elem` mods ->
+              (ShuffleIntoDeck (Deck.InvestigatorDeck owner) (toTarget skill), Just skillId)
+          | otherwise -> case afterPlay of
+              DiscardThis -> case toCard skill of
+                PlayerCard pc -> (AddToDiscard owner pc, Just skillId)
+                _ -> error "Unhandled encounter card skill"
+              ExileThis -> case toCard skill of
+                PlayerCard _ ->
+                  ( Exile (toTarget skillId)
+                  , Just skillId
+                  )
+                _ -> error "Unhandled encounter card skill"
+              RemoveThisFromGame ->
+                (RemoveFromGame (SkillTarget skillId), Nothing)
+              AbsoluteRemoveThisFromGame ->
+                (RemoveFromGame (SkillTarget skillId), Nothing)
+              PlaceThisBeneath target -> (Msg.PlaceUnderneath target [toCard skill], Nothing)
+              ReturnThisToHand ->
+                (ReturnToHand owner (SkillTarget skillId), Nothing)
+              ShuffleThisBackIntoDeck ->
+                (ShuffleIntoDeck (Deck.InvestigatorDeck owner) (toTarget skill), Just skillId)
+              DeferDiscard -> (Noop, Nothing)
+
+    -- A committed skill leaving the test must return any chaos tokens it
+    -- sealed (e.g. Unrelenting (1)) to the bag. The discard/return dispositions
+    -- above do not route through RemoveFromPlay, so unseal here explicitly;
+    -- this mirrors Skill.Runner's RemoveFromPlay handler and is idempotent with
+    -- any card-level afterSkillTest unseal. Without this, sealed tokens are lost
+    -- permanently when the skill is cleaned up without a RemoveFromPlay.
+    let
+      sealedTokenUnseals =
+        [ UnsealChaosToken token
+        | (_, skill) <- mapToList skills'
+        , token <- skillSealedChaosTokens (toAttrs skill)
+        ]
+    pushAll $ sealedTokenUnseals <> map fst skillPairs
+
+    let
+      skillTypes = case skillTestType <$> g ^. skillTestL of
+        Just (SkillSkillTest skillType) -> [skillType]
+        Just (AndSkillTest types) -> types
+        Just ResourceSkillTest -> []
+        Just BaseValueSkillTest {} -> []
+        Nothing -> []
+      skillsToRemove = mapMaybe snd skillPairs
+      historyItem =
+        HistoryItem
+          HistorySkillTestsPerformed
+          [(skillTypes, maybe Unrun skillTestResult (g ^. skillTestL))]
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      setTurnHistory =
+        if turn then turnHistoryL %~ insertHistory iid historyItem else id
+    pure
+      $ g
+      & ( entitiesL
+            . skillsL
+            %~ Map.filterWithKey
+              (\k _ -> k `notElem` skillsToRemove)
+        )
+      & (phaseHistoryL %~ insertHistory iid historyItem)
+      & (actionRemovedEntitiesL . skillsL %~ Map.foldr' (\s m -> Map.insert s.id s m) skills')
+      & setTurnHistory
+  Msg.RestoreSkillTestForWindow mst -> pure $ g & (skillTestL .~ mst)
+  Msg.SkillTestEnded _ -> do
+    let abilitiesToResolve = filter abilityTriggersSkillTest (g ^. activeAbilitiesL)
+    replaceAllMessagesMatching
+      \case
+        ResolvedAbility ab -> ab `elem` abilitiesToResolve
+        _ -> False
+      \case
+        ResolvedAbility ab -> [Priority $ ResolvedAbility ab]
+        other -> [other]
+
+    pure
+      $ g
+      & (skillTestL .~ Nothing)
+      & (skillTestResultsL .~ Nothing)
+      & (activeAbilitiesL %~ filter (not . abilityTriggersSkillTest))
+  Msg.AbilityIsSkillTest aref -> do
+    let updateAbility ab = if ab.ref == aref then ab {abilityTriggersSkillTest = True} else ab
+    pure $ g & (activeAbilitiesL %~ map updateAbility)
+  Do msg'@(Search {}) -> do
+    inSearch <- fromQueue (elem FinishedSearch)
+    if inSearch
+      then insertAfterMatching [msg', FinishedSearch] (== FinishedSearch)
+      else pushAll [msg', FinishedSearch]
+    pure g
+  FinishedSearch -> do
+    pure $ g & foundCardsL .~ mempty & highlightedCardsL .~ mempty
+  DiscardedCard cardId -> do
+    let
+      handleCard card = case card of
+        PlayerCard pc -> case pc.owner of
+          Just iid | pc.cardCode /= "90053" -> pushAll [ObtainCard card.id, AddToDiscard iid pc]
+          Just _ -> pure ()
+          Nothing -> push $ ObtainCard card.id
+        EncounterCard ec -> push $ AddToEncounterDiscard ec
+        VengeanceCard vc -> handleCard vc
+
+    handleCard =<< getCard cardId
+    pure g
+  Msg.PlaceUnderneath _ cards -> do
+    pure
+      $ g
+      & (focusedCardsL %~ map (filter (`notElem` cards)))
+      . (foundCardsL . each %~ filter (`notElem` cards))
+  ReturnToHand iid (SkillTarget skillId) -> do
+    -- If the skill is no longer in play (e.g. a doubled "if this test succeeds"
+    -- result from Double or Nothing tries to return Arrogance after it has
+    -- already been returned to hand), do nothing.
+    for_ (preview (entitiesL . skillsL . ix skillId) g) \_ -> do
+      card <- field SkillCard skillId
+      pushAll [RemoveFromPlay (toSource skillId), addToHand iid card]
+    pure g
+  ReturnToHand iid (CardIdTarget cardId) -> do
+    -- We need to check skills specifically as they aren't covered by the skill
+    -- test runner
+    mSkill <- selectOne $ SkillWithCardId cardId
+    case mSkill of
+      Just skillId -> do
+        card <- field SkillCard skillId
+        -- see RemoveSkill: this branch drops the entity without going through
+        -- RemoveFromPlay, so return any sealed chaos tokens to the bag here
+        for_ (preview (entitiesL . skillsL . ix skillId) g) \skill ->
+          pushAll [UnsealChaosToken token | token <- skillSealedChaosTokens (toAttrs skill)]
+        push $ addToHand iid card
+        pure $ g & entitiesL . skillsL %~ deleteMap skillId
+      Nothing -> pure g
+  ReturnToHand iid (AssetTarget assetId) -> do
+    -- If we try to return to hand but the asset is gone, then do nothing
+    mAsset <- maybeAsset assetId
+    for_ mAsset $ \asset -> do
+      removeAllMessagesMatching $ \case
+        Discarded (AssetTarget assetId') _ _ -> assetId == assetId'
+        _ -> False
+
+      card <- field AssetCard assetId
+      underneath <- field AssetCardsUnderneath assetId
+      -- a double-sided story asset flips rather than leaving play
+      unless (assetIsStory (toAttrs asset) && cdDoubleSided (toCardDef asset)) do
+        pushAll [RemoveFromPlay (toSource assetId), addToHand iid card]
+      for_ underneath (push . addToDiscard iid)
+    pure g
+  When (PlaceInBonded _ (toCardId -> cardId)) -> do
+    events <- select $ EventWithCardId cardId
+    skills <- select $ SkillWithCardId cardId
+    enemies <- select $ EnemyWithCardId cardId
+    treacheries <- select $ TreacheryWithCardId cardId
+    pushAll $ map (RemovedFromPlay . EventSource) events
+    pushAll $ map (RemovedFromPlay . SkillSource) skills
+    pushAll $ map (RemovedFromPlay . EnemySource) enemies
+    pushAll $ map (RemovedFromPlay . TreacherySource) treacheries
+    pure g
+  RemovedFromPlay (AssetSource assetId) -> do
+    runMessage (RemoveAsset assetId) g
+  RemovedFromPlay (EventSource eventId) -> do
+    runMessage (RemoveEvent eventId) g
+  RemovedFromPlay (SkillSource skillId) -> do
+    runMessage (RemoveSkill skillId) g
+  RemovedFromPlay (TreacherySource treacheryId) -> do
+    runMessage (RemoveTreachery treacheryId) g
+  ReturnToHand iid (EventTarget eventId) -> do
+    -- More than one return can be queued for the same event -- orphaned end-of-turn
+    -- effects (Spiritual Echo (2) under TabooList25) pile up and all fire at the same
+    -- EndTurn -- and the first one wins, so a later one finds nothing (#5945).
+    getEventMaybe eventId >>= \case
+      Nothing -> pure g
+      Just event' -> do
+        card <- field EventCard eventId
+        push $ addToHand iid card
+        removedEntitiesF <-
+          if gameInAction g || attr eventWaiting event'
+            then do
+              pure
+                $ actionRemovedEntitiesL
+                . eventsL
+                %~ insertEntity (overAttrs (\e -> e {eventPlacement = Unplaced}) event')
+            else pure id
+        pure $ g & entitiesL . eventsL %~ deleteMap eventId & removedEntitiesF
+  -- fight/evade events pick their enemy during resolution, so record it as the
+  -- event's target for "targets an enemy" matchers
+  ChoseEnemy _ _ ((.event) -> Just eid) enemyId -> setEventEnemyTarget eid enemyId g
+  -- an event's costs are paid before its 'FinishedEvent' is queued, so payment
+  -- choices find no resolving event and are skipped
+  ChoseTarget target -> do
+    queue <- peekQueue
+    pure $ maybe g (\eid -> setEventTarget eid target g) (resolvingEventId queue)
+  ChosenEvadeEnemy _ ((.event) -> Just eid) enemyId -> setEventEnemyTarget eid enemyId g
+  After (ShuffleIntoDeck _ (AssetTarget aid)) -> do
+    runMessage (RemoveAsset aid) g
+  After (ShuffleIntoDeck _ (EventTarget eid)) ->
+    pure $ g & entitiesL . eventsL %~ deleteMap eid
+  ShuffleIntoDeck deck (TreacheryTarget treacheryId) -> do
+    maybeTreachery treacheryId >>= traverse_ \treachery -> do
+      adjustedDeck <- case deck of
+        Deck.InvestigatorDeck _ ->
+          maybe Deck.EncounterDeck Deck.InvestigatorDeck <$> field TreacheryOwner treacheryId
+        _ -> pure deck
+
+      pushAll
+        [ RemoveTreachery treacheryId
+        , ShuffleCardsIntoDeck adjustedDeck [toCard treachery]
+        ]
+    pure g
+  ShuffleIntoDeck deck (EnemyTarget enemyId) -> do
+    maybeEnemy enemyId >>= traverse_ \_ -> do
+      -- The Thing That Follows
+      card <- field EnemyCard enemyId
+      pushAll $ resolve (RemoveEnemy enemyId) <> [ShuffleCardsIntoDeck deck [card]]
+    pure g
+  ShuffleIntoDeck deck (LocationTarget locationId) -> do
+    maybeLocation locationId >>= traverse_ \_ -> do
+      card <- field LocationCard locationId
+      push $ ShuffleCardsIntoDeck deck [card]
+      runQueueT $ removeLocation locationId
+    pure g
+  PlayCard iid card _mtarget _payment windows' True -> do
+    pushAll [BeforeCardCost iid NeedsAction windows' card.id, Do msg]
+    pure g
+  Do (PlayCard iid card' _mtarget _payment windows' True) -> do
+    card <- Lifted.fetchCard (toCardId card')
+    allModifiers <- mconcat <$> sequence [getModifiers card, getModifiers iid]
+    let
+      isFast = case card of
+        PlayerCard _ ->
+          isJust $ cdFastWindow (toCardDef card) <|> listToMaybe [w | BecomesFast w <- allModifiers]
+        _ -> False
+      isPlayAction = if isFast then NotPlayAction else IsPlayAction
+    activeCost <- createActiveCostForCard iid card isPlayAction windows'
+
+    push $ CreatedCost $ activeCostId activeCost
+    {- Mark the play as resolving, for the log. The block it opens has to span
+    the cost and the card, and nothing else in state does: the ActiveCost below
+    is deleted by @PayCostFinished@ the moment the cost is paid, and a reaction
+    to the card entering play ends the action, so the narrator cannot hold it
+    either. Popped by 'ResolvedPlayCard'. -}
+    pure
+      $ g
+      & (activeCostL %~ insertMap (activeCostId activeCost) activeCost)
+      & (cardPlayStackL %~ (<> [toCardId card]))
+  {- Ends the block opened above. The narrator sees this message BEFORE it runs,
+  so the stack is still set when the entry naming the card is built. -}
+  ResolvedPlayCard _ card -> pure $ g & cardPlayStackL %~ filter (/= toCardId card)
+  WindowAsk ws pid q -> do
+    -- get all other asks for these windows and combine into an AskMap
+    others <- popMessagesMatching \case
+      WindowAsk ws' _ _ -> ws == ws'
+      _ -> False
+
+    -- A non-blocking reaction rides along with any prompt this window raises but never
+    -- creates one. Only here is that decidable: `runWindow` runs per seat and cannot see
+    -- whether another seat is stopping the window, so every seat pushes its ask and the
+    -- purely non-blocking ones are dropped once the whole set is in hand. With nothing
+    -- blocking anywhere the window raises no prompt at all -- and must NOT re-check, or
+    -- the same set would be rebuilt and dropped forever. #5784
+    let allAsks = (pid, q) : [(pid', q') | WindowAsk _ pid' q' <- others]
+    anyBlocking <- anyM (fmap not . questionIsOnlyNonBlocking . snd) allAsks
+    let kept = if anyBlocking then allAsks else []
+    -- An ask holding a materialised set's pending window effects must drive its own
+    -- re-checking: reaching a trailing check re-derives the set and REPLACES the ask, and
+    -- that ask is the last copy of those effects ('holdsPendingWindowEffects'). The set
+    -- re-checks itself instead -- every use pushes the marker back, which re-filters and,
+    -- once empty, pushes the @Do (CheckWindows ws)@ itself (#5743, #5764). A second seat
+    -- answering first was enough to reach the trailing one and eat a fight's damage. #5798
+    let selfRechecking = any (holdsPendingWindowEffects . snd) kept
+    pushAll
+      $ [ case kept of
+            [(pid', q')] -> Ask pid' q'
+            _ -> AskMap (Map.fromList kept)
+        | notNull kept
+        ]
+      <> [Do (CheckWindows ws) | notNull ws, notNull kept, not selfRechecking]
+
+    pure g
+  PlayCard iid card mtarget payment windows' False -> do
+    let ignoreSelfModifiers = card.cardCode `elem` ["90088", "90089", "90090", "90091", "90092"]
+    cardMods <- getModifiers (CardIdTarget $ toCardId card)
+    let playSource = fromMaybe (toSource iid) $ asum [Just source | PlaySource source <- cardMods]
+    isPlayable <-
+      if ignoreSelfModifiers
+        then withoutModifiersFrom iid $ getIsPlayable iid playSource Cost.PaidCost windows' card
+        else getIsPlayable iid playSource Cost.PaidCost windows' card
+    if isPlayable
+      then do
+        mods <- getModifiers iid
+        let owner = fromMaybe iid $ listToMaybe [o | PlayableCardOf o c <- mods, c == card]
+        let controller = fromMaybe owner $ listToMaybe [c | PlayUnderControlOf c <- cardMods]
+
+        g' <- runGameMessage (PutCardIntoPlay controller card mtarget payment windows') g
+        let
+          recordLimit g'' = \case
+            MaxPerGame _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            MaxPerGamePerInvestigator _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            MaxPerTurn _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            MaxPerRound _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            MaxPerTraitPerRound _ _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            LimitPerRound _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            _ -> g''
+        mlid <- getMaybeLocation iid
+        let
+          historyItem = HistoryItem HistoryPlayedCards [PlayedCard card mlid mtarget payment]
+          turn = isJust $ view turnPlayerInvestigatorIdL g'
+          setTurnHistory = if turn then turnHistoryL %~ insertHistory iid historyItem else id
+        pure
+          $ foldl' recordLimit g' (cdLimits $ toCardDef card)
+          & (phaseHistoryL %~ insertHistory iid historyItem)
+          & setTurnHistory
+      else do
+        debugOut InfoLevel
+          $ "Tried to play "
+          <> tshow card
+          <> " but it is not in the list of playable cards"
+        pure g
+  CreatePendingEvent card iid eid -> do
+    let event' = flip overAttrs (createEvent card iid eid) \attrs ->
+          attrs {eventPlacement = Limbo}
+    pure $ g & entitiesL . eventsL %~ insertMap eid event'
+  PutCardIntoPlayById iid cardId mtarget payment windows' -> do
+    c <- getCard cardId
+    runMessage (PutCardIntoPlay iid c mtarget payment windows') g
+  PutCardIntoPlay iid card mtarget payment windows' -> do
+    let cardId = toCardId card
+    case card of
+      PlayerCard pc -> case toCardType pc of
+        PlayerTreacheryType -> do
+          tid <- getRandom
+          let treachery = lookupTreachery (toCardCode pc) iid tid cardId
+          let isPermanent = cdPermanent $ toCardDef treachery
+          if isPermanent
+            then do
+              pushAll [CardEnteredPlay iid card, PlaceTreachery tid (Placement.InThreatArea iid)]
+              pure $ g & (entitiesL . treacheriesL %~ insertMap tid treachery)
+            else do
+              modifiers' <- getCombinedModifiers [TreacheryTarget tid, CardIdTarget cardId]
+              let ignoreRevelation = IgnoreRevelation `elem` modifiers'
+              let revelation = Revelation iid (TreacherySource tid)
+              pushAll
+                $ CardEnteredPlay iid card
+                : ( guard (not ignoreRevelation)
+                      *> ( [When revelation]
+                             <> resolveRevelations modifiers' revelation
+                             <> [MoveWithSkillTest (After revelation)]
+                         )
+                  )
+                  <> [UnsetActiveCard]
+              pure
+                $ g
+                & (entitiesL . treacheriesL %~ insertMap tid treachery)
+                & (activeCardL ?~ card)
+        AssetType -> do
+          -- asset might have been put into play via revelation
+          mAid <- selectOne $ AssetWithCardId cardId
+          aid <- maybe getRandom pure mAid
+          -- We need to start the placement as in play area so that CardEnteredPlay triggers only once
+          let sealedTokens = Cost.sealChaosTokenPayments payment
+          asset <-
+            overAttrs (\attrs -> attrs {assetController = Just iid, assetSealedChaosTokens = sealedTokens})
+              <$> runMessage
+                (SetOriginalCardCode $ pcOriginalCardCode pc)
+                (createAsset card aid)
+          let isPermanent = cdPermanent $ toCardDef pc
+          playWindowMsgs <-
+            if isPermanent
+              then pure []
+              else do
+                whenPlayAsset <- checkWindows [mkWindow #when $ Window.PlayAsset iid aid]
+                afterPlayAsset <- checkWindows [mkWindow #after $ Window.PlayAsset iid aid]
+                pure [(whenPlayAsset, afterPlayAsset)]
+          pushAll
+            $ [PaidForCardCost iid card payment, CardIsEnteringPlay iid card]
+            <> [w | (w, _) <- playWindowMsgs]
+            <> [InvestigatorPlayAsset iid aid]
+            <> [w | (_, w) <- playWindowMsgs]
+            <> [ResolvedCard iid card]
+          pure $ g & entitiesL . assetsL %~ insertMap aid asset
+        EventType -> do
+          investigator' <- getInvestigator iid
+          let
+            zone =
+              if
+                | card `elem` investigatorHand (toAttrs investigator') -> Zone.FromHand
+                | maybe False (`elem` investigatorDiscard (toAttrs investigator')) (preview _PlayerCard card) ->
+                    Zone.FromDiscard
+                | otherwise -> Zone.FromPlay
+          -- Check for a pending event created by BeforePlayEvent
+          let
+            mPendingEvent =
+              find (\e -> eventCardId (toAttrs e) == toCardId card)
+                $ toList (g ^. entitiesL . eventsL)
+          (eid, event') <- case mPendingEvent of
+            Just existing -> do
+              let eid = toId existing
+              let event' = flip overAttrs existing \attrs ->
+                    attrs
+                      { eventWindows = windows'
+                      , eventPlayedFrom = zone
+                      , -- a target chosen before costs were paid (move events pick their
+                        -- destination up front) stands unless the play names one
+                        eventTarget = mtarget <|> eventTarget attrs
+                      , eventOriginalCardCode = pcOriginalCardCode pc
+                      , eventPayment = payment
+                      , eventPlacement = Limbo
+                      }
+              pure (eid, event')
+            Nothing -> do
+              eid <- getRandom
+              let event' = flip overAttrs (createEvent pc iid eid) \attrs ->
+                    attrs
+                      { eventWindows = windows'
+                      , eventPlayedFrom = zone
+                      , eventTarget = mtarget
+                      , eventOriginalCardCode = pcOriginalCardCode pc
+                      , eventPayment = payment
+                      , eventPlacement = Limbo
+                      }
+              pure (eid, event')
+          whenPlayEvent <- checkWindows [mkWindow #when $ Window.PlayEvent iid eid]
+          afterPlayEvent <- checkWindows [mkWindow #after $ Window.PlayEvent iid eid]
+          pushAll
+            [ CardEnteredPlay iid card
+            , whenPlayEvent
+            , InvestigatorPlayEvent iid eid mtarget windows' zone
+            , MoveWithSkillTest $ Run [FinishedEvent eid, afterPlayEvent, ResolvedCard iid card]
+            ]
+          pure $ g & entitiesL . eventsL %~ insertMap eid event'
+        _ -> pure g
+      EncounterCard ec -> case toCardType ec of
+        TreacheryType -> do
+          tid <- getRandom
+          let treachery = createTreachery card iid tid
+          pushAll [CardEnteredPlay iid card, PlaceTreachery tid (InThreatArea iid), ResolvedCard iid card]
+          pure $ g & (entitiesL . treacheriesL %~ insertMap tid treachery)
+        AssetType -> do
+          -- asset might have been put into play via revelation
+          mAid <- selectOne $ AssetWithCardId cardId
+          aid <- maybe getRandom pure mAid
+          let asset = overAttrs (\attrs -> attrs {assetController = Just iid}) $ createAsset card aid
+          pushAll
+            [ InvestigatorPlayAsset iid aid
+            , ResolvedCard iid card
+            ]
+          pure $ g & entitiesL . assetsL %~ insertMap aid asset
+        EncounterAssetType -> do
+          -- asset might have been put into play via revelation
+          mAid <- selectOne $ AssetWithCardId cardId
+          aid <- maybe getRandom pure mAid
+          let asset = overAttrs (\attrs -> attrs {assetController = Just iid}) $ createAsset card aid
+          pushAll
+            [ InvestigatorPlayAsset iid aid
+            , ResolvedCard iid card
+            ]
+          pure $ g & entitiesL . assetsL %~ insertMap aid asset
+        _ -> pure g
+      VengeanceCard _ -> error "Vengeance card"
+  DrewPlayerEnemy iid card -> do
+    investigator <- getInvestigator iid
+    withI18n $ cardNameVar card $ investigatorNameVar investigator do
+      if Keyword.Peril `elem` cdKeywords (toCardDef card)
+        then do
+          pid <- getPlayer iid
+          sendEnemyOnly pid (ikey' "drew") (toJSON $ toCard card)
+        else
+          sendEnemy (ikey' "drew") (toJSON $ toCard card)
+
+    enemyId <- getRandom
+    let enemy = overAttrs (\e -> e {enemyBearer = card.owner}) (createEnemy card enemyId)
+    pushAll
+      [ RemoveCardFromHand iid (toCardId card)
+      , InvestigatorDrawEnemy iid enemyId
+      ]
+    pure $ g & entitiesL . enemiesL %~ insertMap enemyId enemy & resolvingCardL ?~ card
+  Would _ [] -> pure $ g & currentBatchIdL .~ Nothing
+  Would bId (x : xs) -> do
+    pushAll [x, Would bId xs]
+    pure $ g & currentBatchIdL ?~ bId
+  ExcessDamage _ msgs -> do
+    pushAll msgs
+    pure g
+  CancelBatch bId -> do
+    withQueue_ $ \q ->
+      flip map q $ \case
+        CheckWindows ws -> CheckWindows (filter ((/= Just bId) . windowBatchId) ws)
+        Do (CheckWindows ws) -> Do (CheckWindows (filter ((/= Just bId) . windowBatchId) ws))
+        other -> other
+    removeAllMessagesMatching $ \case
+      Would bId' _ -> bId == bId'
+      DoBatch bId' _ -> bId == bId'
+      CheckWindows [] -> True
+      Do (CheckWindows []) -> True
+      _ -> False
+    -- The `Would bId []` that would have cleared the current batch was just
+    -- removed, so clear it here; otherwise every window checked for the rest of
+    -- the game is stamped with this dead batch id.
+    pure $ g & currentBatchIdL %~ \c -> if c == Just bId then Nothing else c
+  IgnoreBatch bId -> do
+    removeAllMessagesMatching $ \case
+      Would bId' _ -> bId == bId'
+      DoBatch bId' _ -> bId == bId'
+      _ -> False
+    pure g
+  DoBatch _ msg'@(Discarded {}) -> do
+    push msg'
+    pure g
+  DoBatch _ (Run msgs) -> do
+    pushAll msgs
+    pure g
+  CancelEachNext mCard source msgTypes -> do
+    push
+      =<< checkWindows
+        [mkAfter (Window.CancelledOrIgnoredCardOrGameEffect source mCard)]
+    for_ msgTypes $ \msgType -> do
+      mRemovedMsg <- withQueue $ \queue ->
+        let
+          (before, after) = break ((== Just msgType) . messageType) queue
+          (remaining, removed) = case after of
+            [] -> ([], Nothing)
+            (x : xs) -> (xs, Just x)
+         in
+          (before <> remaining, removed)
+
+      for mRemovedMsg $ \removedMsg -> do
+        case removedMsg of
+          InvestigatorDrawEnemy iid' eid -> do
+            pushAll [toDiscardBy iid' GameSource (EnemyTarget eid), UnsetActiveCard]
+          Revelation iid' source' -> do
+            removeAllMessagesMatchingM $ \case
+              When whenMsg -> pure $ removedMsg == whenMsg
+              AfterRevelation iid'' tid ->
+                pure $ iid' == iid'' && TreacherySource tid == source'
+              CheckWindows wins -> do
+                let
+                  isRevelationDrawCard = \case
+                    (windowType -> Window.DrawCard _ c _) -> (== c) <$> sourceToCard source'
+                    _ -> pure False
+                anyM isRevelationDrawCard wins
+              Do (CheckWindows wins) -> do
+                let
+                  isRevelationDrawCard = \case
+                    (windowType -> Window.DrawCard _ c _) -> (== c) <$> sourceToCard source'
+                    _ -> pure False
+                anyM isRevelationDrawCard wins
+              _ -> pure False
+            case source' of
+              TreacherySource tid ->
+                replaceMessage
+                  (After removedMsg)
+                  [toDiscardBy iid' GameSource (TreacheryTarget tid), UnsetActiveCard]
+              _ -> pure ()
+          _ -> pure ()
+    pure g
+  SkillTestAsk (Ask iid1 (ChooseOne c1)) -> do
+    mNextMessage <- peekMessage
+    case mNextMessage of
+      Just (SkillTestAsk (Ask iid2 (ChooseOne c2))) -> do
+        _ <- popMessage
+        push
+          $ SkillTestAsk
+          $ AskMap
+          $ mapFromList
+            [(iid1, ChooseOne c1), (iid2, ChooseOne c2)]
+      _ -> push (chooseOne iid1 c1)
+    pure g
+  SkillTestAsk (AskMap askMap) -> do
+    mNextMessage <- peekMessage
+    case mNextMessage of
+      Just (SkillTestAsk (Ask iid2 (ChooseOne c2))) -> do
+        _ <- popMessage
+        push
+          $ SkillTestAsk
+          $ AskMap
+          $ insertWith
+            ( \x y -> case (x, y) of
+                (ChooseOne m, ChooseOne n) -> ChooseOne $ m <> n
+                _ -> error "unhandled"
+            )
+            iid2
+            (ChooseOne c2)
+            askMap
+      _ -> push $ AskMap askMap
+    pure g
+  AskPlayer (Ask iid1 ChooseUpgradeDeck) -> do
+    peekMessage >>= \case
+      Just (AskPlayer (Ask iid2 ChooseUpgradeDeck)) -> do
+        _ <- popMessage
+        push
+          $ AskPlayer
+          $ AskMap
+          $ mapFromList
+            [(iid1, ChooseUpgradeDeck), (iid2, ChooseUpgradeDeck)]
+      _ -> push (Ask iid1 ChooseUpgradeDeck)
+    pure g
+  AskPlayer (Ask iid1 (ChooseOne c1)) -> do
+    peekMessage >>= \case
+      Just (AskPlayer (Ask iid2 (ChooseOne c2))) -> do
+        _ <- popMessage
+        push
+          $ AskPlayer
+          $ AskMap
+          $ mapFromList
+            [(iid1, ChooseOne c1), (iid2, ChooseOne c2)]
+      _ -> push (chooseOne iid1 c1)
+    pure g
+  AskPlayer (Ask iid1 (PlayerWindowChooseOne c1)) -> do
+    peekMessage >>= \case
+      Just (AskPlayer (Ask iid2 (PlayerWindowChooseOne c2))) -> do
+        _ <- popMessage
+        push
+          $ AskPlayer
+          $ AskMap
+          $ mapFromList
+            [(iid1, PlayerWindowChooseOne c1), (iid2, PlayerWindowChooseOne c2)]
+      _ -> push (Ask iid1 $ PlayerWindowChooseOne c1)
+    pure g
+  AskPlayer (AskMap askMap) -> do
+    peekMessage >>= \case
+      Just (AskPlayer (Ask iid2 ChooseUpgradeDeck)) -> do
+        _ <- popMessage
+        push
+          $ AskPlayer
+          $ AskMap
+          $ insertWith
+            ( \x y -> case (x, y) of
+                (ChooseUpgradeDeck, ChooseUpgradeDeck) -> ChooseUpgradeDeck
+                _ -> error "unhandled"
+            )
+            iid2
+            ChooseUpgradeDeck
+            askMap
+      Just (AskPlayer (Ask iid2 (ChooseOne c2))) -> do
+        _ <- popMessage
+        push
+          $ AskPlayer
+          $ AskMap
+          $ insertWith
+            ( \x y -> case (x, y) of
+                (ChooseOne m, ChooseOne n) -> ChooseOne $ m <> n
+                _ -> error "unhandled"
+            )
+            iid2
+            (ChooseOne c2)
+            askMap
+      Just (AskPlayer (Ask iid2 (PlayerWindowChooseOne c2))) -> do
+        _ <- popMessage
+        push
+          $ AskPlayer
+          $ AskMap
+          $ insertWith
+            ( \x y -> case (x, y) of
+                (PlayerWindowChooseOne m, PlayerWindowChooseOne n) -> PlayerWindowChooseOne $ m <> n
+                _ -> error "unhandled"
+            )
+            iid2
+            (PlayerWindowChooseOne c2)
+            askMap
+      _ -> push $ AskMap askMap
+    pure g
+  HandleGroupTarget FailSkillTestGroup t msgs -> do
+    peekMessage >>= \case
+      Just (HandleGroupTarget FailSkillTestGroup t' msgs') -> do
+        _ <- popMessage
+        push $ HandleGroupTargets NoAutoStatus FailSkillTestGroup (mapFromList [(t, msgs), (t', msgs')])
+      Just (HandleGroupTargets st FailSkillTestGroup m) -> do
+        _ <- popMessage
+        push $ HandleGroupTargets st FailSkillTestGroup (insertMap t msgs m)
+      Just msg'@(FailedSkillTest {}) -> do
+        _ <- popMessage
+        pushAll [msg', msg]
+      Just msg'@(Failed {}) -> do
+        _ <- popMessage
+        pushAll [msg', msg]
+      _ -> pushAll msgs
+    pure g
+  HandleGroupTarget k t msgs -> do
+    peekMessage >>= \case
+      Just (HandleGroupTarget k' t' msgs') | k == k' -> do
+        _ <- popMessage
+        push $ HandleGroupTargets NoAutoStatus k (mapFromList [(t, msgs), (t', msgs')])
+      Just (HandleGroupTargets st k' m) | k == k' -> do
+        _ <- popMessage
+        push $ HandleGroupTargets st k' (insertMap t msgs m)
+      _ -> pushAll msgs
+    pure g
+  HandleGroupTargets st k targetMap -> do
+    peekMessage >>= \case
+      Just (HandleGroupTarget k' t' msgs') | k == k' -> do
+        _ <- popMessage
+        push $ HandleGroupTargets st k (insertMap t' msgs' targetMap)
+      Just (HandleGroupTargets st' k' m) | k == k' -> do
+        _ <- popMessage
+        push $ HandleGroupTargets (st <> st') k' (m <> targetMap)
+      Just msg'@FailedSkillTest {} | k == FailSkillTestGroup -> do
+        _ <- popMessage
+        pushAll [msg', msg]
+      Just msg'@Failed {} | k == FailSkillTestGroup -> do
+        _ <- popMessage
+        pushAll [msg', msg]
+      _ -> do
+        validTargetsForKey :: Map Target [Message] <- case k of
+          HunterGroup ->
+            mapFromList <$> forMaybeM (mapToList targetMap) \(target, msgs) -> runMaybeT do
+              eid <- hoistMaybe target.enemy
+              -- An enemy batched into the hunter group can leave play while an
+              -- earlier target's move resolves (Sunken Halls defeating it as it
+              -- enters, a WouldMoveFromHunter reaction, ...), so confirm it is
+              -- still on the table before projecting any of its fields.
+              enemyAttrs <- toAttrs <$> MaybeT (project @Enemy eid)
+              guard $ isInPlayPlacement enemyAttrs.placement && not enemyAttrs.defeated
+              kws <- lift $ toList <$> getModifiedKeywords eid
+              liftGuardM $ flip anyM kws \case
+                Keyword.Patrol lm -> matches eid (#ready <> #unengaged <> not_ (EnemyAt $ replaceThatEnemy eid lm))
+                Keyword.Hunter -> do
+                  attrs <- getAttrs @Enemy eid
+                  getPreyMatcher attrs >>= \case
+                    OnlyPrey m -> do
+                      prey <- select m
+                      matches eid (#ready <> not_ (EnemyAt $ LocationWithInvestigator $ mapOneOf InvestigatorWithId prey))
+                    _ -> matches eid (#ready <> #unengaged <> not_ (EnemyAt $ LocationWithInvestigator Anyone))
+                -- War of the Outer Gods: warring enemies move during this
+                -- step and are batched with hunters
+                Keyword.ScenarioKeyword "Warring" -> matches eid (AnyEnemy <> ReadyEnemy <> UnengagedEnemy)
+                _ -> pure False
+              pure (target, msgs)
+          FailSkillTestGroup -> pure targetMap
+        case st of
+          NoAutoStatus -> do
+            let
+              opts =
+                flip map (eachWithRest $ mapToList validTargetsForKey) \((target, msgs), rest) ->
+                  TargetLabel target (msgs <> [HandleGroupTargets Manual k $ mapFromList rest])
+
+            lead <- getLeadPlayer
+            push
+              $ Ask lead
+              $ ChooseOne (Label "$label.automaticallyHandleAll" [HandleGroupTargets Auto k targetMap] : opts)
+          Manual -> do
+            let
+              opts =
+                flip map (eachWithRest $ mapToList validTargetsForKey) \((target, msgs), rest) ->
+                  TargetLabel target (msgs <> [HandleGroupTargets Manual k $ mapFromList rest])
+
+            unless (null opts) do
+              lead <- getLeadPlayer
+              push $ Ask lead $ ChooseOne opts
+          Auto -> do
+            case mapToList validTargetsForKey of
+              [] -> pure ()
+              ((_, msgs) : xs) -> pushAll $ msgs <> [HandleGroupTargets st k (mapFromList xs)]
+    pure g
+  EnemyWillAttack details -> do
+    modifiers' <- maybe (pure []) getModifiers details.singleTarget
+    cannotBeAttacked <- flip anyM modifiers' \case
+      CannotBeAttackedBy matcher -> matches details.enemy matcher
+      _ -> pure False
+    unless cannotBeAttacked do
+      mNextMessage <- peekMessage
+      case mNextMessage of
+        Just (EnemyAttacks as) -> do
+          _ <- popMessage
+          push $ EnemyAttacks (EnemyAttack details : as)
+        Just aoo@(CheckAttackOfOpportunity {}) -> do
+          _ <- popMessage
+          pushAll [aoo, msg]
+        Just (EnemyWillAttack details2) -> do
+          _ <- popMessage
+          modifiers2' <- maybe (pure []) getModifiers details2.singleTarget
+          cannotBeAttacked2 <- flip anyM modifiers2' $ \case
+            CannotBeAttackedBy matcher ->
+              elem (attackEnemy details2) <$> select matcher
+            _ -> pure False
+          if not cannotBeAttacked2
+            then
+              push
+                $ EnemyAttacks [EnemyAttack details, EnemyAttack details2]
+            else push $ EnemyAttacks [EnemyAttack details]
+        _ -> push $ EnemyAttacks [EnemyAttack details]
+    pure g
+  EnemyAttacks as -> do
+    mNextMessage <- peekMessage
+    let
+      toUI msg' = case msg' of
+        EnemyAttack details -> targetLabel (attackEnemy details) [msg']
+        -- scenario-specific attacks (e.g. warring) carry the attacking
+        -- enemy's id as their payload
+        ScenarioSpecific _ v | Just eid <- maybeResult @EnemyId v -> targetLabel eid [msg']
+        _ -> error "unhandled"
+      attackedInvestigator = \case
+        EnemyAttack details -> details.investigator
+        _ -> Nothing
+      attackingEnemies = nub $ mapMaybe attackingEnemy as
+      attackingEnemy = \case
+        EnemyAttack details -> Just details.enemy
+        ScenarioSpecific _ v -> maybeResult @EnemyId v
+        _ -> Nothing
+    case mNextMessage of
+      Just (EnemyAttacks as2) -> do
+        _ <- popMessage
+        push $ EnemyAttacks $ as ++ as2
+        pure g
+      Just aoo@(CheckAttackOfOpportunity {}) -> do
+        _ <- popMessage
+        pushAll [aoo, msg]
+        pure g
+      Just (EnemyWillAttack details2) -> do
+        _ <- popMessage
+        push $ EnemyAttacks (EnemyAttack details2 : as)
+        pure g
+      _ -> do
+        let allAttacked = nub $ mapMaybe attackedInvestigator as
+        player <- case allAttacked of
+          [iid] -> getPlayer iid
+          _ -> getPlayer (gameLeadInvestigatorId g)
+        -- Capture hosts before resolving the attacks: a swarm card may leave
+        -- play before the completion message reaches its host.
+        hosts <-
+          catMaybes <$> for attackingEnemies \eid -> do
+            fieldMay EnemyPlacement eid <&> \case
+              Just (AsSwarm host _) -> Just host
+              _ -> Nothing
+        pushAll
+          [chooseOneAtATime player $ map toUI as, FinishedEnemyAttacks $ nub (attackingEnemies <> hosts)]
+        pure
+          $ g
+          & entitiesL
+          . enemiesL
+          %~ map
+            ( \e ->
+                if e.id `elem` attackingEnemies
+                  then overAttrs (\a -> a {enemyWantsToAttack = True}) e
+                  else e
+            )
+  AfterSkillTestQuiet _ -> do
+    msgs <- popMessagesMatching \case
+      AfterSkillTestQuiet {} -> True
+      AfterSkillTestOption {} -> True
+      _ -> False
+
+    let
+      isQuiet = \case
+        AfterSkillTestQuiet {} -> True
+        _ -> False
+      (quietMsgs, options) = partition isQuiet msgs
+
+    pushAll options
+
+    for_ (msg : quietMsgs) \case
+      AfterSkillTestQuiet xs -> pushAll xs
+      _ -> pure ()
+    pure g
+  AfterSkillTestOption _ _ msgs' -> do
+    msgs <- popMessagesMatching \case
+      AfterSkillTestQuiet {} -> True
+      AfterSkillTestOption {} -> True
+      _ -> False
+
+    let
+      isQuiet = \case
+        AfterSkillTestQuiet {} -> True
+        _ -> False
+      (quietMsgs, options) = partition isQuiet msgs
+
+    if notNull quietMsgs
+      then do
+        pushAll $ msg : options
+
+        for_ quietMsgs \case
+          AfterSkillTestQuiet xs -> pushAll xs
+          _ -> pure ()
+      else do
+        if null options
+          then pushAll msgs'
+          else do
+            askMap <-
+              fmap (QuestionLabel "$label.chooseAfterSkillTestEffect" [] . ChooseOneAtATime) . Map.unionsWith (<>) <$> forMaybeM (msg : options) \case
+                AfterSkillTestOption iid lbl xs -> do
+                  playerId <- getPlayer iid
+                  pure $ Just $ singletonMap playerId [Label lbl xs]
+                _ -> pure Nothing
+            -- Every option was popped off the queue above, so nothing regenerates
+            -- these seats: without Retain, one player answering discards every other
+            -- player's option along with its messages (#4787).
+            push $ Retain (AskMap askMap)
+    pure g
+  SkillTestResultOption opt -> do
+    fromQueue (elem CollectSkillTestOptions) >>= \case
+      True -> pushEnd $ SkillTestResultOption opt
+      False -> push $ SkillTestResultOptions [opt]
+    pure g
+  SkillTestResultOptions opts -> do
+    fromQueue (elem CollectSkillTestOptions) >>= \case
+      True -> pushEnd $ SkillTestResultOptions opts
+      False ->
+        peekMessage >>= \case
+          Just (SkillTestResultOption opt) -> do
+            _ <- popMessage
+            push $ SkillTestResultOptions (opt : opts)
+          Just (SkillTestResultOptions opts') -> do
+            _ <- popMessage
+            push $ SkillTestResultOptions (opts <> opts')
+          Just msg'@(PassedSkillTest {}) -> do
+            _ <- popMessage
+            pushAll [msg', msg]
+          Just msg'@(DisableEffect {}) -> do
+            _ <- popMessage
+            pushAll [msg', msg]
+          _ ->
+            getSkillTest >>= \case
+              Just st -> case opts of
+                [opt] -> when (opt.kind /= PreOriginalOptionKind) do
+                  case opt.criteria of
+                    Nothing -> push $ uiToRun opt.option
+                    Just c -> do
+                      ok <- passesCriteria st.investigator Nothing st.source st.source [] c
+                      when ok $ push $ uiToRun opt.option
+                _ -> do
+                  opts' <-
+                    opts & mapMaybeM \opt -> do
+                      case opt.criteria of
+                        Nothing -> pure $ Just opt
+                        Just c -> do
+                          ok <- passesCriteria st.investigator Nothing st.source st.source [] c
+                          pure $ if ok then Just opt else Nothing
+                  let blocked = any (\opt -> opt.kind == BlockingOptionKind) opts'
+                  pid <- getPlayer st.investigator
+                  push $ Ask pid $ ChooseOne $ opts & eachWithRest & mapMaybe \(opt, rest) -> do
+                    guard $ elem opt opts'
+                    guard $ not blocked || opt.kind /= OriginalOptionKind
+                    guard $ opt.kind /= PreOriginalOptionKind || any (\o -> o.kind == OriginalOptionKind) rest
+                    pure $ uiAnd opt.option (SkillTestResultOptions rest)
+              Nothing -> error "missing skill test"
+    pure g
+  CollectSkillTestOptions -> do
+    collected <- withQueue \q ->
+      let gather (SkillTestResultOption o) = [o]
+          gather (SkillTestResultOptions os) = os
+          gather _ = []
+          isOpt (SkillTestResultOption _) = True
+          isOpt (SkillTestResultOptions _) = True
+          isOpt _ = False
+       in (filter (not . isOpt) q, concatMap gather q)
+    unless (null collected) do
+      -- Double or Nothing resolves the determined results twice. Each repeat has
+      -- to be its own ordering round, so the extra ones ride inside 'Run': the
+      -- 'SkillTestResultOptions' handler merges with an immediately adjacent
+      -- option message, which would otherwise collapse both rounds into a single
+      -- prompt with duplicated entries.
+      times <- getSkillTestResolveTimes
+      pushAll
+        $ SkillTestResultOptions collected
+        : replicate (times - 1) (Run [SkillTestResultOptions collected])
+    pure g
+  Flipped (AssetSource aid) card | toCardType card /= AssetType -> do
+    replaceCard card.id card
+    runMessage (RemoveAsset aid) g
+  Flipped (EnemySource eid) card | toCardType card /= EnemyType -> do
+    replaceCard card.id card
+    runMessage (RemoveEnemy eid) g
+  QuietlyRemoveFromGame target -> do
+    case target of
+      AssetTarget aid -> pure $ g & entitiesL . assetsL %~ deleteMap aid
+      EnemyTarget aid -> pure $ g & entitiesL . enemiesL %~ deleteMap aid
+      TreacheryTarget aid -> do
+        popMessageMatching_ \case
+          Discard _ _ (TreacheryTarget tid) -> tid == aid
+          _ -> False
+        pure $ g & entitiesL . treacheriesL %~ deleteMap aid
+      LocationTarget aid -> pure $ g & entitiesL . locationsL %~ deleteMap aid
+      _ -> error $ "Unhandled quiet removal of target: " <> show target
+  RemoveFromGame (ConcealedCardTarget cid) -> do
+    pure $ g & entitiesL . concealedL %~ deleteMap cid
+  RemoveFromGame (StoryTarget sid) -> do
+    pure $ g & entitiesL . storiesL %~ deleteMap sid
+  RemoveFromGame (AssetTarget aid) -> do
+    fieldMay AssetCard aid >>= \case
+      Nothing -> pure g
+      Just card ->
+        runMessage
+          (RemoveAsset aid)
+          ( g
+              & removedFromPlayL
+              %~ (card :)
+              & entitiesL
+              . assetsL
+              . ix aid
+              %~ overAttrs (\x -> x {assetPlacement = OutOfPlay RemovedZone})
+          )
+  RemoveFromGame (LocationTarget lid) -> do
+    pure $ g & (entitiesL . locationsL %~ deleteMap lid)
+  RemoveFromGame (ActTarget aid) -> do
+    pure $ g & (entitiesL . actsL %~ deleteMap aid)
+  RemoveFromGame (SkillTarget sid) -> do
+    card <- field SkillCard sid
+    pure
+      $ g
+      & (entitiesL . skillsL . ix sid %~ overAttrs (\x -> x {skillPlacement = OutOfPlay RemovedZone}))
+      & (removedFromPlayL %~ (card :))
+  RemoveFromGame (EventTarget eid) -> do
+    fieldMay EventCard eid >>= \case
+      Nothing -> pure g
+      Just card ->
+        pure
+          $ g
+          & (entitiesL . eventsL %~ deleteMap eid)
+          & (removedFromPlayL %~ (card :))
+  RemovedFromGame card -> pure $ g & removedFromPlayL %~ (card :)
+  EnemySpawnFromOutOfPlay {} -> do
+    pure $ g & (activeCardL .~ Nothing) & (focusedCardsL .~ mempty)
+  Discard _ _ (SearchedCardTarget cardId) -> do
+    investigator' <- getActiveInvestigator
+    let
+      mCard =
+        find ((== cardId) . toCardId)
+          $ fromMaybe [] (headMay $ g ^. focusedCardsL)
+          <> ( concat
+                 . Map.elems
+                 . view Investigator.foundCardsL
+                 $ toAttrs investigator'
+             )
+    case mCard of
+      -- The card already left the search (for instance a duplicate resolution of the ability that
+      -- discarded it as a cost). Nothing left to discard, so don't take the game down with us.
+      Nothing -> pure g
+      Just card@(PlayerCard pc) -> do
+        pushAll
+          [ RemoveCardFromSearch (toId investigator') cardId
+          , AddToDiscard (toId investigator') pc
+          ]
+        pure $ g & focusedCardsL %~ map (filter (/= card))
+      Just _ -> error "should not be an option for other cards"
+  Discard _ _ (ActTarget aid) ->
+    pure $ g & entitiesL . actsL %~ Map.filterWithKey (\k _ -> k /= aid)
+  Discard _ _ (AgendaTarget aid) ->
+    pure $ g & entitiesL . agendasL %~ Map.filterWithKey (\k _ -> k /= aid)
+  AddToDiscard _ pc -> pure $ g & removedFromPlayL %~ filter (/= PlayerCard pc)
+  RemoveCard c -> do
+    pushAll [ObtainCard c, Do (RemoveCard c)]
+    pure g
+  Do (RemoveCard c) -> do
+    card <- getCard c
+    pure $ g & removedFromPlayL %~ (card :)
+  AddToVictory miid (SkillTarget sid) -> do
+    card <- field SkillCard sid
+    pushAll $ ObtainCard card.id : Do msg : windows [Window.AddedToVictory miid card]
+    pure g
+  Do (AddToVictory _ (SkillTarget sid)) -> do
+    pure $ g & (entitiesL . skillsL %~ deleteMap sid)
+  AddToVictory miid (EventTarget eid) -> do
+    card <- field EventCard eid
+    pushAll $ windows [Window.AddedToVictory miid card]
+    pure $ g & (entitiesL . eventsL %~ deleteMap eid) -- we might not want to remove here?
+  AddToVictory miid (ActTarget aid) -> do
+    card <- field ActCard aid
+    pushAll $ windows [Window.AddedToVictory miid card]
+    pure $ g & (entitiesL . actsL %~ deleteMap aid) -- we might not want to remove here?
+  AddToVictory miid (StoryTarget sid) -> do
+    maybeStory sid >>= \case
+      Nothing -> pure g
+      Just s -> do
+        let attrs = toAttrs s
+        let card = lookupCard (toCardCode attrs) (storyCardId attrs)
+        let card' = if storyFlipped attrs then flipCard card else card
+        pushAll $ windows [Window.AddedToVictory miid card']
+        pure $ g & (entitiesL . storiesL %~ deleteMap sid)
+  AddToVictory miid (TreacheryTarget tid) -> do
+    whenM (selectAny $ TreacheryWithId tid) do
+      card <- field TreacheryCard tid
+      pushAll $ RemoveTreachery tid : windows [Window.AddedToVictory miid card]
+    pure g
+  AddToVictory miid (LocationTarget lid) -> do
+    case preview (entitiesL . enemyLocationsL . ix lid) g of
+      Just el -> do
+        let card = toCard el
+        pushM $ checkWindows [mkAfter (Window.LeavePlay $ toTarget lid)]
+        pushAll $ RemoveEnemyLocation lid : windows [Window.AddedToVictory miid card]
+        pushM $ checkWindows [mkWhen (Window.LeavePlay $ toTarget lid)]
+      Nothing -> do
+        card <- field LocationCard lid
+        pushM $ checkWindows [mkAfter (Window.LeavePlay $ toTarget lid)]
+        pushAll $ RemoveLocation lid : windows [Window.AddedToVictory miid card]
+        pushM $ checkWindows [mkWhen (Window.LeavePlay $ toTarget lid)]
+    pure g
+  PlayerWindow iid _ _ _ -> do
+    player <- getPlayer iid
+    pure $ g & activeInvestigatorIdL .~ iid & activePlayerIdL .~ player
+  {- The first turn's player is chosen by 'ChooseTurnPlayer' rather than a
+  question built here, because the steps below are all queued before the "when
+  the investigation phase begins" window has run -- and a card in that window
+  can decide who takes the first turn. See 'ChooseTurnPlayer'. -}
+  Begin InvestigationPhase -> do
+    let phaseStep step msgs = Msg.PhaseStep (InvestigationPhaseStep step) msgs
+    phaseBeginsWindow <-
+      checkWindows
+        [ mkWhen Window.AnyPhaseBegins
+        , mkWhen (Window.PhaseBegins #investigation)
+        ]
+
+    afterPhaseBeginsWindow <-
+      checkWindows
+        [ mkAfter Window.AnyPhaseBegins
+        , mkAfter (Window.PhaseBegins #investigation)
+        ]
+
+    fastWindow <- checkWindows [mkWhen Window.FastPlayerWindow]
+    {- The window between 2.1 and 2.2 is left out when a turn is resuming: that
+    turn is already in progress when the phase begins, so the phase never
+    reaches a point between turns for a player window to sit in. Read here, not
+    in the window itself, because the step is queued either way. -}
+    resuming <- anyM (`hasModifier` ResumesSuspendedTurn) (g ^. playerOrderL)
+    pushAll
+      $ [phaseStep InvestigationPhaseBeginsStep [phaseBeginsWindow, afterPhaseBeginsWindow]]
+      <> [phaseStep InvestigationPhaseBeginsWindow [fastWindow] | not resuming]
+      <> [phaseStep NextInvestigatorsTurnBeginsStep [ChooseTurnPlayer]]
+    pure $ g & phaseL .~ InvestigationPhase & undoPhaseStepL ?~ (gameScenarioSteps g + 1)
+  ChooseTurnPlayer -> do
+    playing <- filterM (fmap (not . doneWithTurn) . getInvestigator) (g ^. playerOrderL)
+    -- A seat owed the rest of a suspended turn narrows the offer and is resumed
+    -- rather than begun; several of them are still chosen between, which is
+    -- what the players expect to be asked.
+    resuming <- filterM (`hasModifier` ResumesSuspendedTurn) playing
+    let choice = if null resuming then SetTurnPlayer else ResumeTurnPlayer
+    case if null resuming then playing else resuming of
+      [] -> pushEnd EndInvestigation
+      [x] -> push $ ChoosePlayer x choice
+      xs
+        -- No lead yet: settle that first, then come back and ask them.
+        | g ^. leadInvestigatorIdL == "00000" -> pushAll [ChooseLeadInvestigator, ChooseTurnPlayer]
+        | otherwise -> do
+            player <- getPlayer (g ^. leadInvestigatorIdL)
+            push
+              $ questionLabel "$label.choosePlayerToTakeTurn" player
+              $ ChooseOne [PortraitLabel iid [ChoosePlayer iid choice] | iid <- xs]
+    pure g
+  BeginTurn x -> do
+    player <- getPlayer x
+    -- Two checks, not one batch: a `When your turn begins` reaction is a different timing
+    -- point from an `After your turn begins` Forced, and `runWindow`'s forced branch would
+    -- otherwise resolve the Forced first and offer the reaction only afterwards. #5784
+    whenWindow <- checkWindows [mkWhen (Window.TurnBegins x)]
+    afterWindow <- checkWindows [mkAfter (Window.TurnBegins x)]
+    {- Say what this seat may not trigger this turn. A fast or action ability has
+    no window of its own to be announced at, and the player window it belongs to
+    reopens several times a turn, so turn start is the one moment that happens
+    exactly once. 'withActiveInvestigator' because the criteria pass reads the
+    active investigator and this handler runs before 'activeInvestigatorIdL' is
+    x. 'AbilityPrevented' is narration only. #5827 -}
+    prevented <-
+      withActiveInvestigator x
+        $ map (uncurry $ AbilityPrevented x)
+        <$> getPreventedPlayerAbilities x
+    pushAll $ prevented <> [whenWindow, afterWindow]
+    pure $ turnStartState x player g
+  SetPlayerOrder -> do
+    lead <- getLead
+    players <- getInvestigators
+    push $ ChoosePlayerOrder lead (filter (/= lead) players) [lead]
+    pure g
+  ChoosePlayerOrder _ [x] [] -> do
+    pure $ g & playerOrderL .~ [x]
+  ChoosePlayerOrder _ [] (x : xs) -> do
+    pure $ g & playerOrderL .~ (x : xs)
+  ChoosePlayerOrder _ [y] (x : xs) -> do
+    pure $ g & playerOrderL .~ (x : (xs <> [y]))
+  ChoosePlayerOrder lead investigatorIds orderedInvestigatorIds -> do
+    player <- getPlayer lead
+    push
+      $ questionLabel "$label.chooseNextInTurnOrder" player
+      $ ChooseOne
+        [ PortraitLabel
+            iid
+            [ ChoosePlayerOrder
+                iid
+                (filter (/= iid) investigatorIds)
+                (orderedInvestigatorIds <> [iid])
+            ]
+        | iid <- investigatorIds
+        ]
+    pure $ g & activeInvestigatorIdL .~ gameLeadInvestigatorId g
+  After (EndTurn _) -> do
+    let turnEndUses = cardUsesMatching isPerTurnLimit g
+    pure
+      $ g
+      & (turnHistoryL .~ mempty)
+      & (turnPlayerInvestigatorIdL .~ Nothing)
+      & cardUsesL
+      %~ Map.filterWithKey (\k _ -> k `notElem` turnEndUses)
+  ClearQueue -> do
+    clearQueue
+    pure g
+  CreateCard cardId cardCode -> do
+    let card = lookupCard cardCode cardId
+    replaceCard cardId card
+    pure g
+  AskCollection iid source codes -> do
+    let
+      available = fromMaybe mempty (getTransient $ gameCollectionCards g) <> gameCustomCards g
+      custom =
+        Map.restrictKeys
+          (Map.fromList [(toCardCode card.customCardDef, card) | card <- toList available])
+          (setFromList codes)
+      offered = filter (\code -> not (isCustomCardCode code) || Map.member code custom) codes
+    registerCustomCards custom
+    unless (null offered) do
+      player <- getPlayer iid
+      push $ Ask player $ ChooseFromCollection iid source offered
+    pure $ g & customCardsL %~ (custom <>)
+  DebugRegisterCustomCard customCard -> do
+    let def = (customCardDef customCard) {cdCardCode = cardCode, cdArt = unCardCode cardCode}
+        cardCode = sanitizeCustomCardCode (toCardCode $ customCardDef customCard)
+        customCard' = customCard {customCardDef = def}
+    registerCustomCards (singletonMap cardCode customCard')
+    pure $ g & customCardsL %~ insertMap cardCode customCard'
+  DebugRemoveCustomCard cardCode -> pure $ g & customCardsL %~ deleteMap cardCode
+  DebugPlaceCard iid cardId -> do
+    card <- getCard cardId
+    case cdCardType (toCardDef card) of
+      LocationType -> push =<< placeLocation_ card
+      EnemyLocationCardType -> push =<< placeLocation_ card
+      -- Drawn rather than placed: this is the path that spawns an enemy and
+      -- resolves a revelation, so surge and peril behave as they would at the
+      -- table.
+      cardType | cardType `elem` [EnemyType, TreacheryType] -> case card of
+        EncounterCard ec -> push $ InvestigatorDrewEncounterCard iid ec
+        _ -> push $ putCardIntoPlay iid card
+      PlayerEnemyType -> push $ DrewPlayerEnemy iid card
+      -- A skill has no in-play state, so a hand is the only place to put it.
+      SkillType -> push $ DebugAddToHand iid cardId
+      StoryType -> push $ StoryMessage (ReadStory iid card ResolveIt Nothing)
+      -- Assets, events and weaknesses: into play for free, no cost paid.
+      _ -> push $ putCardIntoPlay iid card
+    pure g
+  DebugAddToCampaignDeck iid cardId -> do
+    card <- getCard cardId
+    when (cdCardType (toCardDef card) `elem` playerCardTypes) do
+      card' <- setOwner iid card
+      pushAll
+        [ AddCampaignCardToDeck iid ShuffleIn card'
+        , ShuffleCardsIntoDeck (Deck.InvestigatorDeck iid) [card']
+        ]
+    pure g
+  DebugAddToEncounterDeck deck cardId -> do
+    card <- getCard cardId
+    push $ ShuffleCardsIntoDeck deck [card]
+    pure g
+  DebugSealChaosToken tokenId target -> do
+    tokens <- getBagChaosTokens
+    for_ (find ((== tokenId) . (.id)) tokens) \token ->
+      pushAll [SealChaosToken token, SealedChaosToken token Nothing target]
+    pure g
+  DebugBeginSkillTest spec -> do
+    let
+      iid = debugTestInvestigator spec
+      refuse key = g <$ Log.sendLog (Log.notice [Log.ikeyPart key []])
+      -- an enemy target, and its value for "use the target's value" if it has one
+      enemyWithValue eid fld = do
+        inPlay <- selectAny $ EnemyWithId eid
+        value <- fieldMayJoin fld eid
+        pure
+          $ if inPlay
+            then Just (EnemyTarget eid, Calc.EnemyMaybeFieldCalculation eid fld <$ value)
+            else Nothing
+    iids <- getInvestigators
+    inTest <- isJust <$> getSkillTestId
+    mSourceCard <- traverse getCardMaybe (debugTestSourceCard spec)
+    mTarget <- case (debugTestAction spec, debugTestTarget spec) of
+      (Nothing, mtarget) -> pure $ Just (fromMaybe (toTarget iid) mtarget, Nothing)
+      (Just Action.Fight, Just (EnemyTarget eid)) -> enemyWithValue eid Field.EnemyFight
+      (Just Action.Evade, Just (EnemyTarget eid)) -> enemyWithValue eid Field.EnemyEvade
+      (Just Action.Parley, Just (EnemyTarget eid)) -> fmap (\(t, _) -> (t, Nothing)) <$> enemyWithValue eid Field.EnemyFight
+      (Just Action.Parley, Nothing) -> pure $ Just (toTarget iid, Nothing)
+      (Just Action.Investigate, Just (LocationTarget lid)) -> do
+        inPlay <- selectAny $ LocationWithId lid
+        shroud <- fieldMayJoin LocationShroud lid
+        pure
+          $ if inPlay
+            then Just (LocationTarget lid, Calc.LocationMaybeFieldCalculation lid LocationShroud <$ shroud)
+            else Nothing
+      _ -> pure Nothing
+    let
+      mTestType = case debugTestSkill spec of
+        DebugTestOneSkill skillType -> Just (SkillSkillTest skillType, SkillBaseValue skillType)
+        DebugTestCombined [] -> Nothing
+        DebugTestCombined [skillType] -> Just (SkillSkillTest skillType, SkillBaseValue skillType)
+        DebugTestCombined skillTypes -> Just (AndSkillTest skillTypes, AndSkillBaseValue skillTypes)
+        DebugTestFixed n -> Just (BaseValueSkillTest n [(#wild, 1), (#wildMinus, -1)], FixedBaseValue n)
+    if
+      | inTest -> refuse "log.debug.skillTestActive"
+      | iid `notElem` iids -> refuse "log.debug.invalidRequest"
+      | Just Nothing <- mSourceCard -> refuse "log.debug.invalidRequest"
+      | otherwise -> case (mTarget, mTestType) of
+          (Just (target, mTargetValue), Just (testType, baseValue)) -> do
+            let
+              mDifficulty = case debugTestDifficulty spec of
+                DebugDifficultyFixed n -> Just (Calc.Fixed n)
+                DebugDifficultyOfTarget -> mTargetValue
+            case mDifficulty of
+              Nothing -> refuse "log.debug.noTargetValue"
+              Just difficulty -> do
+                sid <- getRandom
+                let source = maybe GameSource CardIdSource (debugTestSourceCard spec)
+                Log.sendLog
+                  $ Log.mechanic
+                    [Log.ikeyPart "log.debug.startsSkillTest" ["investigator" Log.~> Log.investigatorRefById iid]]
+                push
+                  $ BeginSkillTest
+                  $ (buildSkillTest sid iid source target testType baseValue (SkillTestDifficulty difficulty))
+                    { skillTestAction = debugTestAction spec
+                    , skillTestSourceCard = debugTestSourceCard spec
+                    }
+                pure g
+          _ -> refuse "log.debug.invalidRequest"
+  DebugMoveCard cardId destination -> do
+    card <- getCard cardId
+    case destination of
+      -- RemoveCard, SetAsideCards and DebugAddToHand each obtain the card as
+      -- their first step, so they already pull it out of every other zone.
+      DebugCardRemovedFromGame -> push $ RemoveCard cardId
+      DebugCardSetAside -> push $ SetAsideCards [card]
+      DebugCardLocation ->
+        when (cdCardType (toCardDef card) `elem` [LocationType, EnemyLocationCardType]) do
+          placement <- placeLocation_ card
+          pushAll [ObtainCard cardId, placement]
+      DebugCardHand iid -> push $ DebugAddToHand iid cardId
+      DebugCardDiscard -> case card of
+        EncounterCard ec -> push $ AddToEncounterDiscard ec
+        PlayerCard pc -> do
+          -- AddToDiscard only answers for the investigator who owns the card, and
+          -- a card sitting in the victory display may have no owner at all.
+          iid <- maybe getLead pure pc.owner
+          pushAll [ObtainCard cardId, AddToDiscard iid (setPlayerCardOwner iid pc)]
+        VengeanceCard _ -> pure ()
+      DebugCardDeck deck position ->
+        when (cardDefCanEnterDeck (toCardDef card) deck) do
+          -- The investigator only names whose deck to touch; every other deck
+          -- ignores it, so fall back to the lead rather than inventing an id.
+          iid <- maybe getLead pure deck.investigator
+          -- Obtain first: PutCardOnTopOfDeck leaves the victory display alone, so
+          -- without this the card would exist in both places, #5662.
+          pushAll
+            $ ObtainCard cardId
+            : case position of
+              DebugDeckTop | deckSupportsEnds deck -> [PutCardOnTopOfDeck iid deck card]
+              DebugDeckBottom | deckSupportsEnds deck -> [PutCardOnBottomOfDeck iid deck card]
+              -- Only three deck signifiers implement top/bottom; for the rest the
+              -- message is a no-op, and since the card has already been obtained
+              -- that would destroy it. Shuffling in is handled for every deck.
+              _ -> [ShuffleCardsIntoDeck deck [card]]
+    pure g
+  After EndPhase -> do
+    clearQueue
+    case g ^. phaseL of
+      MythosPhase {} -> pushEnd $ Begin InvestigationPhase
+      InvestigationPhase {} -> pushEnd $ Begin EnemyPhase
+      EnemyPhase {} -> pushEnd $ Begin UpkeepPhase
+      UpkeepPhase {} -> pushAllEnd [EndRoundWindow, EndRound]
+      ResolutionPhase {} -> error "should not be called in this situation"
+      CampaignPhase {} -> error "should not be called in this situation"
+    pure
+      $ g
+      & (roundHistoryL %~ foldPhaseHistory g)
+      & (phaseHistoryL %~ mempty)
+  EndInvestigation -> do
+    whenWindow <- checkWindows [mkWhen (Window.PhaseEnds InvestigationPhase)]
+    afterWindow <- checkWindows [mkAfter (Window.PhaseEnds InvestigationPhase)]
+
+    pushAll [whenWindow, EndPhase, afterWindow, After EndPhase]
+    pure
+      $ g
+      & (phaseHistoryL .~ mempty)
+      & (roundHistoryL %~ foldPhaseHistory g)
+      & (turnPlayerInvestigatorIdL .~ Nothing)
+  Begin EnemyPhase -> do
+    runQueueT $ runEnemyPhase EndEnemy
+    pure $ g & phaseL .~ EnemyPhase & undoPhaseStepL ?~ (gameScenarioSteps g + 1)
+  EnemyAttackFromDiscard iid source card -> do
+    enemyId <- getRandom
+    let enemy = overAttrs (\a -> a {enemyPlacement = StillInEncounterDiscard}) (createEnemy card enemyId)
+    pushAll
+      [ EnemyWillAttack
+          $ (enemyAttack enemyId source iid)
+            { attackDamageStrategy = enemyDamageStrategy (toAttrs enemy)
+            }
+      , RemoveEnemy enemyId
+      ]
+
+    pure $ g & entitiesL . enemiesL . at enemyId ?~ enemy
+  EndEnemy -> do
+    pushAll
+      . (: [EndPhase, After EndPhase])
+      =<< checkWindows
+        [mkWhen (Window.PhaseEnds EnemyPhase)]
+    pure
+      $ g
+      & (roundHistoryL %~ foldPhaseHistory g)
+      & (phaseHistoryL .~ mempty)
+  Begin UpkeepPhase -> do
+    let phaseStep step msgs = Msg.PhaseStep (UpkeepPhaseStep step) msgs
+    phaseBeginsWindow <-
+      checkWindows
+        [ mkWhen Window.AnyPhaseBegins
+        , mkWhen (Window.PhaseBegins UpkeepPhase)
+        , mkAfter Window.AnyPhaseBegins
+        , mkAfter (Window.PhaseBegins UpkeepPhase)
+        ]
+    fastWindow <- checkWindows [mkWhen Window.FastPlayerWindow]
+    pushAllEnd
+      [ phaseStep UpkeepPhaseBeginsStep [phaseBeginsWindow]
+      , phaseStep UpkeepPhaseBeginsWindow [fastWindow]
+      , phaseStep ResetActionsStep []
+      , phaseStep ReadyExhaustedStep [ReadyExhausted]
+      , phaseStep DrawCardAndGainResourceStep [AllDrawCardAndResource]
+      , phaseStep CheckHandSizeStep [AllCheckHandSize]
+      , phaseStep UpkeepPhaseEndsStep [EndUpkeep, Do EndUpkeep]
+      ]
+    pure $ g & phaseL .~ UpkeepPhase & undoPhaseStepL ?~ (gameScenarioSteps g + 1)
+  Do EndUpkeep -> do
+    pushAll
+      . (: [EndPhase, After EndPhase])
+      =<< checkWindows
+        [mkWhen (Window.PhaseEnds UpkeepPhase)]
+    pure
+      $ g
+      & (roundHistoryL %~ foldPhaseHistory g)
+      & (phaseHistoryL .~ mempty)
+  EndRoundWindow -> do
+    windows' <-
+      traverse
+        (\t -> checkWindows [mkWindow t Window.AtEndOfRound])
+        [#when, Timing.AtIf, #after]
+    pushAll windows'
+    pure g
+  BeginRoundWindow -> do
+    windows' <-
+      traverse
+        (\t -> checkWindows [mkWindow t Window.AtBeginningOfRound])
+        [#when, Timing.AtIf, #after]
+    pushAll windows'
+    pure
+      $ g
+      & (phaseL .~ MythosPhase)
+      & (phaseStepL ?~ MythosPhaseStep MythosPhaseBeginsStep)
+  EndRound -> do
+    pushAllEnd [BeginRoundWindow, BeginRound, Begin MythosPhase]
+    let roundEndUses = cardUsesMatching isPerRoundLimit g
+    let tabooRoundEndUses = ["02266", "05156", "08055"]
+    pure
+      $ g
+      & (roundHistoryL .~ mempty)
+      & cardUsesL
+      %~ Map.filterWithKey (\k _ -> k `notElem` roundEndUses && k `notElem` tabooRoundEndUses)
+  Begin MythosPhase {} -> do
+    let playerOrder = g ^. playerOrderL
+    hasEncounterDeck <- scenarioField ScenarioHasEncounterDeck
+    phaseBeginsWindow <-
+      checkWindows
+        [ mkWhen Window.AnyPhaseBegins
+        , mkWhen (Window.PhaseBegins MythosPhase)
+        , mkAfter Window.AnyPhaseBegins
+        , mkAfter (Window.PhaseBegins MythosPhase)
+        ]
+    allDrawWindow <-
+      checkWindows
+        [mkWhen Window.AllDrawEncounterCard]
+    afterCheckDoomThreshold <-
+      checkWindows
+        [mkWhen Window.AfterCheckDoomThreshold]
+    fastWindow <- checkWindows [mkWhen Window.FastPlayerWindow]
+    modifiers <- getModifiers (PhaseTarget MythosPhase)
+    let phaseStep s msgs = Msg.PhaseStep (MythosPhaseStep s) msgs
+    pushAllEnd
+      $ phaseStep MythosPhaseBeginsStep [phaseBeginsWindow]
+      : [ phaseStep PlaceDoomOnAgendaStep [placeDoomOnAgenda GameSource]
+        | SkipMythosPhaseStep PlaceDoomOnAgendaStep `notElem` modifiers
+        ]
+        <> [phaseStep CheckDoomThresholdStep [AdvanceAgendaIfThresholdSatisfied, afterCheckDoomThreshold]]
+        <> [ phaseStep EachInvestigatorDrawsEncounterCardStep [allDrawWindow, AllDrawEncounterCard]
+           | hasEncounterDeck && SkipMythosPhaseStep EachInvestigatorDrawsEncounterCardStep `notElem` modifiers
+           ]
+        <> [ phaseStep MythosPhaseWindow [fastWindow]
+           , phaseStep
+               MythosPhaseEndsStep
+               [EndMythos, ChoosePlayerOrder (gameLeadInvestigatorId g) [] playerOrder]
+           ]
+    pure
+      $ g
+      & (phaseL .~ MythosPhase)
+      & (phaseStepL ?~ MythosPhaseStep MythosPhaseBeginsStep)
+      & (undoPhaseStepL ?~ (gameScenarioSteps g + 1))
+  Msg.PhaseStep step msgs -> do
+    pushAll msgs
+    pure $ g & phaseStepL ?~ step
+  AllDrawCardAndResource -> do
+    investigators <- filterM (fmap not . isEliminated) =<< getInvestigatorsInOrder
+    push $ SetActiveInvestigator $ g ^. activeInvestigatorIdL
+    for_ (reverse investigators) \iid -> push $ ForInvestigator iid AllDrawCardAndResource
+    pure g
+  AllDrawEncounterCard -> do
+    push $ SetActiveInvestigator $ g ^. activeInvestigatorIdL
+    mGloria <- selectOne $ investigatorIs Investigators.gloriaGoldberg
+    -- A seat that cannot draw one is dropped from the draw rather than handed one
+    -- that does nothing, so it is also absent from Gloria Goldberg's draw order.
+    investigators <-
+      filterM
+        (\iid -> andM [not <$> isEliminated iid, not <$> hasModifier iid CannotDrawEncounterCards])
+        =<< getInvestigatorsInOrder
+    case mGloria of
+      Just gloria | gloria `elem` investigators -> do
+        push $ SendMessage (toTarget gloria) (ForInvestigators investigators AllDrawEncounterCard)
+      _ -> for_ (reverse investigators) \iid -> push $ ForInvestigator iid AllDrawEncounterCard
+    pure g
+  ForInvestigator iid AllDrawEncounterCard -> do
+    iid' <- fromMaybe iid <$> selectOne (InvestigatorWithModifier DrawsEachEncounterCard)
+    -- Also guarded here, not only in the fan-out above: a scenario that rebuilds
+    -- the draw pushes these directly (Ages Unwound VI).
+    cannotDraw <- hasModifier iid CannotDrawEncounterCards
+    unless cannotDraw $ whenM (not <$> isEliminated iid) do
+      player <- getPlayer iid'
+      mods <- getModifiers iid'
+      viaTargets <- nub . concat <$> traverse select [tm | DrawEncounterCardsVia tm <- mods]
+      let drawTargets = if null viaTargets then [EncounterDeckTarget] else viaTargets
+      push $ chooseOne player [TargetLabel t [drawEncounterCard iid' GameSource] | t <- drawTargets]
+    pure $ g & activeInvestigatorIdL .~ iid'
+  EndMythos -> do
+    pushAll
+      . (: [EndPhase, After EndPhase])
+      =<< checkWindows [mkWhen (Window.PhaseEnds MythosPhase)]
+    pure
+      $ g
+      & (roundHistoryL %~ foldPhaseHistory g)
+      & (phaseHistoryL .~ mempty)
+  BeginSkillTestWithPreMessages _ pre skillTest -> runMessage (BeginSkillTestWithPreMessages' pre skillTest) g
+  BeginSkillTestWithPreMessages' pre skillTest -> do
+    runQueueT $ handleSkillTestNesting skillTest.id msg g do
+      let iid = skillTest.investigator
+      let defaultCase = [BeginSkillTestAfterFast]
+
+      performRevelationSkillTestWindow <-
+        checkWindows [mkWhen $ Window.WouldPerformRevelationSkillTest iid skillTest.id]
+
+      msgs <- case skillTestType skillTest of
+        ResourceSkillTest -> pure defaultCase
+        BaseValueSkillTest {} -> pure defaultCase
+        SkillSkillTest skillType -> do
+          availableSkills <- getAvailableSkillsFor skillType iid
+          player <- getPlayer iid
+          pure
+            $ if Set.size availableSkills < 2
+              then defaultCase
+              else
+                [ chooseOne
+                    player
+                    $ SkillLabel skillType []
+                    : [ SkillLabel skillType' [ReplaceSkillTestSkill (FromSkillType skillType) (ToSkillType skillType')]
+                      | skillType' <- setToList availableSkills
+                      , skillType' /= skillType
+                      ]
+                ]
+                  <> [BeginSkillTestAfterFast]
+        AndSkillTest types -> do
+          availableSkills <- for types $ traverseToSnd (`getAvailableSkillsFor` iid)
+          -- (base, other choices)
+          let skillsWithChoice = filter ((> 1) . Set.size . snd) availableSkills
+          if null skillsWithChoice
+            then pure defaultCase
+            else do
+              -- if we have base skills with other choices we need to choose for each one
+              -- if we choose a type it should replace for example if we have int+agi+wil+com and we use mind over matter
+              -- we should be asked for agi and com and end up with int+int+wil+int
+              -- Easiest way might be to let the skill test handle the replacement so we don't have to nest
+              player <- getPlayer skillTest.investigator
+              pure
+                $ map
+                  ( \(base, setToList -> skillsTypes) ->
+                      chooseOne player
+                        $ SkillLabel base []
+                        : [ SkillLabel skillType' [ReplaceSkillTestSkill (FromSkillType base) (ToSkillType skillType')]
+                          | skillType' <- skillsTypes
+                          , skillType' /= base
+                          ]
+                  )
+                  skillsWithChoice
+                <> [BeginSkillTestAfterFast]
+
+      msgs' <-
+        if skillTestIsRevelation skillTest
+          then pure $ performRevelationSkillTestWindow : msgs
+          else pure msgs
+
+      pushAll
+        $ [SetActiveInvestigator skillTest.investigator]
+        <> pre
+        <> msgs'
+        <> [SetActiveInvestigator (g ^. activeInvestigatorIdL)]
+      -- The cards go on before the test is installed: a revelation window or a
+      -- skill-choice ask opens ahead of BeginSkillTestAfterFast, and the client renders
+      -- the test from these fields.
+      skillTest' <- withSkillTestCards skillTest
+      pure $ g & (skillTestL ?~ skillTest')
+  BeforeSkillTest skillTestId -> do
+    getSkillTest >>= \case
+      Nothing -> pure g
+      Just skillTest ->
+        if skillTestId == skillTest.id
+          then do
+            player <- getPlayer skillTest.investigator
+            pure $ g & activeInvestigatorIdL .~ skillTest.investigator & activePlayerIdL .~ player
+          else pure g
+  CreateConcealedCard card -> do
+    pure $ g & entitiesL . concealedL %~ insertMap (toId card) card
+  CreateStoryAssetAtLocationMatching cardCode locationMatcher -> do
+    lid <- selectJust locationMatcher
+    assetId <- getRandom
+    push $ CreateAssetAt assetId cardCode $ AtLocation lid
+    pure g
+  StoryMessage (ReadStory iid card storyMode mtarget) -> do
+    placement <- case mtarget of
+      Just (EnemyTarget eid) -> field EnemyPlacement eid
+      Just (AssetTarget aid) -> field AssetPlacement aid
+      -- Treacheries do not have a UI slot that can be visually replaced by a
+      -- story. Focus their story side instead while retaining the treachery as
+      -- StoryOtherSide so its resolution can still target the original card.
+      Just (TreacheryTarget _) -> pure Unplaced
+      Just (LocationTarget lid) -> pure (AtLocation lid)
+      Just (CardIdTarget _) -> pure Unplaced
+      Just _ -> error $ "no known placement for non-enemy target: " <> show mtarget
+      Nothing -> pure Unplaced
+    push $ ReadStoryWithPlacement iid card storyMode mtarget placement
+    pure g
+  StoryMessage (ReadStoryWithPlacement iid card storyMode mtarget placement) -> do
+    let
+      storyId = StoryId $ toCardCode card
+      story' = overAttrs (Story.placementL .~ placement) (createStory card mtarget storyId)
+    -- if we have a target the ui should visually replace them, otherwise we add to UI by focus
+    player <- getPlayer iid
+    case storyPlacement (toAttrs story') of
+      Unplaced ->
+        pushAll
+          [ FocusCards [card]
+          , chooseOne
+              player
+              [ targetLabel
+                  (toCardId card)
+                  [ StoryMessage (ResolveStory iid storyMode storyId)
+                  , -- If resolving the story kicks off a skill test while another
+                    -- test is active, the new test is relocated to after the current
+                    -- one. ResolvedStory (which removes the story) must travel with
+                    -- it, or the story is removed before its own test resolves.
+                    MoveWithSkillTest (StoryMessage (ResolvedStory iid storyMode storyId))
+                  ]
+              ]
+          ]
+      _ ->
+        push
+          $ chooseOne
+            player
+            [ targetLabel
+                (toTarget storyId)
+                [ StoryMessage (ResolveStory iid storyMode storyId)
+                , MoveWithSkillTest (StoryMessage (ResolvedStory iid storyMode storyId))
+                ]
+            ]
+    pure $ g & entitiesL . storiesL . at storyId ?~ story'
+  StoryMessage (PlaceStory card placement) -> do
+    let storyId = StoryId $ toCardCode card
+    let story' = overAttrs (Story.placementL .~ placement) (createStory card Nothing storyId)
+    pure
+      $ g
+      & entitiesL
+      . storiesL
+      . at storyId
+      ?~ story'
+      & entryTicksL
+      %~ insertMap card.id (gameWindowTick g)
+  StoryMessage (ResolveStory iid mode sid) -> do
+    card <- field StoryCard sid
+    {- The when-half of the resolution window. This runs after the story entity has
+    already queued its own resolution, and 'push' prepends, so the window still
+    resolves in front of the story's effects. -}
+    when (mode == ResolveIt) do
+      whenResolve <- checkWhen $ Window.ResolvesStory iid sid
+      push whenResolve
+    pure $ g & focusedCardsL %~ map (filter (/= card))
+  {- The after-half. Raised here rather than at the push sites so that every path
+  that ends a story read gets it: both of 'ReadStoryWithPlacement''s prompts
+  (where it travels with the story's skill test, since 'ResolvedStory' does), and
+  anything that queues 'ResolvedStory' itself. Because this runs after the
+  entities -- which is where 'RemoveStory' is pushed -- and 'push' prepends, the
+  window always resolves while the story is still in play. -}
+  StoryMessage (ResolvedStory iid mode sid) -> do
+    when (mode == ResolveIt) do
+      afterResolve <- checkAfter $ Window.ResolvesStory iid sid
+      push afterResolve
+    pure g
+  StoryMessage (RemoveStory storyId) -> do
+    pure $ g & entitiesL . storiesL %~ deleteMap storyId
+  CreateSkill skillId card investigatorId placement -> do
+    let skill = createSkill card investigatorId skillId
+    pure
+      $ g
+      & entitiesL
+      . skillsL
+      . at skillId
+      ?~ overAttrs (\a -> a {skillPlacement = placement}) skill
+  PutCardIntoPlayWithAdditionalCosts iid card mTarget payment ws -> do
+    createActiveCostForAdditionalCardCosts iid card >>= \case
+      Nothing -> do
+        push $ PutCardIntoPlay iid card mTarget payment ws
+        pure g
+      Just cost -> do
+        pushAll [PutCardIntoPlay iid card mTarget payment ws, CreatedCost (activeCostId cost)]
+        pure $ g & (activeCostL %~ insertMap (activeCostId cost) cost)
+  RescuedCard iid card -> do
+    afterRescue <- checkAfter $ Window.CardRescued iid card
+    if cardMatch card CardIsStoryAsset
+      then do
+        -- Create only the temporary entity: CreateAssetAt also removes its card
+        -- from the victory display, where a rescued story asset must remain.
+        aid <- getRandom
+        let asset =
+              overAttrs (\attrs -> attrs {assetPlacement = OutOfPlay VictoryDisplayZone}) $ createAsset card aid
+        pushAll [afterRescue, Do (RescuedCard iid card)]
+        pure $ g & entitiesL . assetsL . at aid ?~ asset
+      else g <$ push afterRescue
+  Do (RescuedCard _ card) -> do
+    for_ (toList $ g ^. entitiesL . assetsL) \asset -> do
+      when (toCardId asset == card.id && asset.placement == OutOfPlay VictoryDisplayZone) do
+        push $ RemoveAsset (toId asset)
+    pure g
+  CreateAssetAt assetId card placement -> do
+    let asset = createAsset card assetId
+    iid <- getActiveInvestigatorId
+    mCost <- createActiveCostForAdditionalCardCosts iid card
+    case mCost of
+      Nothing -> do
+        push $ PlaceAsset assetId placement
+        pure $ g & entitiesL . assetsL . at assetId ?~ asset
+      Just cost -> do
+        pushAll [CreatedCost (activeCostId cost), PlaceAsset assetId placement]
+        pure
+          $ g
+          & (entitiesL . assetsL . at assetId ?~ asset)
+          & (activeCostL %~ insertMap (activeCostId cost) cost)
+  CreateScarletKeyAt card placement -> do
+    let keyId = ScarletKeyId card.cardCode
+    let
+      starget =
+        case placement of
+          AttachedToEnemy eid -> EnemyTarget eid
+          AttachedToInvestigator iid -> InvestigatorTarget iid
+          _ -> ScenarioTarget
+    let scarletKey = createScarletKey card starget keyId
+    push $ PlaceScarletKey keyId placement
+    pure $ g & entitiesL . scarletKeysL . at keyId ?~ scarletKey
+  RemoveScarletKey keyId -> do
+    pure $ g & entitiesL . scarletKeysL %~ deleteMap keyId
+  CreateEventAt iid card placement -> do
+    eventId <- getRandom
+    let event' = createEvent card iid eventId
+    mCost <- createActiveCostForAdditionalCardCosts iid card
+    case mCost of
+      Nothing -> do
+        push $ PlaceEvent eventId placement
+        pure $ g & entitiesL . eventsL . at eventId ?~ event'
+      Just cost -> do
+        pushAll
+          [CreatedCost (activeCostId cost), PlaceEvent eventId placement]
+        pure
+          $ g
+          & (entitiesL . eventsL . at eventId ?~ event')
+          & (activeCostL %~ insertMap (activeCostId cost) cost)
+  CreateTreacheryAt treacheryId card placement -> do
+    iid <- getActiveInvestigatorId
+    let treachery = createTreachery card iid treacheryId
+    push $ PlaceTreachery treacheryId placement
+    pure $ g & entitiesL . treacheriesL . at treacheryId ?~ treachery
+  CreateWeaknessInThreatArea card iid -> do
+    treacheryId <- getRandom
+    let treachery = createTreachery card iid treacheryId
+    push (PlaceTreachery treacheryId (InThreatArea iid))
+    pure $ g & entitiesL . treacheriesL . at treacheryId ?~ treachery
+  AttachStoryTreacheryTo treacheryId card target -> do
+    let treachery = createTreachery card (g ^. leadInvestigatorIdL) treacheryId
+    push
+      $ PlaceTreachery treacheryId
+      $ case target of
+        LocationTarget lid -> AttachedToLocation lid
+        EnemyTarget eid -> AttachedToEnemy eid
+        AssetTarget aid -> AttachedToAsset aid Nothing
+        ActTarget aid -> AttachedToAct aid
+        AgendaTarget aid -> AttachedToAgenda aid
+        InvestigatorTarget iid -> InThreatArea iid
+        AgendaDeckTarget -> NextToAgenda
+        ActDeckTarget -> NextToAct
+        _ -> error $ "unhandled attach target : " <> show target
+    pure $ g & entitiesL . treacheriesL . at treacheryId ?~ treachery
+  TakeControlOfSetAsideAsset iid card -> do
+    assetId <- getRandom
+    let asset = createAsset card assetId
+    pushAll [TakeControlOfAsset iid assetId]
+    pure $ g & entitiesL . assetsL . at assetId ?~ asset
+  ReplaceInvestigatorAsset iid assetId card -> do
+    tokens <- field AssetTokens assetId
+    underneath <- field AssetCardsUnderneath assetId
+    replaceCard (toCardId card) card
+    let asset =
+          overAttrs
+            (\attrs -> attrs {assetTokens = tokens, assetCardsUnderneath = underneath})
+            (createAsset card assetId)
+    push (ReplacedInvestigatorAsset iid assetId)
+    pure $ g & entitiesL . assetsL . at assetId ?~ asset
+  ReplaceAsset assetId cardDef -> do
+    asset <- getAsset assetId
+    let card = lookupCard cardDef (toCardId asset)
+    replaceCard (toCardId card) card
+    let asset' =
+          overAttrs
+            ( \attrs ->
+                attrs
+                  { assetTokens = attr assetTokens asset
+                  , assetCardsUnderneath = attr assetCardsUnderneath asset
+                  , assetPlacement = attr assetPlacement asset
+                  , assetOwner = attr assetOwner asset
+                  , assetController = attr assetController asset
+                  , assetExhausted = attr assetExhausted asset
+                  , assetSealedChaosTokens = attr assetSealedChaosTokens asset
+                  , assetKeys = attr assetKeys asset
+                  , assetDriver = attr assetDriver asset
+                  }
+            )
+            (createAsset card assetId)
+    pure $ g & entitiesL . assetsL . at assetId ?~ asset'
+  -- TODO: CHECK SpawnEnemyAt and SpawnEnemyAtEngagedWith
+  SpawnEnemyAt card lid -> do
+    enemyId <- getRandom
+    let details = mkSpawnDetails enemyId $ Arkham.Spawn.SpawnAtLocation lid
+    windows' <- checkWindows [mkWhen (Window.EnemyWouldSpawnAt enemyId lid)]
+    pushAll
+      [ ObtainCard card.id
+      , windows'
+      , Will (EnemySpawn details)
+      , When (EnemySpawn details)
+      , EnemySpawn details
+      , After (EnemySpawn details)
+      , EnemySpawned details
+      ]
+    pure $ g & entitiesL . enemiesL . at enemyId ?~ createEnemy card enemyId
+  SpawnEnemyAtEngagedWith card lid iid -> do
+    enemyId <- getRandom
+    let enemy = createEnemy card enemyId
+    let
+      details =
+        (mkSpawnDetails enemyId $ Arkham.Spawn.SpawnAtLocation lid)
+          { spawnDetailsInvestigator = Just iid
+          }
+    pushAll
+      [ ObtainCard card.id
+      , Will (EnemySpawn details)
+      , When (EnemySpawn details)
+      , EnemySpawn details
+      , After (EnemySpawn details)
+      , EnemySpawned details
+      ]
+    pure $ g & entitiesL . enemiesL . at enemyId ?~ enemy
+  CreateEnemy enemyCreation -> do
+    let enemyId = enemyCreationEnemyId enemyCreation
+        card = enemyCreationCard enemyCreation
+        originalCardCode = \case
+          EncounterCard ec -> ecOriginalCardCode ec
+          PlayerCard pc -> pcOriginalCardCode pc
+          VengeanceCard vc -> originalCardCode vc
+        getBearer = \case
+          EncounterCard _ -> Nothing
+          PlayerCard pc -> pcOwner pc
+          VengeanceCard vc -> getBearer vc
+    enemy'' <-
+      overAttrs (delayEngagementL .~ False)
+        <$> runMessage
+          (SetOriginalCardCode $ originalCardCode card)
+          (createEnemy card enemyId)
+
+    let
+      miid = enemyCreationInvestigator enemyCreation
+      enemy' =
+        overAttrs (\attrs -> attrs {enemySpawnedBy = miid})
+          $ if enemyCreationExhausted enemyCreation
+            then overAttrs (\attrs -> attrs {enemyExhausted = True}) enemy''
+            else enemy''
+
+    enemy <- case getBearer card of
+      Nothing -> pure enemy'
+      Just iid -> runMessage (SetBearer (toTarget enemy') iid) enemy'
+    let handleSpawnDetails d = pushAll $ enemyCreationBefore enemyCreation <> [EnemySpawn d] <> enemyCreationAfter enemyCreation
+
+    case enemyCreationMethod enemyCreation of
+      Arkham.Enemy.Creation.SpawnEngagedWith iid -> do
+        handleSpawnDetails
+          $ (mkSpawnDetails enemyId $ Arkham.Spawn.SpawnEngagedWith (InvestigatorWithId iid))
+            { spawnDetailsInvestigator = Just iid
+            , spawnDetailsOverridden = True
+            }
+      Arkham.Enemy.Creation.SpawnAtLocation lid -> do
+        handleSpawnDetails
+          $ (mkSpawnDetails enemyId $ Arkham.Spawn.SpawnAtLocation lid)
+            { spawnDetailsOverridden = True
+            }
+      SpawnAtLocationMatching locationMatcher -> do
+        handleSpawnDetails
+          $ (mkSpawnDetails enemyId $ Arkham.Spawn.SpawnAt locationMatcher)
+            { spawnDetailsOverridden = True
+            }
+      SpawnWithPlacement placement -> do
+        handleSpawnDetails
+          $ (mkSpawnDetails enemyId $ Arkham.Spawn.SpawnPlaced placement)
+            { spawnDetailsOverridden = True
+            }
+      SpawnEngagedWithPrey ->
+        pushAll
+          $ enemyCreationBefore enemyCreation
+          <> [ Will (EnemySpawnEngagedWithPrey enemyId)
+             , EnemySpawnEngagedWithPrey enemyId
+             ]
+          <> enemyCreationAfter enemyCreation
+      SpawnViaSpawnInstruction -> spawnAt enemyId miid (fromMaybe (error "called without spawn at") $ attr enemySpawnAt enemy)
+    pure $ g & entitiesL . enemiesL . at enemyId ?~ enemy
+  Discarded (InvestigatorTarget iid) source card -> do
+    pushM
+      $ checkWindows
+      $ (`mkWindow` Window.Discarded (Just iid) source card)
+      <$> [#when, #after]
+    pure g
+  InvestigatorAssignDamage iid' source _ n 0 | n > 0 -> do
+    getSourceController source >>= \case
+      Nothing -> pure g
+      Just iid -> do
+        let
+          historyItem = HistoryItem HistoryDealtDamageTo [InvestigatorTarget iid']
+          turn = isJust $ view turnPlayerInvestigatorIdL g
+          setTurnHistory = if turn then turnHistoryL %~ insertHistory iid historyItem else id
+
+        pure $ g & (phaseHistoryL %~ insertHistory iid historyItem) & setTurnHistory
+  Msg.DealDamage (EnemyTarget eid) assignment@(damageAssignmentAmount -> n) | n > 0 -> do
+    let source = damageAssignmentSource assignment
+    miid <- getSourceController source
+    lead <- getLead
+    -- TODO: This is wrong but history is the way we track if enemies were
+    -- defeated for cards like Kerosene (1), we need a history independent of
+    -- the iid for cases where we aren't looking at a specific investigator
+    let
+      iid = fromMaybe lead miid
+      historyItem = HistoryItem HistoryDealtDamageTo [EnemyTarget eid]
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      setTurnHistory =
+        if turn then turnHistoryL %~ insertHistory iid historyItem else id
+
+    pure $ g & (phaseHistoryL %~ insertHistory iid historyItem) & setTurnHistory
+  FoundEncounterCardFrom {} -> pure $ g & (focusedCardsL .~ mempty) & (foundCardsL .~ mempty)
+  FoundAndDrewEncounterCard {} -> pure $ g & (focusedCardsL .~ mempty) & (foundCardsL .~ mempty)
+  -- Every caller searches for a basic weakness, so this shares the deck building
+  -- sampler and only layers @matcher@ on top of the filters it already applies.
+  SearchCollectionForRandom iid source matcher -> do
+    ctx <-
+      RandomBasicWeaknessContext
+        <$> field Investigator.InvestigatorClass iid
+        <*> getPlayerCount
+        <*> field Investigator.InvestigatorTaboo iid
+        <*> field Investigator.InvestigatorCardPool iid
+        <*> getIsStandalone
+        <*> pure []
+    pid <- getPlayer iid
+    ctxWithCustom <- withCustomRandomWeaknessPool pid ctx
+    mcard <-
+      traverse genPlayerCard
+        =<< sampleRandomBasicWeaknessMatching
+          ((`cardMatch` matcher) . (`lookupPlayerCard` nullCardId))
+          []
+          ctxWithCustom
+    g <$ push (RequestedPlayerCard iid source mcard [])
+  CancelSurge _ -> do
+    ems <- effectModifiers GameSource [NoSurge]
+    for_ (view resolvingCardL g) $ \c -> do
+      push
+        $ CreateWindowModifierEffect (EffectCardResolutionWindow c.id) ems GameSource (CardIdTarget c.id)
+    pure g
+  GainSurge source target -> do
+    mCardId <- case target of
+      EnemyTarget eid -> fieldMay EnemyCardId eid
+      TreacheryTarget tid -> fieldMay TreacheryCardId tid
+      AssetTarget aid -> fieldMay AssetCardId aid
+      LocationTarget lid -> fieldMay LocationCardId lid
+      CardIdTarget cid -> pure (Just cid)
+      _ -> error "Unhandled surge target"
+    case mCardId of
+      Just cardId -> do
+        (effectId, surgeEffect) <- createSurgeEffect source cardId
+        pure $ g & entitiesL . effectsL . at effectId ?~ surgeEffect
+      Nothing -> pure g
+  Surge iid source -> do
+    whenWindow <- checkWhen $ Window.GainedSurge iid source
+    pushAll [whenWindow, drawEncounterCard iid source]
+    pure g
+  ReplaceCard cardId card -> do
+    replaceCard cardId card -- We must update the IORef
+    pure $ g & cardsL %~ insertMap cardId card
+  -- After (InvestigatorEliminated iid) -> pure $ g & playerOrderL %~ filter (/= iid)
+  SetActivePlayer pid -> pure do
+    -- We might not have setup the players like (like in the TCU) and so we can't switch
+    case find (\i -> i.player == pid) (toList $ g ^. entitiesL . investigatorsL) of
+      Nothing -> g
+      Just investigator -> g & activeInvestigatorIdL .~ investigator.id & activePlayerIdL .~ pid
+  SetActiveInvestigator iid -> do
+    player <- getPlayer iid
+    pure $ g & activeInvestigatorIdL .~ iid & activePlayerIdL .~ player
+  RevelationSkillTest sid iid (TreacherySource tid) skillType difficulty -> do
+    -- [ALERT] If changed update (DreamersCurse, Somniphobia)
+    mcard <- fieldMay TreacheryCard tid
+
+    case mcard of
+      Nothing -> pure g
+      Just card -> do
+        let
+          skillTest =
+            (initSkillTest sid iid tid tid skillType difficulty)
+              { skillTestIsRevelation = True
+              }
+        pushAll [BeginSkillTest skillTest, UnsetActiveCard]
+        pure $ g & (activeCardL ?~ card)
+  Revelation iid (CardIdSource cid) -> do
+    card <- getCard cid
+    case toCardType card of
+      AssetType -> do
+        pid <- getPlayer iid
+        sendRevelation pid (toJSON $ toCard card)
+        assetId <- getRandom
+        let asset = createAsset card assetId
+        -- Asset is assumed to have a revelation ability if drawn from encounter deck
+        pushAll $ resolve $ Revelation iid (AssetSource assetId)
+        pure $ g & (entitiesL . assetsL . at assetId ?~ asset)
+      EventType -> do
+        pid <- getPlayer iid
+        sendRevelation pid (toJSON $ toCard card)
+        eventId <- getRandom
+        pushAll $ resolve $ Revelation iid (EventSource eventId)
+        push $ ObtainCard card.id
+        let
+          recordLimit g'' = \case
+            MaxPerGame _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            MaxPerGamePerInvestigator _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            MaxPerTurn _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            MaxPerRound _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            MaxPerTraitPerRound _ _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            LimitPerRound _ -> g'' & cardUsesL . at (toCardCode card) . non [] %~ (iid :)
+            _ -> g''
+        pure
+          $ foldl'
+            recordLimit
+            ( g
+                & entitiesL
+                . eventsL
+                . at eventId
+                ?~ overAttrs (\e -> e {eventPlacement = Limbo}) (createEvent card iid eventId)
+            )
+            (cdLimits $ toCardDef card)
+      PlayerEnemyType -> do
+        -- Revelation player enemies never pass through DrewPlayerEnemy, so send the
+        -- "drew enemy" display here or the weakness lands in the threat area silently.
+        investigator <- getInvestigator iid
+        withI18n $ cardNameVar card $ investigatorNameVar investigator do
+          if Keyword.Peril `elem` cdKeywords (toCardDef card)
+            then do
+              pid <- getPlayer iid
+              sendEnemyOnly pid (ikey' "drew") (toJSON $ toCard card)
+            else sendEnemy (ikey' "drew") (toJSON $ toCard card)
+        enemyId <- getRandom
+        let enemy = createEnemy card enemyId
+        -- Asset is assumed to have a revelation ability if drawn from encounter deck
+        pushAll
+          $ [ SetBearer (toTarget enemy) iid
+            , RemoveCardFromHand iid (toCardId card)
+            , InvestigatorDrawEnemy iid enemyId
+            ]
+          <> resolve (Revelation iid (EnemySource enemyId))
+        pure $ g & (entitiesL . enemiesL . at enemyId ?~ enemy)
+      TreacheryType -> do
+        case card of
+          EncounterCard ec -> runMessage (Do (InvestigatorDrewEncounterCardFrom iid ec Nothing)) g
+          PlayerCard _ -> error "Currently not handling Revelations from type TreacheryType when PlayerCard"
+          VengeanceCard _ -> error "Currently not handling Revelations from type TreacheryType when VengeanceCard"
+      EnemyType -> do
+        enemyId <- getRandom
+        let enemy = createEnemy card enemyId
+        pushAll
+          $ InvestigatorDrawEnemy iid enemyId
+          : resolve (Revelation iid (EnemySource enemyId))
+        pure $ g & (entitiesL . enemiesL . at enemyId ?~ enemy)
+      other ->
+        error $ "Currently not handling Revelations from type " <> show other
+  ResolvedCard iid card -> do
+    modifiers' <- getModifiers (toCardId card)
+    push $ After msg
+    when
+      ( NoSurge
+          `notElem` modifiers'
+          && (AddKeyword Keyword.Surge `elem` modifiers' || Keyword.Surge `elem` cdKeywords (toCardDef card))
+      )
+      $ push
+      {- The surging CARD, not @GameSource@: the log named the investigator as
+      the surger ("Daisy Walker surges") because nothing else said who did. -}
+      $ Surge iid (CardIdSource $ toCardId card)
+    let
+      unsetActiveCard = \case
+        Just c | c == card -> Nothing
+        other -> other
+    -- Closes the block an encounter draw opened; see 'gameCardPlayStack'.
+    pure
+      $ g
+      & (resolvingCardL .~ Nothing)
+      & (activeCardL %~ unsetActiveCard)
+      & (cardPlayStackL %~ filter (/= toCardId card))
+  InvestigatorDrewEncounterCard iid card -> do
+    runMessage (InvestigatorDrewEncounterCardFrom iid card Nothing) g
+  InvestigatorDrewEncounterCardFrom iid card mdeck -> runQueueT do
+    investigator <- getInvestigator iid
+    if investigator.eliminated
+      then do
+        push $ AddToEncounterDiscard card
+        pure g
+      else do
+        fullMods <- getFullModifiers iid
+        let mForesightMod = find ((== Foresight (toTitle card)) . modifierType) fullMods
+        -- let hasForesight = Foresight (toTitle card) `elem` mods
+        let mods = map modifierType fullMods
+        when (DrawGainsPeril `elem` mods)
+          $ pushM
+          $ cardResolutionModifier card GameSource card (AddKeyword Keyword.Peril)
+        whenDraw <-
+          checkWindows [mkWhen (Window.DrawCard iid (toCard card) $ fromMaybe Deck.EncounterDeck mdeck)]
+        let uiRevelation = getPlayer iid >>= (`sendRevelation` (toJSON $ toCard card))
+        case toCardType card of
+          EnemyType -> do
+            let hasPeril = (DrawGainsPeril `elem` mods) || (Keyword.Peril `elem` cdKeywords (toCardDef card))
+            if hasPeril
+              then do
+                pid <- getPlayer iid
+                sendEnemyOnly pid (toTitle investigator <> " drew Enemy") (toJSON $ toCard card)
+              else sendEnemy (toTitle investigator <> " drew Enemy") (toJSON $ toCard card)
+          TreacheryType -> uiRevelation
+          AssetType -> uiRevelation
+          EncounterAssetType -> uiRevelation
+          EncounterEventType -> uiRevelation
+          LocationType -> uiRevelation
+          _ -> pure ()
+        case mForesightMod of
+          Just foresight -> do
+            canCancel <- EncounterCard card <=~> CanCancelRevelationEffect (InvestigatorWithId iid) #any
+            if canCancel
+              then do
+                player <- getPlayer iid
+                push
+                  $ chooseOne
+                    player
+                    [ Label
+                        "Cancel card effects and discard it"
+                        [UnfocusCards, CancelNext (modifierSource foresight) RevelationMessage, AddToEncounterDiscard card]
+                    , Label "$label.drawAsNormal" [UnfocusCards, whenDraw, Do msg]
+                    ]
+                pure $ g & focusedCardsL %~ ([toCard card] :)
+              else do
+                pushAll [FocusCards [toCard card], whenDraw, UnfocusCards, Do msg]
+                pure g
+          Nothing -> do
+            pushAll [FocusCards [toCard card], whenDraw, UnfocusCards, Do msg]
+            pure g
+  Do (InvestigatorDrewEncounterCardFrom iid card mdeck) -> do
+    push $ ResolvedCard iid (toCard card)
+    let
+      deleteCard = filter ((/= Just card) . preview _EncounterCard)
+      g' =
+        g
+          & (resolvingCardL ?~ toCard card)
+          -- Opens a log block spanning the whole resolution; popped by 'ResolvedCard'.
+          & (cardPlayStackL %~ (<> [toCardId card]))
+          & (focusedCardsL %~ map deleteCard)
+          & (foundCardsL %~ Map.map deleteCard)
+
+    afterDraw <- checkWindows [mkAfter (Window.DrawCard iid (toCard card) Deck.EncounterDeck)]
+    -- [ALERT]: If you extend this make sure to update LetMeHandleThis
+    --
+    modifiers' <- getModifiers card
+    let ignoreRevelation = IgnoreRevelation `elem` modifiers'
+    if CancelEffects `elem` modifiers'
+      then do
+        runQueueT $ Lifted.discardCard iid GameSource card
+        pure g'
+      else case toCardType card of
+        StoryType -> do
+          pushAll [afterDraw, StoryMessage (ReadStory iid (toCard card) ResolveIt Nothing), UnsetActiveCard]
+          pure g'
+        EnemyType -> do
+          enemyId <- getRandom
+          let enemy = createEnemy card enemyId
+          pushAll
+            $ afterDraw
+            : [Revelation iid (EnemySource enemyId) | hasRevelation card && not ignoreRevelation]
+              <> [InvestigatorDrawEnemy iid enemyId, UnsetActiveCard]
+          pure
+            $ g'
+            & (entitiesL . enemiesL . at enemyId ?~ overAttrs (\attrs -> attrs {enemyDrawnFrom = mdeck}) enemy)
+            & (activeCardL ?~ toCard card)
+        TreacheryType -> do
+          -- handles draw windows
+          pushAll [DrewTreachery iid (mdeck <|> Just Deck.EncounterDeck) (toCard card)]
+          pure g'
+        AssetType -> do
+          assetId <- getRandom
+          let asset = createAsset card assetId
+          -- Story assets can be drawn from encounter decks while still having AssetType.
+          -- Active while the revelation resolves, so the card is visible in the
+          -- play area the way a resolving treachery or a spawning enemy is.
+          pushAll
+            $ afterDraw
+            : (guard (not ignoreRevelation) *> resolve (Revelation iid $ AssetSource assetId))
+              <> [UnsetActiveCard]
+          pure
+            $ g'
+            & (entitiesL . assetsL . at assetId ?~ asset)
+            & (activeCardL ?~ toCard card)
+        EncounterAssetType -> do
+          assetId <- getRandom
+          let asset = createAsset card assetId
+          -- Asset is assumed to have a revelation ability if drawn from encounter deck
+          pushAll
+            $ afterDraw
+            : (guard (not ignoreRevelation) *> resolve (Revelation iid $ AssetSource assetId))
+              <> [UnsetActiveCard]
+          pure
+            $ g'
+            & (entitiesL . assetsL . at assetId ?~ asset)
+            & (activeCardL ?~ toCard card)
+        EncounterEventType -> do
+          eventId <- getRandom
+          let owner = fromMaybe iid (toCardOwner card)
+          let event' = createEvent card owner eventId
+          -- Event is assumed to have a revelation ability if drawn from encounter deck
+          pushAll $ afterDraw
+            : (guard (not ignoreRevelation) *> resolve (Revelation iid $ EventSource eventId))
+          pure $ g' & (entitiesL . eventsL . at eventId ?~ event')
+        LocationType -> do
+          locationId <- getRandom
+          let location = createLocation card locationId
+
+          pushAll
+            $ afterDraw
+            : PlacedLocation (toName location) (toCardCode card) locationId
+            : (guard (not ignoreRevelation) *> resolve (Revelation iid (LocationSource locationId)))
+          pure $ g' & (entitiesL . locationsL . at locationId ?~ location)
+        _ ->
+          error
+            $ "Unhandled card type: "
+            <> show (toCardType card)
+            <> ": "
+            <> show card
+  ResolveRevelation iid card -> do
+    getPlayer iid >>= (`sendRevelation` (toJSON $ toCard card))
+    let
+      deleteCard = filter (/= card)
+      g' =
+        g
+          & (resolvingCardL ?~ toCard card)
+          & (focusedCardsL %~ map deleteCard)
+          & (foundCardsL %~ Map.map deleteCard)
+    modifiers' <- getModifiers card
+    let ignoreRevelation = IgnoreRevelation `elem` modifiers'
+    case toCardType card of
+      EnemyType -> do
+        enemyId <- getRandom
+        let enemy = createEnemy card enemyId
+        pushAll
+          $ [Revelation iid (EnemySource enemyId) | hasRevelation card && not ignoreRevelation]
+          <> [UnsetActiveCard]
+        pure
+          $ g'
+          & (entitiesL . enemiesL . at enemyId ?~ enemy)
+          & (activeCardL ?~ toCard card)
+      TreacheryType -> do
+        -- handles draw windows
+        treacheryId <- getRandom
+        let treachery = createTreachery card iid treacheryId
+        -- Asset is assumed to have a revelation ability if drawn from encounter deck
+        pushAll $ guard (not ignoreRevelation) *> resolve (Revelation iid $ TreacherySource treacheryId)
+        pure $ g' & (entitiesL . treacheriesL . at treacheryId ?~ treachery)
+      AssetType -> do
+        assetId <- getRandom
+        let asset = createAsset card assetId
+        -- Story assets can be resolved from encounter decks while still having AssetType.
+        pushAll $ guard (not ignoreRevelation) *> resolve (Revelation iid $ AssetSource assetId)
+        pure $ g' & (entitiesL . assetsL . at assetId ?~ asset)
+      EncounterAssetType -> do
+        assetId <- getRandom
+        let asset = createAsset card assetId
+        -- Asset is assumed to have a revelation ability if drawn from encounter deck
+        pushAll $ guard (not ignoreRevelation) *> resolve (Revelation iid $ AssetSource assetId)
+        pure $ g' & (entitiesL . assetsL . at assetId ?~ asset)
+      EncounterEventType -> do
+        eventId <- getRandom
+        let owner = fromMaybe iid (toCardOwner card)
+        let event' = createEvent card owner eventId
+        pushAll $ guard (not ignoreRevelation) *> resolve (Revelation iid $ EventSource eventId)
+        pure $ g' & (entitiesL . eventsL . at eventId ?~ event')
+      LocationType -> do
+        locationId <- getRandom
+        let location = createLocation card locationId
+
+        pushAll
+          $ ObtainCard card.id
+          : PlacedLocation (toName location) (toCardCode card) locationId
+          : (guard (not ignoreRevelation) *> resolve (Revelation iid (LocationSource locationId)))
+        pure $ g' & (entitiesL . locationsL . at locationId ?~ location)
+      _ ->
+        error
+          $ "Unhandled card type: "
+          <> show (toCardType card)
+          <> ": "
+          <> show card
+  DrewTreachery iid mdeck (EncounterCard card) -> do
+    treacheryId <- getRandom
+    let
+      treachery = overAttrs (drawnFromL .~ mdeck) $ createTreachery card iid treacheryId
+      historyItem = HistoryItem HistoryTreacheriesDrawn [toCardCode treachery]
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      setTurnHistory = if turn then turnHistoryL %~ insertHistory iid historyItem else id
+
+    modifiers' <- getModifiers (toTarget treachery)
+    afterDraw <- checkWindows [mkAfter (Window.DrawCard iid (toCard card) Deck.EncounterDeck)]
+    pushAll
+      $ [GainSurge GameSource (toTarget treachery) | AddKeyword Keyword.Surge `elem` modifiers']
+      <> [afterDraw, ResolveTreachery iid treacheryId]
+
+    pure
+      $ g
+      & (entitiesL . treacheriesL . at treacheryId ?~ treachery)
+      & (activeCardL ?~ EncounterCard card)
+      & (resolvingCardL ?~ EncounterCard card)
+      & (cardPlayStackL %~ (<> [toCardId card]))
+      & (phaseHistoryL %~ insertHistory iid historyItem)
+      & setTurnHistory
+  ResolveTreachery iid treacheryId -> do
+    treachery <- getTreachery treacheryId
+
+    modifiers' <- getCombinedModifiers [TreacheryTarget treacheryId, CardIdTarget $ toCardId treachery]
+    let ignoreRevelation = IgnoreRevelation `elem` modifiers'
+    let revelation = Revelation iid (TreacherySource treacheryId)
+    needsResolve <- isNothing <$> findFromQueue (== ResolvedCard iid (toCard treachery))
+    needsDiscard <- selectNone $ VictoryDisplayCardMatch (basic $ CardWithId $ toCardId treachery)
+
+    pushAll
+      $ if ignoreRevelation
+        then
+          [ if needsDiscard
+              then toDiscardBy iid GameSource (TreacheryTarget treacheryId)
+              else RemoveTreachery treacheryId
+          ]
+            <> [ResolvedCard iid (toCard treachery) | needsResolve]
+        else
+          [When revelation]
+            <> resolveRevelations modifiers' revelation
+            <> [ MoveWithSkillTest $ Run [After revelation, AfterRevelation iid treacheryId]
+               , UnsetActiveCard
+               ]
+            <> [ResolvedCard iid (toCard treachery) | needsResolve]
+    pure $ g & (if ignoreRevelation then activeCardL .~ Nothing else id)
+  MoveWithSkillTest msg' -> do
+    -- No skill test showed up so just run this
+    push msg'
+    pure g
+  MovedWithSkillTest _ msg' -> do
+    -- No skill test showed up so just run this
+    push msg'
+    pure g
+  DrewTreachery iid _ (PlayerCard card) -> do
+    treacheryId <- getRandom
+    let treachery = createTreachery card iid treacheryId
+    -- player treacheries will not trigger draw treachery windows
+
+    mods <- getModifiers treachery
+
+    pushAll
+      $ [RemoveCardFromHand iid (toCardId card) | hasRevelation card]
+      <> [GainSurge GameSource (toTarget treachery) | AddKeyword Keyword.Surge `elem` mods]
+      <> [ResolveTreachery iid treacheryId]
+
+    let
+      historyItem = HistoryItem HistoryTreacheriesDrawn [toCardCode treachery]
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      setTurnHistory =
+        if turn then turnHistoryL %~ insertHistory iid historyItem else id
+
+    pure
+      $ g
+      & (entitiesL . treacheriesL %~ insertMap treacheryId treachery)
+      & (resolvingCardL ?~ PlayerCard card)
+      & (cardPlayStackL %~ (<> [toCardId card]))
+      & (phaseHistoryL %~ insertHistory iid historyItem)
+      & setTurnHistory
+  SetActiveCard c -> pure $ g & activeCardL ?~ c
+  UnsetActiveCard -> pure $ g & activeCardL .~ Nothing
+  AfterRevelation iid treacheryId -> do
+    afterResolve <- checkAfter $ Window.ResolvesTreachery iid treacheryId
+    pushAll [afterResolve, Do msg]
+    pure $ g & activeCardL .~ Nothing
+  AddCardEntity uuid card -> do
+    let
+      iid = view activeInvestigatorIdL g
+      setAssetPlacement :: forall a. Typeable a => a -> a
+      setAssetPlacement a = case eqT @a @Asset of
+        Just Refl -> overAttrs (\attrs -> attrs {assetPlacement = StillInHand iid, assetController = Just iid}) a
+        Nothing -> a
+      extraEntities = addCardEntityWith iid setAssetPlacement uuid mempty card
+    pure $ g & entitiesL <>~ extraEntities
+  RemoveCardEntity uuid card -> do
+    case toCardType card of
+      AssetType -> runMessage (RemoveAsset (coerce uuid)) g
+      _ -> error "Unhandle remove card entity type"
+  -- Log only; see 'gameLogBlockStack'.
+  OpenLogBlock gid -> pure $ g & logBlockStackL %~ (<> [gid])
+  CloseLogBlock gid -> pure $ g & logBlockStackL %~ filter (/= gid)
+  UseAbility _ a _ -> pure $ g & activeAbilitiesL %~ (a :)
+  ResolvedAbility ab -> do
+    -- a queued ResolveWindowInitiations is a set of in-flight abilities: their sources
+    -- must survive this sweep to claim UseAbility, even after leaving play (Caught in
+    -- the Crossfire discards itself on its first resolution). #5743
+    pendingSources <- queuedInitiationSources
+    let
+      stillInitiating :: Sourceable a => a -> Bool
+      stillInitiating source = toSource source `elem` pendingSources
+    let remainingEvents =
+          Map.filter (\e -> attr eventWaiting e || stillInitiating e)
+            $ entitiesEvents (gameActionRemovedEntities g)
+    let remainingTreacheries =
+          Map.filter (\t -> attr treacheryWaiting t || stillInitiating t)
+            $ entitiesTreacheries (gameActionRemovedEntities g)
+    let removedEntitiesF =
+          if length (gameActiveAbilities g) <= 1
+            then
+              actionRemovedEntitiesL
+                .~ mempty {entitiesEvents = remainingEvents, entitiesTreacheries = remainingTreacheries}
+            else id
+    let remainingAbilities = filter (/= ab) $ view activeAbilitiesL g
+    pure
+      $ g
+      & (activeAbilitiesL .~ remainingAbilities)
+      & removedEntitiesF
+      & (entitiesL %~ (if null remainingAbilities then clearRemovedEntities else id))
+  Discarded (AssetTarget aid) _ (EncounterCard _) -> do
+    runMessage (RemoveAsset aid) g
+  Discarded (AssetTarget aid) _source _card -> do
+    maybeAsset aid >>= \case
+      Nothing -> pure g
+      Just _ -> runMessage (RemoveAsset aid) g
+  DiscardedCost (SearchedCardTarget cid) -> do
+    iid <- getActiveInvestigatorId
+    card <- getCard cid
+    case toCardType card of
+      EventType -> do
+        -- There is only one card, Astounding Revelation, that does this so we just hard code for now
+        let eventId = EventId $ unsafeCardIdToUUID cid
+        let event' = lookupEvent (toCardCode card) iid eventId cid
+        pure
+          $ g
+          & (actionRemovedEntitiesL . eventsL %~ insertEntity event')
+          & (inSearchEntitiesL . eventsL %~ deleteMap eventId)
+      _ -> error $ "Unhandled card type: " <> show card
+  Discarded (TreacheryTarget tid) _ card -> do
+    treachery <- getTreachery tid
+    case card of
+      PlayerCard pc -> do
+        let ownerId = fromJustNote "owner was not set" treachery.owner
+        push $ AddToDiscard ownerId pc {pcOwner = Just ownerId}
+      EncounterCard _ -> pure ()
+      VengeanceCard _ -> error "Vengeance card"
+
+    push $ RemoveTreachery tid
+    pure g
+  Exiled (AssetTarget aid) _ -> do
+    runMessage (RemoveAsset aid) g
+  Discarded (EventTarget eid) _ _ -> do
+    mEvent <- getEventMaybe eid
+    for_ mEvent \event' -> do
+      card <- field EventCard eid
+      modifiers' <- liftA2 (<>) (getModifiers $ EventTarget eid) (getModifiers $ toCardId card)
+      if RemoveFromGameInsteadOfDiscard `elem` modifiers'
+        then push (RemoveFromGame (EventTarget eid))
+        else do
+          case card of
+            PlayerCard pc ->
+              if PlaceOnBottomOfDeckInsteadOfDiscard `elem` modifiers'
+                then do
+                  let iid = eventOwner $ toAttrs event'
+                  push $ PutCardOnBottomOfDeck iid (Deck.InvestigatorDeck iid) card
+                else push $ AddToDiscard (eventOwner $ toAttrs event') pc
+            EncounterCard _ -> error "Unhandled Discarded EventTarget"
+            VengeanceCard _ -> error "Vengeance card"
+    pure g
+  Discard miid source (TreacheryTarget tid) -> do
+    {- "Cannot be discarded from play, except by abilities printed on it." The
+    same rule the asset runner applies for 'CannotLeavePlay', and for the same
+    reason: a card that prints its own way off the table is the one thing
+    allowed to take it, so a discard the treachery sources itself goes through
+    and everything else is refused. -}
+    cannotLeavePlay <-
+      if source.treachery == Just tid
+        then pure False
+        else elem CannotLeavePlay <$> getModifiers (TreacheryTarget tid)
+    mcard <- if cannotLeavePlay then pure Nothing else fieldMay TreacheryCard tid
+    for_ mcard \card -> do
+      inVictory <- selectAny $ VictoryDisplayCardMatch $ basic $ CardWithId $ toCardId card
+      unless inVictory do
+        miid' <- maybeSomeInvestigator miid
+        let windows'' = windows [Window.EntityDiscarded source (toTarget tid)]
+        wouldDo
+          (Run $ windows'' <> [Discarded (TreacheryTarget tid) source card])
+          (Window.WouldBeDiscarded (TreacheryTarget tid))
+          (Window.Discarded miid' source card)
+
+    pure g
+  UpdateHistory iid historyItem@(HistoryItem HistoryCardsDrawn n) -> do
+    let
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      setTurnHistory =
+        if turn then turnHistoryL %~ insertHistory iid historyItem else id
+      currentCount = historyCardsDrawn $ Map.findWithDefault mempty iid (view phaseHistoryL g)
+    when (currentCount == 0 && n > 0) do
+      let (whenW, _, afterW) = frame $ Window.DrewCardsFromOwnDeck iid
+      pushAll [whenW, afterW]
+    pure $ g & (phaseHistoryL %~ insertHistory iid historyItem) & setTurnHistory
+  UpdateHistory iid historyItem -> do
+    let
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      setTurnHistory =
+        if turn then turnHistoryL %~ insertHistory iid historyItem else id
+    pure $ g & (phaseHistoryL %~ insertHistory iid historyItem) & setTurnHistory
+  BecomeYithian iid -> do
+    yithian <- becomeYithian <$> getInvestigator iid
+    pure $ g & (entitiesL . investigatorsL . at iid ?~ yithian)
+  BecomeShatteredSelf iid -> do
+    shatteredSelf <- becomeShatteredSelf <$> getInvestigator iid
+    pure $ g & (entitiesL . investigatorsL . at iid ?~ shatteredSelf)
+  ScenarioSpecific "returnFromShatteredSelf" v -> do
+    let iid = toResult v :: InvestigatorId
+    investigator <- returnFromShatteredSelf <$> getInvestigator iid
+    pure $ g & (entitiesL . investigatorsL . at iid ?~ investigator)
+  ScenarioSpecific "disableAsSelfLocation" v -> do
+    let eid = toResult v :: EnemyId
+    pure $ g & entitiesL . enemiesL . ix eid %~ overAttrs (\x -> x {enemyAsSelfLocation = Nothing})
+  BecomeHomunculus iid -> do
+    findCard (`cardMatch` cardIs Assets.theGreatWorkDivideAndUnite) >>= \case
+      Nothing -> error "The Great Work not found"
+      Just theGreatWork -> do
+        homunculus <- becomeHomunculus <$> getInvestigator iid
+        removeCard theGreatWork.id
+        push $ RemoveCardFromDeckForCampaign iid theGreatWork.id
+        pure $ g & (entitiesL . investigatorsL %~ insertMap iid homunculus)
+  _ -> pure g
+
+-- TODO: Clean this up, the found of stuff is a bit messy
+preloadEntities :: HasGame m => Game -> m Game
+preloadEntities g = do
+  let
+    investigators = view (entitiesL . investigatorsL) g
+    setPlacement :: forall a. Typeable a => Placement -> a -> a
+    setPlacement p a
+      | Just Refl <- eqT @a @Asset = overAttrs (\attrs -> attrs {assetPlacement = p}) a
+      | Just Refl <- eqT @a @Skill = overAttrs (\attrs -> attrs {skillPlacement = p}) a
+      | Just Refl <- eqT @a @Event = overAttrs (\attrs -> attrs {eventPlacement = p}) a
+      | Just Refl <- eqT @a @Treachery = overAttrs (\attrs -> attrs {treacheryPlacement = p}) a
+      | otherwise = a
+    -- Matches the committed skill the engine builds itself: InvestigatorCommittedSkill
+    -- parks it in Limbo, and the committing investigator controls it.
+    setCommitted :: forall a. Typeable a => InvestigatorId -> a -> a
+    setCommitted iid a
+      | Just Refl <- eqT @a @Asset =
+          overAttrs (\attrs -> attrs {assetPlacement = Limbo, assetController = Just iid}) a
+      | otherwise = setPlacement Limbo a
+    preloadHandEntities entities investigator' = do
+      let iid = toId investigator'
+      asIfInHandCards <- getAsIfInHandEffectCards iid
+      committedCards <- field Investigator.InvestigatorCommittedCards iid
+      -- Cards that are only "as if in hand for play" (stashed under Backpack /
+      -- Stick to the Plan, etc.) physically sit under their host asset, not in
+      -- hand. Load their entity at the host's placement rather than StillInHand,
+      -- so "while in your hand" effects (e.g. Pelt Shipment's hand-size penalty)
+      -- don't fire while the card is merely playable from under the asset.
+      forPlayMods <- getModifiers' (InvestigatorTarget iid)
+      let
+        forPlayHosts :: Map CardId AssetId
+        forPlayHosts =
+          mapFromList
+            [ (cid, aid)
+            | Modifier {modifierType = mType, modifierSource = AssetSource aid} <- forPlayMods
+            , cid <- case mType of
+                AsIfInHandFor ForPlay cid' -> [cid']
+                AsIfInHandForEffects cid' -> [cid']
+                _ -> []
+            ]
+        placementFor c = maybe (StillInHand iid) (`AttachedToAsset` Nothing) (lookup c.id forPlayHosts)
+        handEffectCards =
+          filter (cdCardInHandEffects . toCardDef)
+            $ investigatorHand (toAttrs investigator')
+            <> filter (`notElem` committedCards) asIfInHandCards
+      pure
+        $ if null handEffectCards
+          then entities
+          else
+            let
+              handEntities =
+                foldl'
+                  ( \e c ->
+                      addCardEntityWith
+                        iid
+                        (setPlacement $ placementFor c)
+                        (unsafeCardIdToUUID c.id)
+                        e
+                        c
+                  )
+                  defaultEntities
+                  handEffectCards
+             in
+              insertMap iid handEntities entities
+    preloadDiscardEntities entities investigator' = do
+      -- NOTE: recently added the asset type check here to avoid the "Do
+      -- (DiscardCard..." message's action removed entity conflicting with this
+      --
+      -- #2128: prevent duplicates in entities in hand and discard, prefer in hand
+
+      asIfInHandCards <- getAsIfInHandCardsFor NotForPlay (toId investigator')
+      let
+        discardEffectCards =
+          map PlayerCard
+            . filter
+              ( \card ->
+                  let def = toCardDef card
+                   in cdCardInDiscardEffects def
+                        || (cdCardType def /= AssetType && cdCardInHandEffects def)
+                        && (PlayerCard card `notElem` asIfInHandCards)
+              )
+            $ investigatorDiscard (toAttrs investigator')
+      pure
+        $ if null discardEffectCards
+          then entities
+          else
+            let
+              discardEntities =
+                foldl'
+                  ( \e c ->
+                      addCardEntityWith
+                        (toId investigator')
+                        (setPlacement $ StillInDiscard investigator'.id)
+                        (unsafeCardIdToUUID c.id)
+                        e
+                        c
+                  )
+                  defaultEntities
+                  discardEffectCards
+             in
+              insertMap (toId investigator') discardEntities entities
+    -- A committed card keeps no entity of its own: SkillTestCommitCard files it under
+    -- skillTestCommittedCards and CommitCard then ObtainCards it out of whatever zone
+    -- it came from. Only a committed *skill* is spared, because
+    -- InvestigatorCommittedSkill builds a real Skill entity, parked in Limbo.
+    --
+    -- Anything else that wants to act from the skill test asks for it with
+    -- CommittedEffect and gets an entity here, keyed by the card's own UUID so
+    -- Criteria.IsCommitted can tell it apart from an in-play copy. Cards already
+    -- loaded elsewhere are skipped for the reason given above pendingCommitEntities:
+    -- a second live entity resolves the same ability twice (#5555 / #4764).
+    preloadCommittedEntities skillTest entities investigator' = do
+      let iid = toId investigator'
+      let loadedElsewhere = loadedCardIds (gameEntities g) <> foldMap loadedCardIds (gameInHandEntities g)
+      let
+        committedEffectCards =
+          filter
+            (\c -> cdCardCommittedEffects (toCardDef c) && c.id `notMember` loadedElsewhere)
+            (findWithDefault [] iid $ skillTestCommittedCards skillTest)
+      pure
+        $ if null committedEffectCards
+          then entities
+          else
+            insertMap
+              iid
+              ( foldl'
+                  (\e c -> addCardEntityWith iid (setCommitted iid) (unsafeCardIdToUUID c.id) e c)
+                  defaultEntities
+                  committedEffectCards
+              )
+              entities
+    preloadTopOfDeckEntities entities investigator' = do
+      topRevealed <- hasModifier (toId investigator') TopCardOfDeckIsRevealed
+      let
+        topOfDeckEffectCards =
+          map PlayerCard
+            . filter (elem OnTopOfDeckEffect . cdOutOfPlayEffects . toCardDef)
+            $ take 1
+            $ investigatorDeck (toAttrs investigator')
+      pure
+        $ if not topRevealed || null topOfDeckEffectCards
+          then entities
+          else
+            let
+              topOfDeckEntities =
+                foldl'
+                  ( \e c ->
+                      addCardEntityWith
+                        (toId investigator')
+                        (setPlacement $ OnTopOfDeck investigator'.id)
+                        (unsafeCardIdToUUID c.id)
+                        e
+                        c
+                  )
+                  defaultEntities
+                  topOfDeckEffectCards
+             in
+              topOfDeckEntities <> entities
+    foundOfElems = concat . Map.elems . view Investigator.foundCardsL . toAttrs
+    searchEffectCards =
+      filter (cdCardInSearchEffects . toCardDef)
+        $ (concat . Map.elems $ gameFoundCards g)
+        <> concatMap foundOfElems (view (entitiesL . investigatorsL) g)
+  active <- getActiveInvestigatorId
+  let searchEntities =
+        foldl'
+          (\e c -> addCardEntityWith active id (unsafeCardIdToUUID c.id) e c)
+          defaultEntities
+          searchEffectCards
+
+  let isInScenario = isJust $ modeScenario $ g ^. modeL
+  handEntities <- if isInScenario then foldM preloadHandEntities mempty investigators else pure mempty
+  committedEntities <- case guard isInScenario *> gameSkillTest g of
+    Nothing -> pure mempty
+    Just skillTest -> foldM (preloadCommittedEntities skillTest) mempty investigators
+  discardEntities <-
+    if isInScenario then foldM preloadDiscardEntities mempty investigators else pure mempty
+  topOfDeckEntities <-
+    if isInScenario then foldM preloadTopOfDeckEntities mempty investigators else pure mempty
+
+  pure
+    $ g
+      { gameInHandEntities = handEntities
+      , gameCommittedEntities = committedEntities
+      , gameInSearchEntities = searchEntities
+      , gameInDiscardEntities = discardEntities
+      , gameEntities = gameEntities g <> topOfDeckEntities
+      }
+
+-- NOTE: preloadEntities rebuilds the in-hand/in-search/in-discard entities from the card's current
+-- zone before every message, so a card whose parked copy is still here (kept so an in-flight
+-- ability can finish, see ResolvedAbility) can end up loaded twice at once. UseAbility is the one
+-- message both copies act on -- the parked copy from the bare handler and the live copy from the
+-- InSearch/InHand one -- and each pushes `Do msg`, so the ability resolves, and pays its cost,
+-- twice. Astounding Revelation hit this when a later search found it again (#5555), the same shape
+-- as the in-discard double resolve noted in Arkham.Event.Runner (#4764). Every other message keeps
+-- the plain dispatch.
+runActionRemovedEntities :: Runner Game
+runActionRemovedEntities msg g = case msg of
+  UseAbility {} -> do
+    let
+      live =
+        gameInSearchEntities g
+          <> fold (gameInHandEntities g)
+          <> fold (gameCommittedEntities g)
+          <> fold (gameInDiscardEntities g)
+      removed = gameActionRemovedEntities g
+      (parkedEvents, ownEvents) =
+        Map.partitionWithKey (\k _ -> k `Map.member` entitiesEvents live) (entitiesEvents removed)
+      (parkedAssets, ownAssets) =
+        Map.partitionWithKey (\k _ -> k `Map.member` entitiesAssets live) (entitiesAssets removed)
+    removed' <- runMessage msg removed {entitiesEvents = ownEvents, entitiesAssets = ownAssets}
+    pure
+      $ g
+        { gameActionRemovedEntities =
+            removed'
+              { entitiesEvents = entitiesEvents removed' <> parkedEvents
+              , entitiesAssets = entitiesAssets removed' <> parkedAssets
+              }
+        }
+  -- A parked copy is never the entity entering play: a card that re-enters play gets a fresh
+  -- entity, so the `card.id == attrs.cardId` guard every "I entered play" handler uses fires on
+  -- the corpse as well. The King in Yellow, discarded by its own reaction and then redrawn after
+  -- a reshuffle in the same action, placed a second, dead copy into the threat area that way and
+  -- forced an unrelated hand asset to be discarded (#5899).
+  CardIsEnteringPlay _ card -> withoutCardId card.id
+  CardEnteredPlay _ card -> withoutCardId card.id
+  _ -> actionRemovedEntitiesL (runMessage msg) g
+ where
+  withoutCardId cid = do
+    let
+      removed = gameActionRemovedEntities g
+      -- assets, events and skills are the card-backed entity kinds (cf. `loadedCardIds`)
+      (parkedAssets, ownAssets) = Map.partition (\x -> (toAttrs x).cardId == cid) (entitiesAssets removed)
+      (parkedEvents, ownEvents) = Map.partition (\x -> (toAttrs x).cardId == cid) (entitiesEvents removed)
+      (parkedSkills, ownSkills) = Map.partition (\x -> (toAttrs x).cardId == cid) (entitiesSkills removed)
+    removed' <-
+      runMessage
+        msg
+        removed {entitiesAssets = ownAssets, entitiesEvents = ownEvents, entitiesSkills = ownSkills}
+    pure
+      $ g
+        { gameActionRemovedEntities =
+            removed'
+              { entitiesAssets = entitiesAssets removed' <> parkedAssets
+              , entitiesEvents = entitiesEvents removed' <> parkedEvents
+              , entitiesSkills = entitiesSkills removed' <> parkedSkills
+              }
+        }
+
+-- NOTE: We need preloadEntities to be a the end because the game state is not
+-- "saved" between steps here. For example if we discard a card with in discard
+-- effects (See Moonstone) it won't be loaded in the environment until 1 step
+-- too late.
+instance RunMessage Game where
+  runMessage msg g =
+    ( (modeL . here) (runMessage msg) g
+        >>= (modeL . there) (runMessage msg)
+        >>= entitiesL (runMessage msg)
+        >>= runActionRemovedEntities msg
+        >>= itraverseOf (inHandEntitiesL . itraversed) (\i -> runMessage (InHand i msg))
+        >>= itraverseOf (committedEntitiesL . itraversed) (\i -> runMessage (Committed i msg))
+        >>= itraverseOf (inDiscardEntitiesL . itraversed) (\i -> runMessage (InDiscard i msg))
+        >>= (inDiscardEntitiesL . itraversed) (runMessage msg)
+        >>= encounterDiscardEntitiesL (runMessage msg)
+        >>= inSearchEntitiesL (runMessage (InSearch msg))
+        >>= (skillTestL . traverse) (runMessage msg)
+        >>= (activeCostL . traverse) (runMessage msg)
+        >>= runGameMessage msg
+    )
+      <&> handleActionDiff g
+
+runPreGameMessage :: Runner Game
+runPreGameMessage msg g = case msg of
+  {- Opens the log block around a location turning face up: the clues it is
+  stocked with, and anything an "after you reveal" ability does.
+
+  Here rather than in 'runGameMessage' because that runs AFTER the entities, by
+  which point the location has already set @revealed@ and the guard below cannot
+  tell a fresh reveal from a repeat. The closing @After@ is pushed from the same
+  guard, so the two always pair; it lands behind the reveal's own sub-messages
+  because the location prepends those while running. -}
+  Do (RevealLocation _ lid) -> do
+    revealed <- fromMaybe True <$> fieldMay LocationRevealed lid
+    mCard <- fieldMay LocationCard lid
+    case (revealed, mCard) of
+      (False, Just card) -> do
+        push (After msg)
+        pure $ g & cardPlayStackL %~ (<> [toCardId card])
+      _ -> pure g
+  After (Do (RevealLocation miid lid)) -> do
+    mCard <- fieldMay LocationCard lid
+    {- Whose reveal it was. A location revealed by moving into it, or by an
+    investigation, names the investigator; one the scenario turned over by
+    itself names nobody, and is credited to whoever's turn it is -- "if you
+    revealed or put a location into play this round" is said by a card in that
+    investigator's hand. -}
+    lead <- getLead
+    let
+      iid = fromMaybe (fromMaybe lead (view turnPlayerInvestigatorIdL g)) miid
+      historyItem = HistoryItem HistoryLocationsRevealed [lid]
+      turn = isJust $ view turnPlayerInvestigatorIdL g
+      setTurnHistory = if turn then turnHistoryL %~ insertHistory iid historyItem else id
+      recorded = g & (phaseHistoryL %~ insertHistory iid historyItem) & setTurnHistory
+    pure $ maybe recorded (\card -> recorded & cardPlayStackL %~ filter (/= toCardId card)) mCard
+  ForInvestigator iid _ -> do
+    player <- getPlayer iid
+    pure $ g & activeInvestigatorIdL .~ iid & activePlayerIdL .~ player
+  DrawCards iid _ -> do
+    player <- getPlayer iid
+    pure $ g & activeInvestigatorIdL .~ iid & activePlayerIdL .~ player
+  ForTarget GameTarget ResetGame -> do
+    let
+      promoteHomunculus (k, i) =
+        if i.form == HomunculusForm
+          then ("11068b", overAttrs (\x -> x {Investigator.investigatorId = "11068b"}) i)
+          else (k, i)
+    pure $ g & (entitiesL . investigatorsL %~ mapFromList . map promoteHomunculus . mapToList)
+  CheckWindows ws | notNull ws -> do
+    if isJust $ modeScenario $ g ^. modeL
+      then do
+        {- Say so when this window matched an ability someone is forbidden to
+        trigger. Here rather than in @Do (CheckWindows ws)@ because only the
+        @Do@ is re-pushed on a re-check, so this fires once per window and needs
+        no dedupe state. The tick this handler is about to set is not visible to
+        'getPreventedActions' yet, which can only make its entry-tick test
+        stricter -- it under-reports rather than inventing a line. #5821 -}
+        iids <- select UneliminatedInvestigator
+        prevented <- concatForM iids \iid ->
+          map (uncurry $ AbilityPrevented iid) <$> getPreventedActions iid ws
+        pushAll $ prevented <> [Do (CheckWindows ws), EndCheckWindow]
+        let tick' = gameWindowTick g + 1
+        pure
+          $ g
+          & windowDepthL
+          +~ 1
+          & (windowStackL %~ Just . maybe [ws] (ws :))
+          & (windowTickL .~ tick')
+          & (windowTickStackL %~ (tick' :))
+      else pure g
+  EndCheckWindow -> do
+    let
+      windowStack =
+        case fmap (drop 1) (gameWindowStack g) of
+          Nothing -> Nothing
+          Just [] -> Nothing
+          Just ([] : xs) -> case xs of
+            [] -> Nothing
+            _ -> Just xs
+          Just (x : xs) -> Just (x : xs)
+    pure $ g & windowDepthL -~ 1 & windowStackL .~ windowStack & (windowTickStackL %~ drop 1)
+  ScenarioResolution r -> do
+    -- Remember which resolution this was, so the game can name its ending once
+    -- it is over; see 'gameLastResolution'.
+    let ending = (\s -> Ending (attr scenarioId s) r) <$> modeScenario (g ^. modeL)
+    pure
+      $ g
+      & (skillTestL .~ Nothing)
+      & (skillTestResultsL .~ Nothing)
+      & (windowStackL .~ mempty)
+      & (windowDepthL .~ 0)
+      & (windowTickStackL .~ [])
+      & (lastResolutionL %~ \old -> ending <|> old)
+  ResetInvestigators -> do
+    -- if we reset and there is no player order, set it to the current investigator keys
+    pure
+      $ g
+      & (entitiesL . investigatorsL %~ map returnToBody)
+      & (removedFromPlayL .~ [])
+      & (playerOrderL %~ \po -> if null po then view (entitiesL . investigatorsL . to Map.keys) g else po)
+  Setup -> pure $ g & inSetupL .~ True
+  StartScenario {} ->
+    pure
+      $ g
+      & (inSetupL .~ True)
+      & (scenarioStepsL .~ 0)
+      -- Rounds are counted per scenario, not per game.
+      & (roundCountL .~ 0)
+      & (undoActionStepL .~ Nothing)
+      & (undoTurnStepL .~ Nothing)
+      & (undoPhaseStepL .~ Nothing)
+      & (undoRoundStepL .~ Nothing)
+  EndSetup -> do
+    -- setup is not a round/turn, so a card limit spent there must not carry into round 1
+    let setupUses = cardUsesMatching (\l -> isPerRoundLimit l || isPerTurnLimit l) g
+    pure
+      $ g
+      & (inSetupL .~ False)
+      & cardUsesL
+      %~ Map.filterWithKey (\k _ -> k `notElem` setupUses)
+  BeginRound ->
+    pure
+      $ g
+      & (undoRoundStepL ?~ (gameScenarioSteps g + 1))
+      -- The round counter the log reads; see Arkham.Game.Base.
+      & (roundCountL +~ 1)
+  -- Entry-tick capture: record the window-tick at which each card entered play
+  -- so a card that enters during an open window cannot respond to a triggering
+  -- condition that already occurred (see Arkham.Helpers.Action). These run
+  -- before the entity's own handler mutates its placement.
+  CardEnteredPlay _ card ->
+    pure $ g & entryTicksL %~ insertMap card.id (gameWindowTick g)
+  PlaceTreachery tid placement -> do
+    old <- field TreacheryPlacement tid
+    let entersPlay = not (isInPlayPlacement old) && isInPlayPlacement placement
+    if entersPlay
+      then do
+        card <- field TreacheryCard tid
+        pure $ g & entryTicksL %~ insertMap card.id (gameWindowTick g)
+      else pure g
+  EnemySpawn details -> do
+    card <- field EnemyCard details.enemy
+    pure $ g & entryTicksL %~ insertMap card.id (gameWindowTick g)
+  _ -> pure g
+
+{- | Fold a phase's history into the round's.
+
+@Map@'s own @<>@ is a left-biased union, so folding with it kept the round's
+existing entry for an investigator and dropped everything the phase recorded for
+them -- a 'RoundHistory' read saw only the first phase that recorded anything.
+'History' knows how to merge two of itself; this is the only thing that asks it
+to.
+-}
+foldPhaseHistory :: Game -> Map InvestigatorId History -> Map InvestigatorId History
+foldPhaseHistory g roundH = Map.unionWith (<>) roundH (view phaseHistoryL g)
+
+{- | Maintain the revert information for the in-flight action.
+
+While an action resolves, 'gameActionDiff' holds a single lazy revert diff
+from the current state back to the snapshot the action started from (kept in
+the runtime-only 'gameActionSnapshot'). Replacing one unforced thunk per
+message costs nothing; the diff is only computed if the game is saved
+mid-action or the action is undone. This previously consed a fully-computed
+diff per processed message — two whole-game serializations plus a tree diff,
+times hundreds of messages, all forced at every mid-action save.
+
+The snapshot is reconstructed on the first message after a mid-action load by
+folding the saved revert patches into the just-loaded state — which also
+covers mid-action saves written by older builds (one patch per message), so
+'UndoAction' keeps working across the format change.
+-}
+handleActionDiff :: Game -> Game -> Game
+handleActionDiff old new
+  | not (gameInAction new) = new
+  | otherwise = case getTransient (gameActionSnapshot new) of
+      Just snap -> new & actionDiffL .~ [diff new snap]
+      Nothing ->
+        let snap = case gameActionDiff new of
+              -- action began with this message; the pre-message state is the
+              -- action start
+              [] -> old
+              -- resumed from a mid-action save: fold the saved revert patches
+              -- into the just-loaded state to recover the action start
+              ps -> (foldl' unsafePatch old ps) {gameActionDiff = []}
+         in new
+              & (actionSnapshotL .~ Transient (Just snap))
+              & (actionDiffL .~ [diff new snap])
+
+rewriteUsedAbilityWindows
+  :: (Window.WindowType -> Bool)
+  -> (Window.WindowType -> [Window.WindowType])
+  -> Investigator
+  -> Investigator
+rewriteUsedAbilityWindows matchesP rewriteWT =
+  overAttrs (Investigator.usedAbilitiesL %~ map rewriteUsed)
+ where
+  rewriteUsed u = u {usedAbilityWindows = concatMap rewriteWindow (usedAbilityWindows u)}
+  rewriteWindow w
+    | matchesP (windowType w) = map (`Window.replaceWindowType` w) (rewriteWT (windowType w))
+    | otherwise = [w]

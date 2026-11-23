@@ -1,0 +1,940 @@
+module Arkham.Helpers.Cost where
+
+import Arkham.Ability
+import Arkham.Action (Action)
+import Arkham.ActiveCost.Base
+import Arkham.Asset.Types (Field (..))
+import Arkham.Asset.Uses
+import Arkham.Campaigns.TheScarletKeys.Concealed.Kind
+import Arkham.Campaigns.TheScarletKeys.Key.Matcher
+import Arkham.Capability
+import Arkham.Card
+import Arkham.ChaosBag.Base
+import Arkham.Classes.HasGame
+import Arkham.Classes.HasQueue
+import Arkham.Classes.Query
+import Arkham.Cost.FieldCost
+import Arkham.Distance
+import Arkham.Enemy.Types (Field (EnemySealedChaosTokens, EnemyTokens))
+import Arkham.Event.Types (Field (..))
+import Arkham.GameEnv
+import Arkham.Helpers.Action (additionalActionCovers)
+import {-# SOURCE #-} Arkham.Helpers.Calculation
+import Arkham.Helpers.Card (extendedCardMatch, getModifiedCardCost)
+import Arkham.Helpers.ChaosBag
+import Arkham.Helpers.ChaosToken (matchChaosToken)
+import {-# SOURCE #-} Arkham.Helpers.Criteria (passesCriteria)
+import Arkham.Helpers.Customization
+import Arkham.Helpers.GameValue
+import Arkham.Helpers.Investigator ()
+import Arkham.Helpers.Investigator qualified as Investigator (
+  getSpendableClueCount,
+ )
+import Arkham.Helpers.Location (getLocationOf)
+import Arkham.Helpers.Log (remembered)
+import Arkham.Helpers.Modifiers
+import Arkham.Helpers.Ref
+import Arkham.Helpers.Scenario
+import Arkham.Helpers.Shuffle
+import {-# SOURCE #-} Arkham.Helpers.SkillTest
+import Arkham.Helpers.SkillTest.Target
+import Arkham.Helpers.Target
+import Arkham.Id
+import Arkham.Investigator.Cards qualified as Investigators
+import Arkham.Investigator.Types (Field (..))
+import Arkham.Key
+import Arkham.Location.Types (Field (..))
+import Arkham.Matcher qualified as Matcher
+import Arkham.Message qualified as Msg
+import Arkham.Message.Lifted.Queue
+import Arkham.Prelude
+import Arkham.Projection
+import Arkham.Scenario.Types (Field (..))
+import Arkham.SkillType
+import Arkham.Source
+import Arkham.Target
+import Arkham.Token qualified as Token
+import Arkham.Window (Window (..), mkWhen)
+import Arkham.Window qualified as Window
+import Control.Lens (non)
+import Control.Monad.State.Strict (evalStateT, get, put)
+import Data.List.Extra (nubOrd)
+import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
+
+getAdditionalActionCosts :: HasGame m => InvestigatorId -> Target -> Action -> m [Cost]
+getAdditionalActionCosts iid target action = do
+  investigatorModifiers <- getModifiers iid
+  targetModifiers <- getModifiers target
+  pure
+    $ mapMaybe
+      ( \case
+          AdditionalActionCostOf (IsAction action') n | action == action' -> Just (ActionCost n)
+          _ -> Nothing
+      )
+      investigatorModifiers
+    <> mapMaybe
+      ( \case
+          AdditionalCostToInvestigate c | action == #investigate -> Just c
+          AdditionalCostToExplore c | action == #explore -> Just c
+          AdditionalCostToResign c | action == #resign -> Just c
+          _ -> Nothing
+      )
+      targetModifiers
+
+getAdditionalActionCost :: HasGame m => InvestigatorId -> Target -> Action -> m Cost
+getAdditionalActionCost iid target action = mconcat <$> getAdditionalActionCosts iid target action
+
+getCanAffordAdditionalActionCost
+  :: (HasCallStack, HasGame m, Sourceable source)
+  => InvestigatorId
+  -> source
+  -> Target
+  -> Action
+  -> m Bool
+getCanAffordAdditionalActionCost iid source target action = do
+  cost <- getAdditionalActionCost iid target action
+  getCanAffordCost iid source [] [mkWhen Window.NonFast] cost
+
+hasSkillTestCost :: Cost -> Bool
+hasSkillTestCost = \case
+  SkillTestCost {} -> True
+  Costs xs -> any hasSkillTestCost xs
+  OrCost xs -> any hasSkillTestCost xs
+  OptionalCost x -> hasSkillTestCost x
+  CostWhenEnemy _ x -> hasSkillTestCost x
+  CostWhenTreachery _ x -> hasSkillTestCost x
+  CostWhenTreacheryElse _ a b -> hasSkillTestCost a || hasSkillTestCost b
+  CostOnlyWhen _ x -> hasSkillTestCost x
+  CostWhen _ x -> hasSkillTestCost x
+  CostIfEnemy _ a b -> hasSkillTestCost a || hasSkillTestCost b
+  CostIfLocation _ a b -> hasSkillTestCost a || hasSkillTestCost b
+  CostIfCustomization _ a b -> hasSkillTestCost a || hasSkillTestCost b
+  CostIfRemembered _ a b -> hasSkillTestCost a || hasSkillTestCost b
+  UpTo _ x -> hasSkillTestCost x
+  AtLeastOne _ x -> hasSkillTestCost x
+  AsIfAtLocationCost _ x -> hasSkillTestCost x
+  NonBlankedCost x -> hasSkillTestCost x
+  LabeledCost _ x -> hasSkillTestCost x
+  SourcedCost _ x -> hasSkillTestCost x
+  XCost x -> hasSkillTestCost x
+  OneOfDistanceCost _ x -> hasSkillTestCost x
+  _ -> False
+
+getCanAffordCost
+  :: (HasCallStack, HasGame m, Sourceable source)
+  => InvestigatorId
+  -> source
+  -> [Action]
+  -> [Window]
+  -> Cost
+  -> m Bool
+getCanAffordCost iid source actions windows' cost =
+  getCanAffordCost_ iid source actions windows' True cost
+
+{- | Total uses of @uType@ spendable from @assets@, including uses granted by
+other assets/events via @ProvidesUses@/@ProvidesProxyUses@ modifiers.
+-}
+
+{- | Does this cost tree carry a condition that only the game can settle?
+
+Pure, so it can gate the game-context walk in 'resolveConditionalCosts':
+practically every ability answers 'False' after a constructor match or two and never
+touches game state. Only the spine is inspected -- top level and inside 'Costs' -- because
+that is the only part the resolver rewrites. See 'hasSkillTestCost' for the same shape.
+-}
+hasConditionalCost :: Cost -> Bool
+hasConditionalCost = \case
+  CostOnlyWhen {} -> True
+  CostWhen {} -> True
+  CostWhenEnemy {} -> True
+  CostWhenTreachery {} -> True
+  CostWhenTreacheryElse {} -> True
+  CostIfEnemy {} -> True
+  CostIfLocation {} -> True
+  CostIfRemembered {} -> True
+  Costs xs -> any hasConditionalCost xs
+  _ -> False
+
+getSpendableUseCount :: HasGame m => [AssetId] -> UseType -> m Int
+getSpendableUseCount assets uType =
+  flip evalStateT assets $ do
+    sum <$> for assets \asset -> do
+      mods <- lift $ getModifiers asset
+      alreadyCounted <- get
+      fromOtherSources <-
+        sum <$> for mods \case
+          ProvidesUses uType' (AssetSource s) | uType' == uType -> do
+            if s `elem` alreadyCounted
+              then pure 0
+              else do
+                put $ s : alreadyCounted
+                lift $ fieldMap AssetUses (findWithDefault 0 uType) s
+          ProvidesProxyUses pType uType' (AssetSource s) | uType' == uType -> do
+            if s `elem` alreadyCounted
+              then pure 0
+              else do
+                put $ s : alreadyCounted
+                lift $ fieldMap AssetUses (findWithDefault 0 pType) s
+          _ -> pure 0
+      lift $ fieldMap AssetUses ((+ fromOtherSources) . findWithDefault 0 uType) asset
+
+getCanAffordCost_
+  :: (HasCallStack, HasGame m, Sourceable source)
+  => InvestigatorId
+  -> source
+  -> [Action]
+  -> [Window]
+  -> Bool
+  -> Cost
+  -> m Bool
+getCanAffordCost_ !iid !(toSource -> source) !actions !windows' !canModify cost_ = do
+  cached (CanAffordCostKey iid source actions windows' canModify cost_) do
+    case cost_ of
+      ConcealedXCost -> do
+        let
+          go = \case
+            ((windowType -> Window.ScenarioEvent "wouldConceal" _ val) : _) -> do
+              let (_, _, gv) = toResult @(EnemyId, ConcealedCardKind, GameValue) val
+              getCanAffordCost_ iid source actions windows' canModify (GroupClueCost gv Matcher.Anywhere)
+            (_ : rest) -> go rest
+            [] -> pure False
+        go windows'
+      XCost c -> getCanAffordCost_ iid source actions windows' canModify c -- just need to afford once
+      FlipScarletKeyCost ->
+        selectAny $ StableScarletKey <> ScarletKeyWithBearer (Matcher.InvestigatorWithId iid)
+      OneOfDistanceCost lmatcher c -> do
+        getLocationOf iid >>= \case
+          Nothing -> pure False
+          Just loc -> do
+            locs <- select lmatcher
+            distances <- locs & mapMaybeM \l -> if l == loc then pure (Just 0) else getDistance loc l
+            nubOrd distances & anyM \(Distance dist) ->
+              if dist == 0
+                then pure True
+                else getCanAffordCost_ iid source actions windows' canModify $ fold @[Cost] (replicate dist c)
+      LabeledCost _ inner -> getCanAffordCost_ iid source actions windows' canModify inner
+      SourcedCost costSource inner ->
+        getCanAffordCost_ iid costSource actions windows' canModify inner
+      ShuffleTopOfScenarioDeckIntoYourDeck n deckKey -> do
+        cs <- take n <$> getScenarioDeck deckKey
+        andM [pure (length cs >= n), getCanShuffleIn iid cs]
+      RemoveEnemyDamageCost x matcher -> do
+        n <- getGameValue x
+        selectAny $ matcher <> Matcher.EnemyWithDamage (Matcher.atLeast n)
+      SpendKeyCost k ->
+        andM
+          [ withoutModifier iid CannotSpendKeys
+          , fieldMap InvestigatorKeys (elem k) iid
+          ]
+      SpendTokenKeyCost n face -> do
+        andM
+          [ withoutModifier iid CannotSpendKeys
+          , (>= n)
+              . count ((== face) . (.face))
+              . mapMaybe (preview _TokenKey)
+              . toList
+              <$> field InvestigatorKeys iid
+          ]
+      SpendTokenCost tkn tm -> do
+        targets <- select tm
+        targets & anyM \case
+          ScenarioTarget -> scenarioFieldMap ScenarioTokens ((> 0) . countTokens tkn)
+          LocationTarget lid -> fieldMap LocationTokens ((> 0) . countTokens tkn) lid
+          EnemyTarget lid -> fieldMap EnemyTokens ((> 0) . countTokens tkn) lid
+          _ -> pure False
+      PlaceKeyCost _ k -> fieldMap InvestigatorKeys (elem k) iid
+      GroupSpendKeyCost k lm -> selectAny (Matcher.InvestigatorAt lm <> Matcher.InvestigatorWithKey k)
+      CostToEnterUnrevealed c -> getCanAffordCost_ iid source actions windows' canModify c
+      UnpayableCost -> pure False
+      ChooseEnemyCost mtcr -> selectAny mtcr
+      ChooseEnemyCostAndMaybeFieldClueCost mtch fld -> do
+        clues <- getSpendableClueCount [iid]
+        select mtch >>= anyM \enemy -> do
+          clueCount <- field fld enemy
+          pure $ maybe False (clues >=) clueCount
+      ChooseEnemyCostAndMaybeGroupFieldClueCost lmtch mtch fld -> do
+        clues <- getSpendableClueCount =<< select (Matcher.InvestigatorAt lmtch)
+        select mtch >>= anyM \enemy -> do
+          clueCount <- field fld enemy
+          pure $ maybe False (clues >=) clueCount
+      ChooseExtendedCardCost mtcr -> selectAny mtcr
+      -- Revealing is something the investigator does, and a card can forbid it.
+      RevealChosenCardCost mtcr -> andM [can.reveal.cards iid, selectAny mtcr]
+      {- Which card's traits these will be is not known until the cost that chooses
+         it has been paid, so there is nothing to check here. The card matcher of
+         that earlier cost is where the requirement belongs. -}
+      ChooseTraitOfChosenCardCost -> pure True
+      ChosenTraitCost _ -> pure True
+      ChosenEnemyCost eid -> selectAny (Matcher.EnemyWithId eid)
+      ChosenCardCost cid -> selectAny (Matcher.basic $ Matcher.CardWithId cid)
+      Free -> pure True
+      UpTo {} -> pure True
+      AtLeastOne _ c -> getCanAffordCost_ iid source actions windows' canModify c
+      OptionalCost {} -> pure True
+      AddCurseTokensEqualToShroudCost -> do
+        mloc <- field InvestigatorLocation iid
+        mShroud <- maybe (pure Nothing) (field LocationShroud) mloc
+        case mShroud of
+          Nothing -> pure False
+          Just shroud -> do
+            x <- getRemainingCurseTokens
+            pure $ x >= shroud
+      AddCurseTokensEqualToSkillTestDifficulty -> do
+        getSkillTestDifficulty >>= \case
+          Nothing -> pure False
+          Just difficulty -> do
+            x <- getRemainingCurseTokens
+            pure $ x >= difficulty
+      AddFrostTokenCost n -> do
+        x <- getRemainingFrostTokens
+        pure $ x >= n
+      AddTokenCost n face -> canAddChaosTokenFaces n face
+      AddCurseTokenCost n -> do
+        x <- getRemainingCurseTokens
+        if x >= n
+          then pure True
+          else
+            -- Parallel Rex's reaction only triggers when 2+ curse tokens would be added
+            if n < 2
+              then pure False
+              else do
+                canParallelRex <-
+                  iid
+                    <=~> ( Matcher.InvestigatorIs "90078"
+                             <> Matcher.InvestigatorAt Matcher.Anywhere
+                             <> Matcher.InvestigatorWithAnyClues
+                         )
+                if canParallelRex
+                  then do
+                    z <- fieldMap InvestigatorClues (* 2) iid
+                    pure $ x + z >= n
+                  else pure False
+      AddCurseTokensCost n _ -> do
+        x <- getRemainingCurseTokens
+        if x >= n
+          then pure True
+          else do
+            canParallelRex <-
+              iid
+                <=~> ( Matcher.InvestigatorIs "90078"
+                         <> Matcher.InvestigatorAt Matcher.Anywhere
+                         <> Matcher.InvestigatorWithAnyClues
+                     )
+            if canParallelRex
+              then do
+                z <- fieldMap InvestigatorClues (* 2) iid
+                -- Smallest Rex-payable amount is max n 2; if that fits, the cost is affordable.
+                pure $ x + z >= max n 2
+              else pure False
+      SkillTestCost {} -> pure True
+      AsIfAtLocationCost lid c -> do
+        withModifiers' iid (toModifiers source [AsIfAt lid])
+          $ getCanAffordCost_ iid source actions windows' canModify c
+      ShuffleAttachedCardIntoDeckCost target cardMatcher -> do
+        case target of
+          AssetTarget aid -> fieldMap AssetCardsUnderneath (any (`cardMatch` cardMatcher)) aid
+          _ -> error "Unhandled shuffle attached card into deck cost"
+      EnemyAttackCost eid -> selectAny $ Matcher.EnemyWithId eid <> Matcher.EnemyCanAttack (Matcher.InvestigatorWithId iid)
+      DrawEncounterCardsCost _n -> can.target.encounterDeck iid
+      DiscardEncounterUntilFirstCost _requester _matcher -> can.target.encounterDeck iid
+      CrossOffRecordCost key n ->
+        fieldMap InvestigatorLog ((>= n) . findWithDefault 0 key . (.recordedCounts)) iid
+      CostWhenEnemy mtchr c -> do
+        hasEnemy <- selectAny mtchr
+        if hasEnemy then getCanAffordCost_ iid source actions windows' canModify c else pure True
+      CostWhenTreachery mtchr c -> do
+        hasTreachery <- selectAny mtchr
+        if hasTreachery then getCanAffordCost_ iid source actions windows' canModify c else pure True
+      CostWhenTreacheryElse mtchr c1 c2 -> do
+        hasTreachery <- selectAny mtchr
+        getCanAffordCost_ iid source actions windows' canModify
+          $ Matcher.replaceYouMatcher iid
+          $ if hasTreachery then c1 else c2
+      CostOnlyWhen cr c -> do
+        ok <- passesCriteria iid Nothing source source windows' cr
+        if ok then getCanAffordCost_ iid source actions windows' canModify c else pure False
+      -- Additive, unlike 'CostOnlyWhen': an unmet criterion costs nothing rather than
+      -- making the ability unpayable.
+      CostWhen cr c -> do
+        ok <- passesCriteria iid Nothing source source windows' cr
+        if ok then getCanAffordCost_ iid source actions windows' canModify c else pure True
+      CostIfRemembered skey c1 c2 -> do
+        ok <- remembered skey
+        getCanAffordCost_ iid source actions windows' canModify $ if ok then c1 else c2
+      CostIfEnemy mtchr c1 c2 -> do
+        hasEnemy <- selectAny mtchr
+        getCanAffordCost_ iid source actions windows' canModify $ if hasEnemy then c1 else c2
+      CostIfLocation mtchr c1 c2 -> do
+        hasLocation <- selectAny mtchr
+        getCanAffordCost_ iid source actions windows' canModify $ if hasLocation then c1 else c2
+      CostIfCustomization customization c1 c2 -> do
+        case source of
+          (CardIdSource cid) -> do
+            card <- getCard cid
+            case card of
+              PlayerCard pc ->
+                getCanAffordCost_ iid source actions windows' canModify
+                  $ if pc `hasCustomization` customization then c1 else c2
+              _ -> error "Not implemented"
+          _ -> error "Not implemented"
+      ArchiveOfConduitsUnidentifiedCost -> do
+        n <- selectCount Matcher.Anywhere
+        pure $ n >= 4
+      NonBlankedCost c -> do
+        mods <- getModifiers (sourceToTarget source)
+        if Blank `elem` mods
+          then pure True
+          else getCanAffordCost_ iid source actions windows' canModify c
+      GloriaCost ->
+        fromMaybe False <$> runMaybeT do
+          t <- MaybeT getSkillTestTarget
+          gloria <- MaybeT $ selectOne $ Matcher.investigatorIs Investigators.gloriaGoldberg
+          lift do
+            cardsUnderneath <- field InvestigatorCardsUnderneath gloria
+            traits <- targetTraits t
+            pure $ any (\trait -> any (`cardMatch` Matcher.CardWithTrait trait) cardsUnderneath) traits
+      ShuffleIntoDeckCost target -> case target of
+        TreacheryTarget tid ->
+          andM
+            [ can.manipulate.deck iid
+            , selectAny $ Matcher.TreacheryWithId tid
+            , fieldMap InvestigatorDeck (not . null) iid
+            ]
+        AssetTarget tid ->
+          andM
+            [ can.manipulate.deck iid
+            , selectAny $ Matcher.AssetWithId tid
+            , fieldMap InvestigatorDeck (not . null) iid
+            ]
+        _ -> error "Unhandled shuffle into deck cost"
+      ShuffleBondedCost n cardCode -> do
+        bondedCards <- field InvestigatorBondedCards iid
+        pure $ count ((== cardCode) . toCardCode) bondedCards >= n
+      DiscardHandCost {} -> pure True
+      DiscardTopOfDeckCost {} -> can.manipulate.deck iid
+      DiscardTopOfDeckWithTargetCost {} -> can.manipulate.deck iid
+      AdditionalActionsCost {} -> pure True
+      AdditionalActionsCostThatReducesResourceCostBy n cost -> do
+        spendableActions <- field InvestigatorRemainingActions iid
+        blockedActions <- getUnspendableActionCount iid
+        let totalActions = totalActionCost cost
+        let reduction = max 0 ((spendableActions - blockedActions - totalActions) * n)
+        withModifiers iid (toModifiers source [ExtraResources reduction]) do
+          getCanAffordCost_ iid source actions windows' canModify cost
+      RevealCost {} -> pure True
+      Costs xs -> do
+        -- We need to check and make sure the costs don't try to exhaust the same thing twice
+        let targets = mapMaybe (preview _ExhaustCost) xs
+        let ok = length targets == length (Set.fromList targets)
+        andM
+          [ pure ok
+          , and <$> traverse (getCanAffordCost_ iid source actions windows' canModify) xs
+          , canAffordCombinedClueCosts iid source xs
+          ]
+      OrCost xs ->
+        or <$> traverse (getCanAffordCost_ iid source actions windows' canModify) xs
+      ExhaustCost target -> case target of
+        AssetTarget aid ->
+          elem aid <$> select Matcher.AssetReady
+        EventTarget eid ->
+          elem eid <$> select Matcher.EventReady
+        EnemyTarget eid ->
+          elem eid <$> select Matcher.ReadyEnemy
+        -- "this card" is authored as a 'CardIdTarget': the one target that matches
+        -- the card in every zone. 'isTarget' already honours it, so the exhaust that
+        -- gets pushed lands -- which leaves affordability as the only half that has
+        -- to learn it.
+        CardIdTarget cid ->
+          orM
+            [ selectAny $ Matcher.AssetWithCardId cid <> Matcher.AssetReady
+            , selectAny $ Matcher.EventWithCardId cid <> Matcher.EventReady
+            , selectAny $ Matcher.EnemyWithCardId cid <> Matcher.ReadyEnemy
+            ]
+        -- A target with nothing to exhaust is an unpayable cost, not a crash: the
+        -- card builder lets an author pick any 'Target' here.
+        _ -> pure False
+      ExhaustAssetCost matcher ->
+        selectAny $ Matcher.replaceYouMatcher iid matcher <> Matcher.AssetReady
+      ExhaustXAssetCost matcher ->
+        selectAny $ Matcher.replaceYouMatcher iid matcher <> Matcher.AssetReady
+      DiscardAssetCost matcher ->
+        selectAny $ Matcher.replaceYouMatcher iid matcher <> Matcher.DiscardableAsset
+      -- No 'DiscardableAsset' counterpart: exiling is not leaving play by
+      -- discard, so what the matcher names is the whole of what can be paid.
+      ExileAssetCost matcher -> selectAny $ Matcher.replaceYouMatcher iid matcher
+      UseCost assetMatcher uType n -> do
+        assets <- select (Matcher.replaceYouMatcher iid assetMatcher)
+        uses <- getSpendableUseCount assets uType
+        pure $ uses >= n
+      EventUseCost eventMatcher uType n -> do
+        events <- select eventMatcher
+        uses <- sum <$> traverse (fieldMap EventUses (findWithDefault 0 uType)) events
+        pure $ uses >= n
+      AllUsesCost {} -> pure True
+      DynamicUseCost assetMatcher uType useCost -> do
+        assets <- select assetMatcher
+        uses <-
+          sum <$> traverse (fieldMap AssetUses (findWithDefault 0 uType)) assets
+        case useCost of
+          DynamicCalculation calc -> do
+            n <- calculate calc
+            pure $ uses >= n
+          DrawnCardsValue -> do
+            let
+              toDrawnCards = \case
+                (windowType -> Window.DrawCards _ xs) -> length xs
+                _ -> 0
+              drawnCardsValue = sum $ map toDrawnCards windows'
+            pure $ uses >= drawnCardsValue
+      UseCostUpTo assetMatcher uType n _ -> do
+        assets <- select assetMatcher
+        uses <- getSpendableUseCount assets uType
+        pure $ uses >= n
+      UnlessFastActionCost n ->
+        getCanAffordCost_ iid source actions windows' canModify (ActionCost n)
+      ActionCost n -> do
+        modifiers <- getModifiers (InvestigatorTarget iid)
+        if any (`elem` modifiers) [ActionsAreFree, IgnoreActionCost]
+          then pure True
+          else do
+            takenActions <- field InvestigatorActionsTaken iid
+            performedActions <- field InvestigatorActionsPerformed iid
+            let modifiedActionCost =
+                  if canModify
+                    then foldr (applyActionCostModifier takenActions performedActions actions) n modifiers
+                    else n
+            additionalActions <- field InvestigatorAdditionalActions iid
+            additionalActionCount <- countM (additionalActionCovers source actions) additionalActions
+            actionCount <- field InvestigatorRemainingActions iid
+            blockedActions <- getUnspendableActionCount iid
+            pure $ max 0 (actionCount + additionalActionCount - blockedActions) >= modifiedActionCost
+      AdditionalActionCost -> getCanAffordCost_ iid source actions windows' canModify (ActionCost 1)
+      AssetClueCost _ aMatcher gv -> do
+        totalClueCost <- getPlayerCountValue gv
+        clues <- getSum <$> selectAgg Sum AssetClues aMatcher
+        pure $ clues >= totalClueCost
+      ClueCost gameValue -> do
+        spendableClues <- getSpendableClueCount [iid]
+        totalClueCost <- getPlayerCountValue gameValue
+        pure $ spendableClues >= totalClueCost
+      ClueCostX -> do
+        spendableClues <- getSpendableClueCount [iid]
+        pure $ spendableClues >= 1
+      PerPlayerClueCostX -> do
+        spendableClues <- getSpendableClueCount [iid]
+        n <- perPlayer 1
+        pure $ spendableClues >= n
+      GroupClueCostX lm -> do
+        let wrapper = if lm == Matcher.Anywhere then id else (Matcher.InvestigatorAt lm <>)
+        spendableClues <- getSpendableClueCount =<< select (wrapper Matcher.UneliminatedInvestigator)
+        n <- perPlayer 1
+        pure $ spendableClues >= n
+      DiscoveredCluesCost -> pure True
+      PlaceClueOnLocationCost gv -> do
+        n <- getPlayerCountValue gv
+        placeable <- getPlaceableClueCount iid
+        pure $ placeable >= n
+      GroupPlaceClueOnLocationCost gv locationMatcher -> do
+        n <- getPlayerCountValue gv
+        let lm = Matcher.replaceYouMatcher iid locationMatcher
+        iids <- select $ Matcher.InvestigatorAt lm
+        totalPlaceable <- sum <$> traverse getPlaceableClueCount iids
+        pure $ totalPlaceable >= n
+      InvestigatorPlaceClueOnLocationCost investigatorMatcher gv -> do
+        n <- getPlayerCountValue gv
+        -- Unaffordable when the matcher resolves to nobody, so an ability whose
+        -- cost is placed by the window's investigator is not offered when that
+        -- investigator has no clue to place.
+        selectOne (Matcher.replaceYouMatcher iid investigatorMatcher) >>= \case
+          Nothing -> pure False
+          Just placer -> do
+            clues <- field InvestigatorClues placer
+            pure $ clues >= n
+      CalculatedGroupClueCost calc locationMatcher -> do
+        cost <- calculate calc
+        let lm = Matcher.replaceYouMatcher iid locationMatcher
+        iids <- select $ Matcher.InvestigatorAt lm
+        totalSpendableClues <- getSpendableClueCount iids
+        pure $ totalSpendableClues >= cost
+      GroupClueCost n locationMatcher -> do
+        cost <- getPlayerCountValue n
+        let lm = Matcher.replaceYouMatcher iid locationMatcher
+        iids <- select $ Matcher.InvestigatorAt lm
+        totalSpendableClues <- getSpendableClueCount iids
+        pure $ totalSpendableClues >= cost
+      SameLocationGroupClueCost n locationMatcher -> do
+        totalClues <- getPlayerCountValue n
+        let lm = Matcher.replaceYouMatcher iid locationMatcher
+        select lm >>= anyM \lid -> do
+          total <- getSpendableClueCount =<< select (Matcher.investigatorAt lid)
+          pure $ total >= totalClues
+      GroupResourceCost n locationMatcher -> do
+        cost <- getPlayerCountValue n
+        let lm = Matcher.replaceYouMatcher iid locationMatcher
+        iids <- select $ Matcher.InvestigatorAt lm
+        totalSpendableClues <- sum <$> traverse getSpendableResources iids
+        pure $ totalSpendableClues >= cost
+      GroupDiscardCost n extendedCardMatcher locationMatcher -> do
+        cost <- getPlayerCountValue n
+        let lm = Matcher.replaceYouMatcher iid locationMatcher
+        cards <-
+          selectCount
+            $ Matcher.InHandOf Matcher.NotForPlay (Matcher.InvestigatorAt lm)
+            <> extendedCardMatcher
+            <> Matcher.basic Matcher.DiscardableCard
+        pure $ cards >= cost
+      GroupClueCostRange (cost, _) locationMatcher -> do
+        let lm = Matcher.replaceYouMatcher iid locationMatcher
+        iids <- select $ Matcher.InvestigatorAt lm
+        totalSpendableClues <- getSpendableClueCount iids
+        pure $ totalSpendableClues >= cost
+      IncreaseCostOfThis cardId n -> do
+        card <- getCard cardId
+        mCost <- getModifiedCardCost iid card
+        resources <- getSpendableResources iid
+        pure $ case mCost of
+          Nothing -> False
+          Just cost -> resources >= cost + n
+      ResourceCost n -> do
+        resources <- getSpendableResources iid
+        pure $ resources >= n
+      ScenarioResourceCost n -> do
+        resources <- scenarioFieldMap ScenarioTokens (countTokens Token.Resource)
+        pure $ resources >= n
+      DiscardFromCost n zone cardMatcher -> do
+        -- We need to check that n valid candidates exist across all zones
+        -- the logic is that we'll grab all card defs from each zone and then
+        -- filter
+        let
+          getCards = \case
+            FromHandOf whoMatcher -> do
+              excludeCards <- case source of
+                CardIdSource cid -> (: []) <$> getCard cid
+                _ -> pure mempty
+              fmap
+                ( filterBy
+                    [ (`cardMatch` (cardMatcher <> Matcher.DiscardableCard))
+                    , (`notElem` excludeCards)
+                    ]
+                    . concat
+                )
+                . traverse (field InvestigatorHand)
+                =<< select whoMatcher
+            FromPlayAreaOf whoMatcher -> do
+              assets <- select $ Matcher.AssetControlledBy whoMatcher <> Matcher.DiscardableAsset
+              filterCards cardMatcher <$> traverse (field AssetCard) assets
+            CostZones zs -> concatMapM getCards zs
+        (>= n) . length <$> getCards zone
+      DiscardUnderneathCardCost assetId cardMatcher -> do
+        cards <- field AssetCardsUnderneath assetId
+        anyM (<=~> cardMatcher) cards
+      DiscardCost _ _ -> pure True -- TODO: Make better
+      DiscardCardCost _ -> pure True -- TODO: Make better
+      DiscardRandomCardCost -> iid <=~> Matcher.InvestigatorWithDiscardableCard
+      DiscardDrawnCardCost -> pure True -- TODO: Make better
+      ExileCost _ -> iid <=~> Matcher.InvestigatorCanRemoveCardsFromDeck -- TODO: Make better
+      RemoveCost _ -> pure True -- TODO: Make better
+      -- Damage protection (e.g. Hemlock Vale preludes) does not prevent horror.
+      -- Keep the recipient check, but use the same distinction as damage assignment.
+      HorrorCost _ (InvestigatorTarget iid') _ -> matches iid' Matcher.Anyone
+      HorrorCost {} -> pure True -- TODO: Make better
+      HorrorCostX {} -> matches iid Matcher.Anyone
+      DamageCost _ (InvestigatorTarget iid') _ -> matches iid' Matcher.InvestigatorCanBeDamaged -- TODO: Make better
+      DamageCost {} -> pure True -- TODO: Make better
+      DirectDamageCost _ inner _ -> selectAny (inner <> Matcher.InvestigatorCanBeDamaged) -- TODO: Make better
+      DirectHorrorCost _ inner _ -> selectAny inner
+      DirectDamageAndHorrorCost _ inner _ _ -> selectAny (inner <> Matcher.InvestigatorCanBeDamaged) -- TODO: Make better
+      InvestigatorDamageCost _ inner _ _ -> selectAny (inner <> Matcher.InvestigatorCanBeDamaged) -- TODO: Make better
+      EachInvestigatorDamageCost _ inner _ _ -> selectAny (inner <> Matcher.InvestigatorCanBeDamaged) -- TODO: Make better
+      DoomCost _ (AgendaMatcherTarget agendaMatcher) _ -> selectAny agendaMatcher
+      DoomCost {} -> pure True -- TODO: Make better
+      EnemyDoomCost _ enemyMatcher -> selectAny enemyMatcher
+      AssetDoomCost _ assetMatcher -> selectAny (Matcher.replaceYouMatcher iid assetMatcher)
+      SkillIconCostMatching n skillTypes matcher -> do
+        cards <- mapMaybe (preview _PlayerCard) <$> select matcher
+        let countF = if null skillTypes then const True else (`member` insertSet WildIcon skillTypes)
+        let total = sum $ map (count countF . cdSkills . toCardDef) cards
+        pure $ total >= n
+      SkillIconCost n skillTypes -> do
+        handCards <- mapMaybe (preview _PlayerCard) <$> field InvestigatorHand iid
+        let countF = if null skillTypes then const True else (`member` insertSet WildIcon skillTypes)
+        let total = sum $ map (count countF . cdSkills . toCardDef) handCards
+        pure $ total >= n
+      GroupSkillIconCost n skillTypes locationMatcher -> do
+        let lm = Matcher.replaceYouMatcher iid locationMatcher
+        iids <- select $ Matcher.InvestigatorAt lm
+        let countF = if null skillTypes then const True else (`member` insertSet WildIcon skillTypes)
+        total <-
+          sum <$> for iids \iid' -> do
+            handCards <- mapMaybe (preview _PlayerCard) <$> field InvestigatorHand iid'
+            pure $ sum $ map (count countF . cdSkills . toCardDef) handCards
+        pure $ total >= n
+      SameSkillIconCost n -> do
+        handCards <- mapMaybe (preview _PlayerCard) <$> field InvestigatorHand iid
+        let total = unionsWith (+) $ map (frequencies . cdSkills . toCardDef) handCards
+        let wildCount = total ^. at #wild . non 0
+        pure $ foldr (\x y -> y || x + wildCount >= n) False $ toList $ deleteMap #wild total
+      SameSkillIconCostMatching n matcher -> do
+        cards <- mapMaybe (preview _PlayerCard) <$> select matcher
+        let total = unionsWith (+) $ map (frequencies . cdSkills . toCardDef) cards
+        let wildCount = total ^. at #wild . non 0
+        pure $ foldr (\x y -> y || x + wildCount >= n) False $ toList $ deleteMap #wild total
+      CalculatedDiscardCombinedCost calc -> do
+        n <- calculate (Matcher.replaceYouMatcher iid calc)
+        getCanAffordCost_ iid source actions windows' canModify (DiscardCombinedCost n)
+      DiscardCombinedCost n -> do
+        handCards <-
+          mapMaybe (preview _PlayerCard)
+            . filter (`cardMatch` Matcher.NonWeakness)
+            <$> field InvestigatorHand iid
+        let
+          total = sum $ map (maybe 0 toPrintedCost . cdCost . toCardDef) handCards
+        pure $ total >= n
+      ShuffleDiscardCost n cardMatcher -> do
+        discards <-
+          fieldMap
+            InvestigatorDiscard
+            (filter (`cardMatch` cardMatcher))
+            iid
+        pure $ length discards >= n
+      HandDiscardCost n extendedCardMatcher -> do
+        excludeCards <- case source of
+          CardIdSource cid -> (: []) <$> getCard cid
+          _ -> pure mempty
+        cards <-
+          mapMaybe (preview _PlayerCard) . filter (`notElem` excludeCards) <$> field InvestigatorHand iid
+        (>= n)
+          <$> countM (`extendedCardMatch` (Matcher.basic Matcher.DiscardableCard <> extendedCardMatcher)) cards
+      HandDiscardAnyNumberCost extendedCardMatcher -> do
+        excludeCards <- case source of
+          CardIdSource cid -> (: []) <$> getCard cid
+          _ -> pure mempty
+        cards <-
+          mapMaybe (preview _PlayerCard) . filter (`notElem` excludeCards) <$> field InvestigatorHand iid
+        (> 0) <$> countM (`extendedCardMatch` extendedCardMatcher) cards
+      ReturnMatchingAssetToHandCost assetMatcher -> selectAny $ Matcher.AssetCanLeavePlayByNormalMeans <> assetMatcher
+      ReturnAssetToHandCost assetId -> selectAny $ Matcher.AssetWithId assetId
+      ReturnEventToHandCost eventId -> selectAny $ Matcher.EventWithId eventId
+      SealCost tokenMatcher -> do
+        tokens <- scenarioFieldMap ScenarioChaosBag chaosBagChaosTokens
+        anyM (\token -> matchChaosToken iid token tokenMatcher) tokens
+      SealMultiCost n tokenMatcher -> do
+        tokens <- scenarioFieldMap ScenarioChaosBag chaosBagChaosTokens
+        (>= n) <$> countM (\token -> matchChaosToken iid token tokenMatcher) tokens
+      SealChaosTokenCost _ -> pure True
+      SealOnInvestigatorCost tokenMatcher -> do
+        tokens <- scenarioFieldMap ScenarioChaosBag chaosBagChaosTokens
+        anyM (\token -> matchChaosToken iid token tokenMatcher) tokens
+      SealChaosTokenOnInvestigatorCost _ -> pure True
+      RevealChaosTokensCost _ _ -> pure True
+      FindEncounterCardCost {} -> can.target.encounterDeck iid
+      ReleaseChaosTokensCost n tokenMatcher -> do
+        case tokenMatcher of
+          Matcher.SealedOnAsset assetMatcher tokenMatcher' -> do
+            mAsset <- selectOne assetMatcher
+            case mAsset of
+              Nothing -> pure False
+              Just aid ->
+                fmap (>= n) . countM (<=~> Matcher.IncludeSealed tokenMatcher') =<< field AssetSealedChaosTokens aid
+          Matcher.SealedOnEnemy enemyMatcher tokenMatcher' -> do
+            mEnemy <- selectOne enemyMatcher
+            case mEnemy of
+              Nothing -> pure False
+              Just eid ->
+                fmap (>= n) . countM (<=~> Matcher.IncludeSealed tokenMatcher') =<< field EnemySealedChaosTokens eid
+          _ -> do
+            let
+              handleSource = \case
+                AssetSource aid ->
+                  fmap (>= n) . countM (<=~> Matcher.IncludeSealed tokenMatcher) =<< field AssetSealedChaosTokens aid
+                AbilitySource t _ -> handleSource t
+                UseAbilitySource _ t _ -> handleSource t
+                _ -> error $ "Unhandled release token cost source: " <> show source
+            handleSource source
+      ReleaseChaosTokenCost t ->
+        t
+          <=~> Matcher.IncludeSealed
+            ( Matcher.oneOf
+                [ Matcher.SealedOnAsset Matcher.AnyAsset Matcher.AnyChaosToken
+                , Matcher.SealedOnEnemy Matcher.AnyEnemy Matcher.AnyChaosToken
+                ]
+            )
+      ReturnChaosTokensToPoolCost n matcher -> do
+        (>= n) <$> selectCount matcher
+      ReturnChaosTokenToPoolCost _ -> pure True
+      ReturnChosenChaosTokensToPoolCost -> pure True
+      FieldResourceCost (FieldCost mtchr fld) -> do
+        ns <- selectFields fld mtchr
+        resources <- getSpendableResources iid
+        pure $ any (resources >=) ns
+      MaybeFieldResourceCost (MaybeFieldCost mtchr fld) -> do
+        ns <- catMaybes <$> selectFields fld (Matcher.replaceYouMatcher iid mtchr)
+        resources <- getSpendableResources iid
+        pure $ any (resources >=) ns
+      CalculatedResourceCost calc -> do
+        n <- calculate (Matcher.replaceYouMatcher iid calc)
+        resources <- getSpendableResources iid
+        pure $ resources >= n
+      CalculatedClueCost calc -> do
+        n <- calculate (Matcher.replaceYouMatcher iid calc)
+        clues <- getSpendableClueCount [iid]
+        pure $ clues >= n
+      CalculatedHandDiscardCost calc matcher -> do
+        n <- calculate (Matcher.replaceYouMatcher iid calc)
+        getCanAffordCost_ iid source actions windows' canModify (HandDiscardCost n matcher)
+      SupplyCost locationMatcher supply ->
+        iid <=~> (Matcher.InvestigatorWithSupply supply <> Matcher.InvestigatorAt locationMatcher)
+      ResolveEachHauntedAbility _ -> pure True
+
+getSpendableResources :: HasGame m => InvestigatorId -> m Int
+getSpendableResources iid = do
+  mods <- getModifiers iid
+  let extraResources = sum [x | ExtraResources x <- mods]
+  pooledResources <- sum <$> traverse (field AssetResources) [aid | AsIfResourcePool aid <- mods]
+  fieldMap InvestigatorResources (+ (pooledResources + extraResources)) iid
+
+-- Separate clue costs must not count the same clues twice. Payer pools may
+-- overlap without being identical (Rear Corridors restricts its printed cost
+-- to Side Building, while The Boundary's surcharge can be paid anywhere).
+-- Each subset of demands must fit within the union of its eligible payers;
+-- checking only the grand total would miss a shortage in a restricted pool.
+canAffordCombinedClueCosts :: HasGame m => InvestigatorId -> Source -> [Cost] -> m Bool
+canAffordCombinedClueCosts iid source costs
+  | sum (map clueCostCount costs) < 2 = pure True
+  | otherwise = do
+      demands <- concat <$> traverse (clueDemands source) costs
+      let pools = Map.toList $ Map.fromListWith (+) demands
+      allM canPay $ filter (not . null) $ subsequences pools
+ where
+  clueCostCount :: Cost -> Int
+  clueCostCount = \case
+    Costs xs -> sum $ map clueCostCount xs
+    CostToEnterUnrevealed c -> clueCostCount c
+    NonBlankedCost c -> clueCostCount c
+    LabeledCost _ c -> clueCostCount c
+    SourcedCost _ c -> clueCostCount c
+    ClueCost {} -> 1
+    GroupClueCost {} -> 1
+    _ -> 0
+
+  canPay demands = do
+    available <- getSpendableClueCount $ Set.toList $ foldMap fst demands
+    pure $ available >= sum (map snd demands)
+
+  clueDemands s = \case
+    Costs xs -> concat <$> traverse (clueDemands s) xs
+    CostToEnterUnrevealed c -> clueDemands s c
+    NonBlankedCost c -> do
+      blank <- hasModifier (sourceToTarget s) Blank
+      if blank then pure [] else clueDemands s c
+    LabeledCost _ c -> clueDemands s c
+    SourcedCost s' c -> clueDemands s' c
+    ClueCost value -> do
+      n <- getPlayerCountValue value
+      pure [(Set.singleton iid, n)]
+    GroupClueCost value matcher -> do
+      n <- getPlayerCountValue value
+      payers <- select $ Matcher.InvestigatorAt $ Matcher.replaceYouMatcher iid matcher
+      pure [(Set.fromList payers, n)]
+    _ -> pure []
+
+getSpendableClueCount :: HasGame m => [InvestigatorId] -> m Int
+getSpendableClueCount investigatorIds =
+  getSum <$> foldMapM (fmap Sum . Investigator.getSpendableClueCount) investigatorIds
+
+getSpendableClueCountOf :: HasGame m => Matcher.InvestigatorMatcher -> m Int
+getSpendableClueCountOf = select >=> getSpendableClueCount
+
+{- | How many clues this investigator can put on a location to pay a cost.
+
+Placing is not spending, so this is the clue pool itself rather than
+'getSpendableClueCount'. Parallel Rex turns 2 curse tokens into 1 placed clue at
+the @WouldPlaceClueOnLocation@ window, so he can pay past his pool.
+
+Shared by 'PlaceClueOnLocationCost' and 'GroupPlaceClueOnLocationCost' so the
+group cost counts a contributor exactly as the single cost counts a payer.
+-}
+getPlaceableClueCount :: HasGame m => InvestigatorId -> m Int
+getPlaceableClueCount iid = do
+  canParallelRex <- iid <=~> Matcher.InvestigatorIs "90078"
+  z <- if canParallelRex then (`div` 2) <$> getRemainingCurseTokens else pure 0
+  fieldMap InvestigatorClues (+ z) iid
+
+{- | The same 'Matcher.matchTarget' payment uses in
+'Arkham.ActiveCost.getActionCostSurcharges', so what is charged and what is checked
+for affordability cannot drift. Spelling out only 'IsAction' and
+'FirstOneOfPerformed' here left 'AnyActionTarget' unmatched, so Artificial Gravity
+Malfunction's surcharge was invisible until payment and a move was offered with one
+action left (#5895).
+-}
+applyActionCostModifier :: [[Action]] -> [[Action]] -> [Action] -> ModifierType -> Int -> Int
+applyActionCostModifier takenActions performedActions actions (ActionCostOf match m) n
+  | any (Matcher.matchTarget takenActions performedActions match) actions = n + m
+applyActionCostModifier takenActions performedActions actions (AdditionalActionCostOf match m) n
+  | any (Matcher.matchTarget takenActions performedActions match) actions = n + m
+applyActionCostModifier _ _ _ (ActionCostModifier m) n = n + m
+applyActionCostModifier _ _ _ _ n = n
+
+payEffectCost
+  :: (Sourceable source, HasCardCode source, ReverseQueue m)
+  => InvestigatorId -> source -> Cost -> m ()
+payEffectCost _iid source cost = push $ Msg.PayForAbility (abilityEffect source [] cost) []
+
+{- | Cancelling or ignoring any part of a cost means the cost was not paid, so
+the ability whose cost it was does not resolve its effect. What was already paid
+stays paid -- Idle Hands is still discarded when Deny Existence takes away the 2
+damage, you just do not get the additional action.
+
+Cost payments run under a 'PaymentSource' wrapper naming the active cost that is
+paying (see 'Arkham.ActiveCost.payCost'), which is what lets a "would take
+damage" window be traced back to the cost it belongs to. Anything else is not a
+cost payment and is left alone.
+-}
+cancelCostPaymentFrom :: (HasGame m, HasQueue Msg.Message m) => Source -> m ()
+cancelCostPaymentFrom = \case
+  PaymentSource s -> do
+    costs <- getActiveCosts
+    for_ (find ((== s) . activeCostSource) costs) $ push . Msg.CancelCostPayment . activeCostId
+  _ -> pure ()
+
+{- | Settle the conditions in a cost tree so the client is shown the cost that will
+actually be paid.
+
+The client cannot evaluate a 'Criterion' or a matcher, so a conditional cost is invisible
+to it: Call of the Sea's @ActionCost 1 <> CostOnlyWhen youAreADeepOne (ActionCost 1)@ drew
+one action arrow for a Deep One investigator who owes two. Rebuilding each branch with
+'<>' melds what survives -- @ActionCost 1 <> ActionCost 1@ is @ActionCost 2@ via 'Cost''s
+own 'Semigroup' -- so the arrows come out right with no client change.
+
+Only the spine is walked. 'OrCost', 'OptionalCost', 'UpTo' and friends stand for a choice
+or an amount the player makes at payment time, and collapsing one here would decide it for
+them (Tommy Muldoon (2) offers a conditional resource cost *or* discarding a Firearm).
+'CostIfCustomization' is left alone too: it needs the source's customizations, which this
+walk does not carry.
+
+Gate every call on the pure 'hasConditionalCost' -- see its note.
+-}
+resolveConditionalCosts
+  :: (HasGame m, Sourceable source) => InvestigatorId -> source -> [Window] -> Cost -> m Cost
+resolveConditionalCosts iid (toSource -> source) ws = go
+ where
+  go = \case
+    Costs xs -> mconcat <$> traverse go xs
+    -- An unmet 'CostOnlyWhen' makes the ability unaffordable rather than free
+    -- ('getCanAffordCost_'), so on an ability the player has been offered this is
+    -- always met. Asked rather than assumed, because this helper does not know
+    -- whether the caller filtered first.
+    CostOnlyWhen cr c -> do
+      ok <- passesCriteria iid Nothing source source ws cr
+      if ok then go c else pure Free
+    CostWhen cr c -> do
+      ok <- passesCriteria iid Nothing source source ws cr
+      if ok then go c else pure Free
+    CostWhenEnemy m c -> selectAny m >>= \ok -> if ok then go c else pure Free
+    CostWhenTreachery m c -> selectAny m >>= \ok -> if ok then go c else pure Free
+    CostWhenTreacheryElse m c1 c2 -> selectAny m >>= \ok -> go (if ok then c1 else c2)
+    CostIfEnemy m c1 c2 -> selectAny m >>= \ok -> go (if ok then c1 else c2)
+    CostIfLocation m c1 c2 -> selectAny m >>= \ok -> go (if ok then c1 else c2)
+    CostIfRemembered k c1 c2 -> remembered k >>= \ok -> go (if ok then c1 else c2)
+    c -> pure c

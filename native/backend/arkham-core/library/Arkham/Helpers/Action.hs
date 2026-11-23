@@ -1,0 +1,580 @@
+module Arkham.Helpers.Action where
+
+import Arkham.Ability hiding (NoRestriction)
+import Arkham.Ability.Types qualified as Ability
+import Arkham.Action
+import Arkham.Action.Additional
+import Arkham.Asset.Types qualified as Field
+import Arkham.Card
+import Arkham.ClassSymbol
+import Arkham.Classes.HasGame
+import Arkham.Classes.Query
+import Arkham.GameEnv (getAllAbilities, getCurrentWindowTick, getEntryTicks)
+import Arkham.Helpers.Ability (
+  abilityWindowFor,
+  applyCriteriaOverride,
+  getCanAffordAbility,
+  getCanPerformAbility,
+  isForcedAbility,
+ )
+import Arkham.Helpers.CombatTarget
+import {-# SOURCE #-} Arkham.Helpers.Cost (hasConditionalCost, resolveConditionalCosts)
+import {-# SOURCE #-} Arkham.Helpers.Criteria (passesCriteria)
+import Arkham.Helpers.Modifiers (
+  ModifierType (..),
+  getModifiers,
+  getModifiers',
+  withGrantedAction,
+  withModifiersOf,
+ )
+import {-# SOURCE #-} Arkham.Helpers.Playable (getPlayableCards)
+import Arkham.Helpers.Ref (sourceToMaybeCard, sourceToTarget)
+import Arkham.Helpers.Source (sourceTraits)
+import {-# SOURCE #-} Arkham.Helpers.Window (windowMatches)
+import Arkham.Id
+import Arkham.Investigator.Types (Field (..), Investigator, InvestigatorAttrs (..))
+import Arkham.Matcher.Ability
+import Arkham.Matcher.Action
+import Arkham.Matcher.Card
+import Arkham.Matcher.Enemy
+import Arkham.Matcher.Window
+import Arkham.Metrics (timedPure)
+import Arkham.Modifier (Modifier (..))
+import Arkham.Prelude
+import Arkham.Projection
+import Arkham.Source
+import Arkham.Target
+import Arkham.Window (Window (..), defaultWindows)
+import Arkham.Window qualified as Window
+import Data.List.Extra (nubOrdOn)
+
+data IsFast = IsFast | NotFast
+  deriving stock Eq
+
+actionMatches :: HasGame m => InvestigatorId -> Action -> ActionMatcher -> m Bool
+actionMatches _ _ AnyAction = pure True
+actionMatches _ a (ActionIs a') = pure $ a == a'
+actionMatches iid a (ActionMatches as) = allM (actionMatches iid a) as
+actionMatches iid a (ActionOneOf as) = anyM (actionMatches iid a) as
+actionMatches iid a (FirstActionMatchOfRound inner) = do
+  performed <- concat <$> field InvestigatorActionsPerformed iid
+  andM
+    [ actionMatches iid a inner
+    , noneM (\b -> actionMatches iid b inner) performed
+    ]
+actionMatches iid a RepeatableAction = do
+  a' <- getAttrs @Investigator iid
+  actions <- withGrantedAction iid GameSource $ getActions iid (defaultWindows iid)
+
+  playableCards <-
+    filterCards (not_ FastCard)
+      <$> getPlayableCards iid iid (UnpaidCost NoAction) (defaultWindows iid)
+
+  canAffordTakeResources <- withModifiersOf iid GameSource [ActionCostOf IsAnyAction (-1)] do
+    getCanAfford a' [#resource]
+
+  canAffordDrawCards <- withModifiersOf iid GameSource [ActionCostOf IsAnyAction (-1)] do
+    getCanAfford a' [#draw]
+  let available = filter (elem a . abilityActions) actions
+  canDraw <- canDo_ iid #draw
+  canTakeResource <- canDo_ iid #resource
+  canPlay <- canDo_ iid #play
+  pure
+    $ or
+      [ notNull available
+      , canAffordTakeResources && canTakeResource && a == #resource
+      , canAffordDrawCards && canDraw && a == #draw
+      , canPlay && notNull playableCards && a == #play
+      ]
+
+canDo_ :: HasGame m => InvestigatorId -> Action -> m Bool
+canDo_ iid action = canDo iid action NotFast
+
+canDo :: HasGame m => InvestigatorId -> Action -> IsFast -> m Bool
+canDo iid action isFast = do
+  mods <- getModifiers iid
+  let
+    prevents = \case
+      CannotPerformAction x -> preventsAction x
+      CannotTakeAction x | isFast == NotFast && ActionsAreFree `notElem` mods -> preventsAction x
+      MustTakeAction x | isFast == NotFast -> not <$> preventsAction x -- reads a little weird but we want only thing things x would prevent with cannot take action
+      MustTakeAction _ -> pure False
+      CannotDrawCards -> pure $ action == #draw
+      CannotDrawCardsFromPlayerCardEffects -> pure $ action == #draw
+      CannotManipulateDeck -> pure $ action == #draw
+      CannotGainResources -> pure $ action == #resource
+      _ -> pure False
+    preventsAction = \case
+      FirstOneOfPerformed as | action `elem` as -> do
+        fieldP InvestigatorActionsPerformed (\taken -> all (\a -> all (notElem a) taken) as) iid
+      FirstOneOfPerformed {} -> pure False
+      IsAction action' -> pure $ action == action'
+      AnyActionTarget as -> anyM preventsAction as
+      EnemyAction {} -> pure False
+      AssetAction {} -> pure False
+      IsAnyAction {} -> pure True
+
+  not <$> anyM prevents mods
+
+additionalActionCovers
+  :: HasGame m => Source -> [Action] -> AdditionalAction -> m Bool
+additionalActionCovers source actions (AdditionalAction _ _ aType) = case aType of
+  PlayCardRestrictedAdditionalAction matcher -> case source of
+    CardIdSource cid -> elem cid . map toCardId <$> select matcher
+    _ -> pure False
+  TraitRestrictedAdditionalAction t actionRestriction -> case actionRestriction of
+    NoRestriction -> member t <$> sourceTraits source
+    AbilitiesOnly -> case source of
+      AbilitySource {} -> member t <$> sourceTraits source
+      UseAbilitySource {} -> member t <$> sourceTraits source
+      _ -> pure False
+  AbilityRestrictedAdditionalAction s idx -> pure $ isAbilitySource s idx source
+  {- The ability being paid for is only known here as its source, so the matcher
+  is asked for the abilities it accepts and the source is looked for among
+  them. -}
+  AbilityMatchingAdditionalAction matcher -> do
+    abilities <- select matcher
+    pure $ any (\ab -> isAbilitySource ab.source ab.index source) abilities
+  ActionRestrictedAdditionalAction a -> pure $ a `elem` actions
+  EffectAction _ _ -> pure False
+  AnyAdditionalAction -> pure True
+  BountyAction -> pure False -- Has to be handled by Tony Morgan
+  BobJenkinsAction -> pure False -- Has to be handled by Bob Jenkins
+
+getCanAfford :: HasGame m => InvestigatorAttrs -> [Action] -> m Bool
+getCanAfford a@InvestigatorAttrs {..} as = do
+  actionCost <- getActionCost a as
+  additionalActions <- getAdditionalActions a
+  additionalActionCount <-
+    countM (\aa -> anyM (\ac -> additionalActionCovers (toSource a) [ac] aa) as) additionalActions
+  pure $ actionCost <= (investigatorRemainingActions + additionalActionCount)
+
+getAdditionalActions :: HasGame m => InvestigatorAttrs -> m [AdditionalAction]
+getAdditionalActions attrs = do
+  mods <- getModifiers attrs
+  let
+    toAdditionalAction = \case
+      GiveAdditionalAction ac -> [ac]
+      AdditionalActions label source n | n > 0 -> map (\x -> AdditionalAction label (IndexedSource x source) AnyAdditionalAction) [1 .. n]
+      _ -> []
+    additionalActions = concatMap toAdditionalAction mods
+
+  if CannotGainAdditionalActions `elem` mods
+    then pure []
+    else pure $ filter (`notElem` investigatorUsedAdditionalActions attrs) additionalActions
+
+{- | An investigator's /unrestricted/ actions: their remaining actions plus
+every unspent additional action that carries no limitation on its use.
+'getAdditionalActions' is what makes the count exclude the ones already spent.
+
+This is what Ages Unwound calls a "standard action":
+
+> A standard action is any action that does not have a limitation on its use,
+> regardless of its source.
+
+The name deliberately avoids that word. The core rules use "standard action"
+for the opposite side of the split -- the investigator's /three base/ actions,
+as against their additional ones ("not one of Daisy's three standard actions",
+glossary "Action"; FAQ 1.10) -- so an identifier saying /standard/ would read
+as the narrower count to anyone holding the rulebook and the wider one to
+anyone holding the campaign guide. Keep the campaign's wording on the cards and
+out of the engine.
+
+The unqualified count is 'getAllRemainingActions'.
+
+AU uses the term only where it *counts* actions ("for each standard action you
+have remaining", "if you have any standard actions remaining", "X is the number
+of standard actions you have"). Its "lose N action(s)" effects are a different
+thing -- see 'Arkham.Message.LoseUnrestrictedActions'.
+-}
+
+{- | Every action the investigator still has: their remaining actions plus
+every unspent additional action, whatever limitation it carries.
+
+This is what a card means by "actions remaining" left unqualified -- an
+investigator holding only Finn Edwards's evade-only action does have an action
+remaining -- so it backs 'Arkham.Matcher.InvestigatorWithActionsRemaining', and
+it is the count that losing an action goes by (FAQ 1.10).
+
+'getUnrestrictedActions' is the narrower one, for the cards that say /standard
+action/.
+-}
+getAllRemainingActions :: HasGame m => InvestigatorId -> m Int
+getAllRemainingActions iid = do
+  remaining <- field InvestigatorRemainingActions iid
+  additional <- length <$> field InvestigatorAdditionalActions iid
+  pure $ remaining + additional
+
+getUnrestrictedActions :: HasGame m => InvestigatorId -> m Int
+getUnrestrictedActions iid = do
+  remaining <- field InvestigatorRemainingActions iid
+  additional <- count isUnrestrictedAdditionalAction <$> field InvestigatorAdditionalActions iid
+  pure $ remaining + additional
+
+getActionCost :: HasGame m => InvestigatorAttrs -> [Action] -> m Int
+getActionCost attrs as = do
+  modifiers <- getModifiers (toTarget attrs)
+  pure $ foldr applyModifier 1 modifiers
+ where
+  applyModifier (ActionCostOf match m) n =
+    if any (matchTarget attrs match) as then n + m else n
+  applyModifier (AdditionalActionCostOf match m) n =
+    if any (matchTarget attrs match) as then n + m else n
+  applyModifier _ n = n
+
+matchTarget :: InvestigatorAttrs -> ActionTarget -> Action -> Bool
+matchTarget attrs (AnyActionTarget as) action = any (\atarget -> matchTarget attrs atarget action) as
+matchTarget attrs (FirstOneOfPerformed as) action =
+  action `elem` as && all (\a -> all (notElem a) $ investigatorActionsPerformed attrs) as
+matchTarget _ (IsAction a) action = action == a
+matchTarget _ (EnemyAction a _) action = action == a
+matchTarget _ (AssetAction a _) action = action == a
+matchTarget _ IsAnyAction _ = True
+
+getActions :: (HasGame m, HasCallStack) => InvestigatorId -> [Window] -> m [Ability]
+getActions iid ws = getActionsWith iid ws id
+
+{- | Whether any of @ws@ is a window this ability may actually respond to: its
+window matcher matches it AND the entry-tick rule holds.
+
+A forced/reaction ability may only respond to a triggering condition that
+occurred while its source card was already in play. A card that enters during an
+open window cannot respond to that window's already-occurred triggering
+condition (#4927). A window built ahead of the point at which it is checked --
+an attack's after-window, say -- pins the tick its condition initiated at;
+otherwise the condition began when the window opened (#5576).
+
+Two callers and they must agree: 'getActionsWith' admits abilities with it, and
+'getPreventedActions' uses it to decide whether a suppressed ability was close
+enough to firing to be worth announcing. A laxer deriving side would announce
+abilities that never had a window to begin with.
+
+97% of these evaluations return False (measured: 9326 ability checks per act
+advance, 257 matches), so rejecting on timing first is worth far more than
+making the full check faster.
+-}
+abilityRespondsToAny
+  :: (HasCallStack, HasGame m)
+  => InvestigatorId
+  -> Map CardId Int
+  -- ^ 'getEntryTicks', hoisted by the caller so a filter pass reads it once
+  -> [Window]
+  -> Ability
+  -> m Bool
+abilityRespondsToAny iid entryTicks ws ability = do
+  let abWindow = abilityWindowFor ability
+  let
+    respectsEntryTick w = do
+      isForced <- isForcedAbility iid ability
+      if not (isForced || isReactionAbility ability)
+        then pure True
+        else
+          sourceToMaybeCard (abilitySource ability) >>= \case
+            Nothing -> pure True
+            Just card -> case lookup card.id entryTicks of
+              Nothing -> pure True
+              Just entryTick -> case windowConditionTick w of
+                Just conditionTick -> pure $ entryTick <= conditionTick
+                Nothing -> getCurrentWindowTick <&> maybe True (> entryTick)
+  flip anyM ws \w -> do
+    matched <- windowMatches iid (abilitySource ability) w abWindow
+    if matched then respectsEntryTick w else pure False
+
+{- | Abilities one of @ws@ matched that @iid@ is forbidden to trigger, each paired
+with the source of the 'CannotTriggerAbilityMatching' modifier forbidding it.
+
+'getActionsWith' drops these silently, which left a player with no way to tell a
+blocked ability from one that does not exist: Infernal Machinery's "you cannot
+trigger abilities on Glyph or Artifact cards" quietly ate Chamber of Records'
+[reaction], and with the clue gone the glyph was unrecoverable (#5821). The
+caller turns each pair into an 'AbilityPrevented' for the log.
+
+Cost: an investigator with no such modifier returns on the first line, so the
+common case pays one cached modifier lookup and nothing else. When there is one,
+the candidate set is only the abilities the matcher names -- a handful of cards
+in play -- so the window and criteria passes below are cheap. The expensive part
+of 'getActionsWith', enumerating every ability in the game, is not repeated.
+-}
+getPreventedActions
+  :: (HasCallStack, HasGame m) => InvestigatorId -> [Window] -> m [(Ability, Source)]
+getPreventedActions iid ws = getPreventedAbilitiesBy isReactionAbility iid ws
+
+{- | The non-reaction half of 'getPreventedActions': the fast and action
+abilities @iid@ is forbidden to trigger right now, tested against the windows
+'getActions' builds the player window from.
+
+A reaction is announced where its own window opens; a fast or action ability has
+no such moment, so this is called once per turn ('BeginTurn' in
+"Arkham.Game.Runner"). That call site is what keeps the line out of the log on
+every one of the several player windows a turn opens -- the reason the collector
+was reactions-only to begin with. Sacrificial Shepherd forbidding every ability
+on a Bystander card left a player staring at a Kidnapped Citizen with no button
+and nothing said (#5827).
+-}
+getPreventedPlayerAbilities
+  :: (HasCallStack, HasGame m) => InvestigatorId -> m [(Ability, Source)]
+getPreventedPlayerAbilities iid =
+  getPreventedAbilitiesBy (not . isReactionAbility) iid (defaultWindows iid)
+
+getPreventedAbilitiesBy
+  :: (HasCallStack, HasGame m)
+  => (Ability -> Bool)
+  -> InvestigatorId
+  -> [Window]
+  -> m [(Ability, Source)]
+getPreventedAbilitiesBy isWanted iid ws = do
+  modifiers <- getModifiers' iid
+  let
+    -- The same matcher 'getActionsWith' builds, so the two cannot drift. Note a
+    -- Forced ability is not a 'TriggeredAbility' here, which is what exempts it
+    -- from these modifiers in the first place.
+    filters =
+      modifiers & mapMaybe \m -> case modifierType m of
+        CannotTriggerAbilityMatching matcher ->
+          Just (TriggeredAbility <> matcher, modifierSource m)
+        _ -> Nothing
+  if null filters || null ws
+    then pure []
+    else do
+      entryTicks <- getEntryTicks
+      let
+        -- Only announce what was otherwise ready to fire. This is
+        -- 'getCanPerformAbility' minus its prevention check -- calling that
+        -- would re-suppress every candidate -- so an ability whose criteria or
+        -- cost would have failed anyway is never reported as blocked.
+        wouldHaveFired ability = do
+          -- The criteria 'getCanPerformAbility' would have tested, override and
+          -- all: an override to 'Never' means the ability was not going to fire
+          -- regardless, and saying it was blocked would be a lie.
+          abilityModifiers <- getModifiers (AbilityTarget iid ability.ref)
+          let criteria = foldr applyCriteriaOverride ability.criteria abilityModifiers
+          andM
+            [ abilityRespondsToAny iid entryTicks ws ability
+            , getCanAffordAbility iid ability ws
+            , passesCriteria iid Nothing (toSource ability) ability.requestor ws criteria
+            ]
+      blocked <- concatForM filters \(matcher, blocker) -> do
+        -- 'isWanted' splits the two kinds because they are announced at
+        -- different moments, not because one of them does not matter. A window
+        -- opens and closes on its own, so a suppressed reaction is invisible --
+        -- that is #5821, and 'getPreventedActions' reports it wherever the
+        -- window is checked. A fast or action ability has no window of its own
+        -- to hang off and its player window reopens several times a turn, so
+        -- 'getPreventedPlayerAbilities' is called once per turn instead.
+        candidates <- filter isWanted <$> select (AbilityOneOf [matcher])
+        map (,blocker) <$> filterM wouldHaveFired candidates
+      -- One line per ability: two modifiers forbidding the same thing is still
+      -- one thing the player could not do, and either reason explains it.
+      pure $ nubOrdOn (\(ability, _) -> ability.ref) blocked
+
+getActionsWith
+  :: (HasCallStack, HasGame m)
+  => InvestigatorId
+  -> [Window]
+  -> (Ability -> Ability)
+  -> m [Ability]
+getActionsWith iid ws f = do
+  investigatorModifiers <- getModifiers iid
+  let
+    abilityFilters =
+      investigatorModifiers & mapMaybe \case
+        CannotTriggerAbilityMatching m -> Just (TriggeredAbility <> m)
+        _ -> Nothing
+
+  unfilteredActions <- map f <$> getAllAbilities
+  {- TEMPORARY profiling instrumentation. Enumerating every ability in the game
+  is pure work, otherwise paid for piecemeal by whatever forces the list below;
+  forcing it here puts the whole of it in one span. -}
+  let !_enumerated = timedPure "actions/enumerate" (length unfilteredActions)
+  actions' <-
+    if null abilityFilters
+      then pure unfilteredActions
+      else do
+        ignored <- select (AbilityOneOf abilityFilters)
+        pure $ filter (`notElem` ignored) unfilteredActions
+  actionsWithSources <-
+    concat <$> for actions' \action -> do
+      case abilitySource action of
+        ProxySource (AgendaMatcherSource m) base -> do
+          sources <- selectMap AgendaSource m
+          pure $ sources & map \source -> action {abilitySource = ProxySource source base}
+        ProxySource (ActMatcherSource m) base -> do
+          sources <- selectMap ActSource m
+          pure $ sources & map \source -> action {abilitySource = ProxySource source base}
+        ProxySource (AssetMatcherSource m) base -> do
+          sources <- selectMap AssetSource m
+          pure $ sources & map \source -> action {abilitySource = ProxySource source base}
+        ProxySource (LocationMatcherSource m) base -> do
+          sources <- selectMap LocationSource m
+          pure $ sources & map \source -> action {abilitySource = ProxySource source base}
+        ProxySource (EnemyMatcherSource m) base -> do
+          sources <- selectMap EnemySource m
+          pure $ sources & map \source -> action {abilitySource = ProxySource source base}
+        -- An ability anchored on the investigator it is offered to, so the UI
+        -- draws its button on their portrait rather than on the card that
+        -- grants it. These abilities are collected per investigator, so @iid@
+        -- is the anchor -- unlike 'replaceMatcherSources', which has no seat to
+        -- work from and has to settle for `You`.
+        ProxySource YouSource base ->
+          pure [action {abilitySource = ProxySource (InvestigatorSource iid) base}]
+        _ -> pure [action]
+
+  entryTicks <- getEntryTicks
+  actionsMatchingWindow <-
+    if null ws
+      then pure actionsWithSources
+      else filterM (abilityRespondsToAny iid entryTicks ws) actionsWithSources
+
+  let bountiesOnly = BountiesOnly `elem` investigatorModifiers
+
+  let uniqueSources = nub (map abilitySource actionsMatchingWindow)
+  sourceModifierMap :: Map Source [ModifierType] <-
+    fmap mapFromList $ for uniqueSources $ \src ->
+      (src,) <$> getModifiers (sourceToTarget src)
+  sourceClassesMap :: Map Source (Set ClassSymbol) <-
+    fmap mapFromList $ for uniqueSources $ \src -> case src of
+      AssetSource aid -> (src,) <$> field Field.AssetClasses aid
+      _ -> pure (src, singleton Neutral)
+  sourceBountyMap :: Map Source Bool <-
+    fmap mapFromList $ for uniqueSources $ \src -> case src of
+      EnemySource eid -> (src,) <$> (eid <=~> EnemyWithBounty)
+      _ -> pure (src, True)
+  let
+    lookupModifiers src = findWithDefault [] src sourceModifierMap
+    lookupClasses src = findWithDefault (singleton Neutral) src sourceClassesMap
+    lookupBounty src = findWithDefault True src sourceBountyMap
+  actions'' <-
+    catMaybes <$> for actionsMatchingWindow \ability -> do
+      let modifiers' = lookupModifiers (abilitySource ability)
+      let cardClasses = lookupClasses (abilitySource ability)
+
+      -- if enemy only bounty enemies
+      let sourceIsBounty = lookupBounty (abilitySource ability)
+
+      isForced <- isForcedAbility iid ability
+      let
+        -- Lola Hayes: Forced abilities will always trigger
+        -- weaknesses ignore the class system (FAQ 1.35) but weakness
+        -- assets with Lola-usable activated abilities don't exist; add a
+        -- cdCardSubType exemption here (needs a source->def lookup) if one ever does
+        prevents (CanOnlyUseCardsInRole role) =
+          null (setFromList [role, Neutral, Mythos] `intersect` cardClasses)
+            && not isForced
+        prevents CannotTriggerFastAbilities = isFastAbility ability
+        prevents _ = False
+        -- Blank excludes any non-default abilities (index >= 100)
+        -- TODO: this is a leaky abstraction, we may want to track this
+        -- on the abilities themselves
+        blankPrevents Blank = abilityIndex ability < 100
+        blankPrevents BlankExceptForcedAbilities = not isForced
+        blankPrevents _ = False
+        -- If the window is fast we only permit fast abilities, but forced
+        -- abilities need to be everpresent so we include them
+        needsToBeFast =
+          ws & all \window ->
+            (windowType window == Window.FastPlayerWindow)
+              && not (isFastAbility ability || isForced || isReactionAbility ability)
+
+      pure
+        $ if any prevents investigatorModifiers
+          || any blankPrevents modifiers'
+          || needsToBeFast
+          || (bountiesOnly && not sourceIsBounty)
+          then Nothing
+          else Just $ applyAbilityModifiers ability modifiers'
+
+  affordable <-
+    actions'' & filterM \action -> runValidT do
+      liftGuardM $ getCanPerformAbility iid ws action
+      liftGuardM $ getCanAffordAbility iid action ws
+  {- Settle any conditional cost now that the ability is known performable, so the
+  client is handed the cost that will actually be paid rather than a condition it
+  cannot evaluate (Call of the Sea's second action arrow). The gate is pure and
+  rejects every ability that carries no condition, and the whole enumeration runs
+  under one 'runCachedQueryT', so the rare resolution shares that cache. -}
+  actions''' <-
+    affordable & traverse \action ->
+      if hasConditionalCost action.cost
+        then do
+          cost <- resolveConditionalCosts iid action.source ws action.cost
+          pure action {Ability.abilityType = modifyCost (const cost) action.abilityType}
+        else pure action
+  forcedActions <- filterM (isForcedAbility iid) actions'''
+  -- Encounter-card forced abilities (Treachery, Enemy, Location, Agenda, Act)
+  -- resolve before player-card forced abilities (Asset, Event, Skill).
+  let encounterForcedActions = filter (isEncounterCardSource . abilitySource) forcedActions
+  let prioritizedForcedActions =
+        if null encounterForcedActions then forcedActions else encounterForcedActions
+  pure $ nub $ if bountiesOnly || null forcedActions then actions''' else prioritizedForcedActions
+
+hasFightActions
+  :: (Sourceable source, HasGame m)
+  => InvestigatorId
+  -> source
+  -> WindowMatcher
+  -> [Window]
+  -> m Bool
+hasFightActions iid requestor window windows' = do
+  abilities <- selectMap (setRequestor requestor) (#basic <> #fight <> AbilityWindow window)
+  andM
+    [ hasFightTargets (toSource requestor) iid
+    , anyM (\a -> getCanPerformAbility iid windows' $ decreaseAbilityActionCost a 1) abilities
+    ]
+
+hasEvadeActions
+  :: (HasCallStack, Sourceable source, HasGame m)
+  => InvestigatorId
+  -> source
+  -> WindowMatcher
+  -> [Window]
+  -> m Bool
+hasEvadeActions iid requestor window windows' = do
+  abilities <- selectMap (setRequestor requestor) (#basic <> #evade <> AbilityWindow window)
+  andM
+    [ hasEvadeTargets (toSource requestor) iid
+    , anyM (\a -> getCanPerformAbility iid windows' $ decreaseAbilityActionCost a 1) abilities
+    ]
+
+hasInvestigateActions
+  :: (Sourceable source, HasGame m)
+  => InvestigatorId
+  -> source
+  -> WindowMatcher
+  -> [Window]
+  -> m Bool
+hasInvestigateActions iid requestor window windows' = do
+  abilities <- selectMap (setRequestor requestor) (#basic <> #investigate <> AbilityWindow window)
+  anyM (\a -> getCanPerformAbility iid windows' $ decreaseAbilityActionCost a 1) abilities
+
+{- | Each action can count as several types (e.g. a weapon's "[action]: Fight"
+is both an activate action and a fight action). A streak of "different types
+of actions in a row" is therefore a system of distinct representatives (SDR):
+one distinct type assigned per action. Input is a list of the per-action type
+groups.
+-}
+
+{- | The longest prefix of the (newest-first) action groups that still admits an
+SDR, i.e. the longest run of "different types in a row".
+-}
+longestUniqueStreak :: Eq a => [[a]] -> [[a]]
+longestUniqueStreak = go []
+ where
+  go acc [] = acc
+  go acc (xs : xss)
+    | sdrExists (xs : acc) = go (xs : acc) xss
+    | otherwise = acc
+
+-- | Does a system of distinct representatives exist for these groups?
+sdrExists :: Eq a => [[a]] -> Bool
+sdrExists [] = True
+sdrExists (xs : rest) = any (\x -> sdrExists (map (filter (/= x)) rest)) xs
+
+-- | Pick one concrete SDR (a distinct representative per group), or [] if none.
+pickSDR :: Eq a => [[a]] -> [a]
+pickSDR = fromMaybe [] . go
+ where
+  go [] = Just []
+  go (xs : rest) =
+    listToMaybe
+      . catMaybes
+      $ [fmap (x :) (go (map (filter (/= x)) rest)) | x <- xs]

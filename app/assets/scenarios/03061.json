@@ -1,0 +1,9 @@
+{
+ "code": "03061",
+ "name": "最后的王者",
+ "mapName": "地点总览",
+ "exterior": "act:03064",
+ "cardBackgrounds": true,
+ "endings": {},
+ "_note": "The Path to Carcosa (11-20): no paintings yet — backgrounds are the location cards' art, the scenario picture the first act's art, the map drawn from the core's location layout. A painted whole map can be added later as map.style \"painting\" with hotspots."
+}

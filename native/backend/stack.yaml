@@ -1,0 +1,13 @@
+resolver: nightly-2026-08-09
+compiler: ghc-9.14.1
+system-ghc: true
+install-ghc: false
+notify-if-nix-on-path: false
+casa:
+  enable: false
+packages:
+- cards-discover
+- arkham-core
+ghc-options:
+  "$targets": -j2 +RTS -A128M -n4m -c -RTS
+  "$locals": -O0 -fno-write-ide-info -fhide-source-paths

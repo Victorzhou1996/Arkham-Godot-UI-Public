@@ -1,0 +1,8 @@
+[Unit]
+Description=QQ Bot bug list cleanup (move fixed / duplicate / not-a-bug reports to the archive)
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/qqbot
+ExecStart=/opt/qqbot/.venv/bin/python /opt/qqbot/bug_cleanup.py

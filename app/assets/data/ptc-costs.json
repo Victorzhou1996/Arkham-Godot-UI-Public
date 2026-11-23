@@ -1,0 +1,829 @@
+{
+ "_source": "rules source (read-only): Asset\\Cards\\ThePathToCarcosa.hs, Event\\Cards\\ThePathToCarcosa.hs, Skill\\Cards.hs, Skill\\CardDefs\\ThePathToCarcosa.hs",
+ "03007": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "combat",
+   "combat",
+   "combat",
+   "combat"
+  ]
+ },
+ "03009": {
+  "type": "asset",
+  "cost": null,
+  "skills": []
+ },
+ "03009b": {
+  "type": "asset",
+  "cost": null,
+  "skills": []
+ },
+ "03010": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "wild",
+   "wild"
+  ]
+ },
+ "03011": {
+  "type": "asset",
+  "cost": null,
+  "skills": []
+ },
+ "03012": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "willpower",
+   "agility",
+   "wild"
+  ]
+ },
+ "03014": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "willpower",
+   "intellect",
+   "wild"
+  ]
+ },
+ "03016": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "willpower",
+   "combat",
+   "wild"
+  ]
+ },
+ "03018": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "wild",
+   "wild"
+  ]
+ },
+ "03020": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "combat"
+  ]
+ },
+ "03021": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "willpower"
+  ]
+ },
+ "03022": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "willpower",
+   "combat"
+  ]
+ },
+ "03023": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "intellect",
+   "intellect"
+  ]
+ },
+ "03024": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "agility"
+  ]
+ },
+ "03025": {
+  "type": "asset",
+  "cost": 0,
+  "skills": [
+   "intellect"
+  ]
+ },
+ "03026": {
+  "type": "event",
+  "cost": 2,
+  "skills": [
+   "wild"
+  ]
+ },
+ "03027": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "intellect"
+  ]
+ },
+ "03028": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "agility"
+  ]
+ },
+ "03029": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "intellect",
+   "agility"
+  ]
+ },
+ "03030": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "wild"
+  ]
+ },
+ "03031": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "intellect"
+  ]
+ },
+ "03032": {
+  "type": "asset",
+  "cost": 1,
+  "skills": [
+   "willpower"
+  ]
+ },
+ "03033": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "willpower",
+   "willpower"
+  ]
+ },
+ "03034": {
+  "type": "event",
+  "cost": 3,
+  "skills": [
+   "willpower",
+   "agility"
+  ]
+ },
+ "03035": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "combat"
+  ]
+ },
+ "03036": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "intellect"
+  ]
+ },
+ "03037": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "combat"
+  ]
+ },
+ "03038": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "agility",
+   "agility"
+  ]
+ },
+ "03039": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "intellect",
+   "combat",
+   "agility"
+  ]
+ },
+ "03076a": {
+  "type": "asset",
+  "cost": null,
+  "skills": []
+ },
+ "03077": {
+  "type": "asset",
+  "cost": null,
+  "skills": []
+ },
+ "03078": {
+  "type": "asset",
+  "cost": null,
+  "skills": []
+ },
+ "03079": {
+  "type": "asset",
+  "cost": null,
+  "skills": []
+ },
+ "03080": {
+  "type": "asset",
+  "cost": null,
+  "skills": []
+ },
+ "03106": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "willpower",
+   "combat"
+  ]
+ },
+ "03107": {
+  "type": "asset",
+  "cost": 1,
+  "skills": [
+   "combat",
+   "agility"
+  ]
+ },
+ "03108": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "willpower",
+   "combat"
+  ]
+ },
+ "03109": {
+  "type": "asset",
+  "cost": 1,
+  "skills": [
+   "intellect",
+   "combat"
+  ]
+ },
+ "03110": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "combat"
+  ]
+ },
+ "03111": {
+  "type": "asset",
+  "cost": 1,
+  "skills": [
+   "willpower",
+   "agility"
+  ]
+ },
+ "03112": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "intellect"
+  ]
+ },
+ "03113": {
+  "type": "asset",
+  "cost": 1,
+  "skills": [
+   "willpower"
+  ]
+ },
+ "03114": {
+  "type": "asset",
+  "cost": 0,
+  "skills": [
+   "willpower"
+  ]
+ },
+ "03115": {
+  "type": "asset",
+  "cost": 1,
+  "skills": [
+   "willpower",
+   "intellect"
+  ]
+ },
+ "03116": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "willpower",
+   "willpower",
+   "willpower",
+   "willpower"
+  ]
+ },
+ "03117": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "intellect",
+   "intellect",
+   "intellect",
+   "intellect"
+  ]
+ },
+ "03118": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "combat",
+   "combat",
+   "combat",
+   "combat"
+  ]
+ },
+ "03119": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "agility",
+   "agility",
+   "agility",
+   "agility"
+  ]
+ },
+ "03141": {
+  "type": "asset",
+  "cost": null,
+  "skills": []
+ },
+ "03142": {
+  "type": "asset",
+  "cost": 1,
+  "skills": []
+ },
+ "03143": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "willpower",
+   "combat",
+   "agility"
+  ]
+ },
+ "03147": {
+  "type": "asset",
+  "cost": 1,
+  "skills": [
+   "combat"
+  ]
+ },
+ "03148": {
+  "type": "event",
+  "cost": 2,
+  "skills": [
+   "intellect",
+   "combat"
+  ]
+ },
+ "03149": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "intellect"
+  ]
+ },
+ "03150": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "willpower"
+  ]
+ },
+ "03151": {
+  "type": "asset",
+  "cost": 4,
+  "skills": [
+   "intellect"
+  ]
+ },
+ "03152": {
+  "type": "event",
+  "cost": 2,
+  "skills": [
+   "intellect",
+   "combat",
+   "combat"
+  ]
+ },
+ "03153": {
+  "type": "event",
+  "cost": 3,
+  "skills": [
+   "willpower",
+   "combat"
+  ]
+ },
+ "03154": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "intellect"
+  ]
+ },
+ "03155": {
+  "type": "event",
+  "cost": 1,
+  "skills": []
+ },
+ "03156": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "willpower"
+  ]
+ },
+ "03157": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "agility"
+  ]
+ },
+ "03158": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "intellect",
+   "agility"
+  ]
+ },
+ "03182a": {
+  "type": "asset",
+  "cost": null,
+  "skills": []
+ },
+ "03189": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "combat",
+   "combat"
+  ]
+ },
+ "03190": {
+  "type": "asset",
+  "cost": 4,
+  "skills": [
+   "combat",
+   "agility"
+  ]
+ },
+ "03191": {
+  "type": "event",
+  "cost": 2,
+  "skills": [
+   "willpower",
+   "willpower"
+  ]
+ },
+ "03192": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "willpower",
+   "intellect"
+  ]
+ },
+ "03193": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "intellect",
+   "agility"
+  ]
+ },
+ "03194": {
+  "type": "event",
+  "cost": 2,
+  "skills": [
+   "combat",
+   "agility"
+  ]
+ },
+ "03195": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "agility",
+   "agility"
+  ]
+ },
+ "03196": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "wild"
+  ]
+ },
+ "03197": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "willpower",
+   "willpower"
+  ]
+ },
+ "03198": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "intellect"
+  ]
+ },
+ "03199": {
+  "type": "event",
+  "cost": 2,
+  "skills": [
+   "willpower",
+   "agility"
+  ]
+ },
+ "03228": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "willpower",
+   "intellect",
+   "combat"
+  ]
+ },
+ "03229": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "willpower",
+   "combat"
+  ]
+ },
+ "03230": {
+  "type": "asset",
+  "cost": 2,
+  "skills": [
+   "willpower",
+   "willpower"
+  ]
+ },
+ "03231": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "willpower",
+   "intellect",
+   "agility"
+  ]
+ },
+ "03232": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "willpower",
+   "intellect",
+   "agility"
+  ]
+ },
+ "03233": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "willpower",
+   "combat",
+   "agility"
+  ]
+ },
+ "03234": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "combat",
+   "agility"
+  ]
+ },
+ "03235": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "wild"
+  ]
+ },
+ "03236": {
+  "type": "asset",
+  "cost": 1,
+  "skills": [
+   "intellect",
+   "intellect"
+  ]
+ },
+ "03237": {
+  "type": "event",
+  "cost": 3,
+  "skills": [
+   "agility",
+   "agility"
+  ]
+ },
+ "03238": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "willpower",
+   "intellect"
+  ]
+ },
+ "03239": {
+  "type": "event",
+  "cost": 0,
+  "skills": []
+ },
+ "03263": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "intellect",
+   "combat"
+  ]
+ },
+ "03264": {
+  "type": "asset",
+  "cost": 0,
+  "skills": []
+ },
+ "03265": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "wild"
+  ]
+ },
+ "03266": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "willpower",
+   "intellect"
+  ]
+ },
+ "03267": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "agility",
+   "agility"
+  ]
+ },
+ "03268": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "willpower",
+   "agility"
+  ]
+ },
+ "03269": {
+  "type": "asset",
+  "cost": 4,
+  "skills": [
+   "willpower"
+  ]
+ },
+ "03270": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "wild"
+  ]
+ },
+ "03271": {
+  "type": "asset",
+  "cost": 0,
+  "skills": [
+   "willpower",
+   "combat"
+  ]
+ },
+ "03272": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "willpower",
+   "combat",
+   "agility"
+  ]
+ },
+ "03273": {
+  "type": "event",
+  "cost": 3,
+  "skills": []
+ },
+ "03304": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "combat",
+   "agility"
+  ]
+ },
+ "03305": {
+  "type": "asset",
+  "cost": 4,
+  "skills": [
+   "willpower",
+   "willpower",
+   "combat",
+   "combat"
+  ]
+ },
+ "03306": {
+  "type": "event",
+  "cost": 0,
+  "skills": [
+   "intellect",
+   "agility"
+  ]
+ },
+ "03307": {
+  "type": "event",
+  "cost": 2,
+  "skills": [
+   "wild",
+   "intellect"
+  ]
+ },
+ "03308": {
+  "type": "asset",
+  "cost": 0,
+  "skills": []
+ },
+ "03309": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "combat"
+  ]
+ },
+ "03310": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "wild"
+  ]
+ },
+ "03311": {
+  "type": "event",
+  "cost": 1,
+  "skills": []
+ },
+ "03312": {
+  "type": "skill",
+  "cost": null,
+  "skills": [
+   "wild"
+  ]
+ },
+ "03313": {
+  "type": "asset",
+  "cost": 1,
+  "skills": [
+   "intellect",
+   "intellect"
+  ]
+ },
+ "03314": {
+  "type": "event",
+  "cost": 1,
+  "skills": [
+   "intellect",
+   "intellect",
+   "agility",
+   "agility"
+  ]
+ },
+ "03315": {
+  "type": "asset",
+  "cost": 3,
+  "skills": [
+   "wild",
+   "willpower"
+  ]
+ },
+ "03321b": {
+  "type": "asset",
+  "cost": 0,
+  "skills": []
+ }
+}

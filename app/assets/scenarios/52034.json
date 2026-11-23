@@ -1,0 +1,9 @@
+{
+ "code": "52034",
+ "name": "重返邪秽誓约",
+ "mapName": "地点总览",
+ "cardBackgrounds": true,
+ "endings": {},
+ "_note": "Later cycles (11-22, tools import): no paintings — the scenario picture is the first act's art, the map the core's location layout.",
+ "exterior": "act:52035"
+}

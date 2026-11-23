@@ -1,0 +1,102 @@
+{
+ "code": "01120",
+ "name": "午夜假面",
+ "exterior": "arkham-your-house",
+ "backgrounds": {
+  "yourHouse": "arkham-your-house-interior",
+  "rivertown": "arkham-rivertown",
+  "southside": "arkham-southside",
+  "stMarysHospital": "arkham-hospital",
+  "miskatonicUniversity": "arkham-university",
+  "downtown": "arkham-downtown-bank",
+  "easttown": "arkham-street",
+  "graveyard": "arkham-graveyard",
+  "northside": "arkham-northside"
+ },
+ "states": [
+  {
+   "location": "downtown",
+   "code": "01131",
+   "background": "arkham-downtown-asylum"
+  },
+  {
+   "location": "southside",
+   "code": "01127",
+   "background": "arkham-street"
+  }
+ ],
+ "map": {
+  "image": "arkham-map",
+  "hotspots": {
+   "northside": [
+    0.03,
+    0.03,
+    0.36,
+    0.17
+   ],
+   "miskatonicUniversity": [
+    0.2,
+    0.2,
+    0.2,
+    0.18
+   ],
+   "downtown": [
+    0.5,
+    0.05,
+    0.3,
+    0.2
+   ],
+   "easttown": [
+    0.5,
+    0.28,
+    0.26,
+    0.17
+   ],
+   "southside": [
+    0.28,
+    0.43,
+    0.2,
+    0.17
+   ],
+   "stMarysHospital": [
+    0.0,
+    0.5,
+    0.26,
+    0.2
+   ],
+   "yourHouse": [
+    0.24,
+    0.68,
+    0.2,
+    0.2
+   ],
+   "rivertown": [
+    0.5,
+    0.5,
+    0.25,
+    0.22
+   ],
+   "graveyard": [
+    0.8,
+    0.52,
+    0.2,
+    0.34
+   ]
+  },
+  "style": "cards",
+  "_note_cards": "Yunke 11-18 r8: every map is location cards joined by lines; the painted setup is kept in backup/scenarios-before-cards-20261118"
+ },
+ "objectives": {
+  "01123": {
+   "perPlayer": 0
+  }
+ },
+ "endings": {
+  "R1": "arkham-map",
+  "R2": "arkham-your-house"
+ },
+ "mapName": "阿卡姆地图",
+ "exteriorByRecord": {
+  "YourHouseHasBurnedToTheGround": "arkham-rivertown"
+ }
+}

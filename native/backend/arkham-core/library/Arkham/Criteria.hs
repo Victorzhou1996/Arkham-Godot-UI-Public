@@ -1,0 +1,723 @@
+{-# LANGUAGE TemplateHaskell #-}
+
+module Arkham.Criteria (
+  module Arkham.Criteria,
+  module Arkham.Criteria.Override,
+) where
+
+import Arkham.Prelude
+
+import {-# SOURCE #-} Arkham.Calculation
+import Arkham.CampaignLog
+import Arkham.CampaignLogKey (CampaignLogKey, IsCampaignLogKey (..))
+import Arkham.Campaigns.TheForgottenAge.Supply (Supply)
+import Arkham.Campaigns.TheScarletKeys.Concealed.Matcher
+import Arkham.Campaigns.TheScarletKeys.Key.Matcher
+import Arkham.Capability (Capabilities, Capable (..), FromSource)
+import Arkham.Card.CardCode
+import Arkham.Cost.Status (CostStatus)
+import Arkham.Criteria.Override
+import Arkham.Customization
+import Arkham.Direction (GridDirection)
+import Arkham.Duration
+import Arkham.GameValue (GameValue (Static))
+import Arkham.History.Types (HistoryType)
+import Arkham.Id
+import Arkham.Key
+import Arkham.Matcher.Ability
+import Arkham.Matcher.Act
+import Arkham.Matcher.Agenda
+import Arkham.Matcher.Asset
+import Arkham.Matcher.Base
+import Arkham.Matcher.Card
+import Arkham.Matcher.ChaosToken
+import Arkham.Matcher.Enemy
+import Arkham.Matcher.Event
+import Arkham.Matcher.History
+import Arkham.Matcher.Investigator
+import Arkham.Matcher.Key
+import Arkham.Matcher.Location
+import Arkham.Matcher.Patterns
+import Arkham.Matcher.Phase
+import Arkham.Matcher.Scenario
+import Arkham.Matcher.Skill
+import Arkham.Matcher.SkillTest
+import Arkham.Matcher.Source
+import Arkham.Matcher.Story
+import Arkham.Matcher.Target
+import Arkham.Matcher.Treachery
+import Arkham.Matcher.Value
+import Arkham.Modifier
+import Arkham.Scenario.Deck
+import Arkham.ScenarioLogKey
+import Arkham.Source
+import Arkham.Taboo.Types
+import Arkham.Token
+import Arkham.Trait (Trait)
+import Arkham.UltimatumsAndBoons.Types (UltimatumOrBoon)
+import Arkham.Zone
+import Control.Lens (Plated, Prism', prism')
+import Data.Aeson.TH
+
+data DiscardSignifier = AnyPlayerDiscard | DiscardOf Who
+  deriving stock (Show, Eq, Ord, Data)
+
+pattern AnyHorrorOnThis :: Criterion
+pattern AnyHorrorOnThis <- HorrorOnThis (GreaterThan (Static 0))
+  where
+    AnyHorrorOnThis = HorrorOnThis (GreaterThan (Static 0))
+
+pattern AnyDamageOnThis :: Criterion
+pattern AnyDamageOnThis <- DamageOnThis (GreaterThan (Static 0))
+  where
+    AnyDamageOnThis = DamageOnThis (GreaterThan (Static 0))
+
+pattern NoCluesOnThis :: Criterion
+pattern NoCluesOnThis <- CluesOnThis (EqualTo (Static 0))
+  where
+    NoCluesOnThis = CluesOnThis (EqualTo (Static 0))
+
+pattern AnyCluesOnThis :: Criterion
+pattern AnyCluesOnThis <- CluesOnThis (GreaterThan (Static 0))
+  where
+    AnyCluesOnThis = CluesOnThis (GreaterThan (Static 0))
+
+pattern CanGainResources :: Criterion
+pattern CanGainResources <-
+  InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotGainResources])
+  where
+    CanGainResources = InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotGainResources])
+
+pattern CanDealDamage :: Criterion
+pattern CanDealDamage <-
+  InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotDealDamage])
+  where
+    CanDealDamage = InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotDealDamage])
+
+pattern CanAttack :: Criterion
+pattern CanAttack <-
+  InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotAttack])
+  where
+    CanAttack = InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotAttack])
+
+{- | The one way to ask "can this investigator discover a clue at these locations".
+Delegates to 'Arkham.Helpers.Investigator.getCanDiscoverClues' via
+'LocationWithDiscoverableCluesBy', so it covers clue tokens, exposable concealed
+cards, and every CannotDiscoverClues* modifier. Replaced the permission-only
+CanDiscoverCluesAt / AbleToDiscoverCluesAt patterns in #5262.
+-}
+canDiscoverCluesAt :: LocationMatcher -> Criterion
+canDiscoverCluesAt locationMatcher = exists $ locationMatcher <> LocationWithDiscoverableCluesBy You
+
+pattern CanTakeControlOfClues :: Criterion
+pattern CanTakeControlOfClues <-
+  InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotTakeControlOfClues])
+  where
+    CanTakeControlOfClues =
+      InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotTakeControlOfClues])
+
+pattern CanDrawCards :: Criterion
+pattern CanDrawCards <-
+  Criteria
+    [ CanManipulateDeck
+      , InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotDrawCards])
+      ]
+  where
+    CanDrawCards =
+      Criteria
+        [ CanManipulateDeck
+        , InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotDrawCards])
+        ]
+
+pattern CanSearchDeck :: Criterion
+pattern CanSearchDeck <- CanManipulateDeck
+  where
+    CanSearchDeck = CanManipulateDeck
+
+pattern CanShuffleDeck :: Criterion
+pattern CanShuffleDeck <- CanManipulateDeck
+  where
+    CanShuffleDeck = CanManipulateDeck
+
+pattern CanManipulateDeck :: Criterion
+pattern CanManipulateDeck <-
+  InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotManipulateDeck])
+  where
+    CanManipulateDeck = InvestigatorExists (InvestigatorMatches [You, InvestigatorWithoutModifier CannotManipulateDeck])
+
+pattern InYourThreatArea :: Criterion
+pattern InYourThreatArea <- InThreatAreaOf You
+  where
+    InYourThreatArea = InThreatAreaOf You
+
+pattern DuringYourSkillTest :: Criterion
+pattern DuringYourSkillTest <- DuringSkillTest (YourSkillTest AnySkillTest)
+  where
+    DuringYourSkillTest = DuringSkillTest (YourSkillTest AnySkillTest)
+
+pattern DuringAnySkillTest :: Criterion
+pattern DuringAnySkillTest <- DuringSkillTest AnySkillTest
+  where
+    DuringAnySkillTest = DuringSkillTest AnySkillTest
+
+data CostReduction = Reduce Int | ReduceBySuccessAmount
+  deriving stock (Show, Eq, Ord, Data)
+
+overCriteria :: (Criterion -> Criterion) -> Criterion -> Criterion
+overCriteria f = \case
+  AtLeastNCriteriaMet n cs -> f (AtLeastNCriteriaMet n (map f cs))
+  Criteria cs -> f (Criteria (map f cs))
+  AnyCriterion cs -> f (AnyCriterion (map f cs))
+  Negate c -> f (Negate (f c))
+  IfCostsAreIgnored c -> f (IfCostsAreIgnored (f c))
+  IfCriteria a b c -> f (IfCriteria (f a) (f b) (f c))
+  c -> f c
+
+data Criterion
+  = AssetExists AssetMatcher
+  | TargetExists TargetMatcher
+  | {- | This Ultimatum or Boon is active. Ability lists are pure, so a card
+    whose printed behavior a Refraction rewrites cannot ask
+    'Arkham.UltimatumsAndBoons.hasUltimatum' for itself; it declares both
+    versions and tells them apart with this.
+    -}
+    UltimatumOrBoonIsActive UltimatumOrBoon
+  | ScenarioExists ScenarioMatcher
+  | DifferentTargetsExist TargetMatcher TargetMatcher
+  | DifferentAssetsExist AssetMatcher AssetMatcher
+  | DifferentEnemiesExist EnemyMatcher EnemyMatcher
+  | EventExists EventMatcher
+  | ExcludeWindowAssetExists AssetMatcher
+  | EventWindowInvestigatorIs InvestigatorMatcher
+  | {- | True when the card being played in the current `PlayCard` window has an
+    actual resource cost greater than 0 (accounting for cost modifiers and
+    treating X-cost cards as potentially > 0). Used to suppress cost-reduction
+    reactions on cards that already cost 0.
+    -}
+    PlayedCardHasNonZeroCost
+  | AgendaExists AgendaMatcher
+  | AbilityExists AbilityMatcher
+  | ActExists ActMatcher
+  | SkillExists SkillMatcher
+  | StoryExists StoryMatcher
+  | InYourHand
+  | InYourDiscard
+  | {- | This card is on the current skill test as a committed card. Pairs with
+    'Arkham.Card.CardDef.CommittedEffect', which is what gives it an entity to
+    carry the ability from there.
+    -}
+    IsCommitted
+  | DoomCountIs ValueMatcher
+  | PlayerCountIs Int
+  | OnAct Int
+  | CardExists CardMatcher
+  | ChargesOnThis ValueMatcher
+  | TokensOnThis Token ValueMatcher
+  | ClueOnLocation
+  | CluesOnThis ValueMatcher
+  | DuringSkillTest SkillTestMatcher
+  | DuringTurn InvestigatorMatcher
+  | EnemyCriteria EnemyCriterion
+  | ExtendedCardExists ExtendedCardMatcher
+  | ScarletKeyExists ScarletKeyMatcher
+  | CommitedCardsMatch CardListMatcher
+  | FirstAction
+  | HasSupply Supply
+  | Here
+  | HorrorOnThis ValueMatcher
+  | DamageOnThis ValueMatcher
+  | InThreatAreaOf InvestigatorMatcher
+  | InVictoryDisplay CardMatcher ValueMatcher
+  | InvestigatorExists InvestigatorMatcher
+  | InvestigatorIsAlone
+  | InvestigatorsHaveSpendableClues ValueMatcher
+  | InvestigatorsHaveClues ValueMatcher
+  | InvestigatorsAtHaveClues LocationMatcher ValueMatcher
+  | LocationExists LocationMatcher
+  | AgendaCount Int AgendaMatcher
+  | AssetCount Int AssetMatcher
+  | EnemyCount ValueMatcher EnemyMatcher
+  | EventCount ValueMatcher EventMatcher
+  | TreacheryCount ValueMatcher TreacheryMatcher
+  | LocationCount Int LocationMatcher
+  | KeyCount ValueMatcher KeyMatcher
+  | ExtendedCardCount ValueMatcher ExtendedCardMatcher
+  | AllUndefeatedInvestigatorsResigned
+  | EachUndefeatedInvestigator InvestigatorMatcher
+  | OnLocation LocationMatcher
+  | AllLocationsMatch LocationMatcher LocationMatcher
+  | HasAdjacentLocations LocationMatcher
+  | CanAffordCostIncrease Int
+  | OnSameLocation
+  | OwnCardWithDoom
+  | CardWithRemovableDoomExists
+  | ControlsThis -- really controls this
+  | OwnsThis -- just the owner
+  | PlayableCardExists CostStatus ExtendedCardMatcher
+  | PlayableCardExistsIgnoreModifiersFromSelf CostStatus ExtendedCardMatcher
+  | PlayableCardExistsWithCostReduction CostReduction ExtendedCardMatcher
+  | ResourcesOnThis ValueMatcher
+  | ResourcesOnLocation Where ValueMatcher
+  | TokensOnLocation Where Token ValueMatcher
+  | ReturnableCardInDiscard DiscardSignifier ExtendedCardMatcher
+  | PlayableCardInDiscard DiscardSignifier CardMatcher
+  | ScenarioCardHasResignAbility
+  | ScenarioDeckWithCard ScenarioDeckKey
+  | EncounterDeckIsNotEmpty
+  | EncounterDeckWith CardListMatcher
+  | NotSetup
+  | Self
+  | SetAsideCardExists CardMatcher
+  | OutOfPlayEnemyExists OutOfPlayZone EnemyMatcher
+  | TreacheryExists TreacheryMatcher
+  | Uncontrolled
+  | SelfHasModifier ModifierType
+  | ValueIs Int ValueMatcher
+  | UnderneathCardCount ValueMatcher UnderZone CardMatcher
+  | Remembered ScenarioLogKey
+  | RememberedAtLeast GameValue [ScenarioLogKey]
+  | ActionCanBeUndone
+  | DuringPhase PhaseMatcher
+  | ChaosTokenCountIs ChaosTokenMatcher ValueMatcher
+  | ChaosTokenExists ChaosTokenMatcher
+  | ConcealedCardExists ConcealedCardMatcher
+  | ConcealedCardCount Int ConcealedCardMatcher
+  | CanMoveThis GridDirection
+  | CanMoveTo LocationMatcher
+  | {- | Your move already in flight is headed at a matching location.
+
+    Read off the live movement, not off the window, which is the whole point: a
+    @WouldMove@ window names the destination the move had when it opened, and a
+    card that retargets the move in that window (Ages Unwound's "Instead, move
+    to a new Arkham Streets location") leaves every other trigger in it looking
+    at a destination that is no longer true. A condition about where you are
+    going therefore belongs on a later timing point -- @Leaves #when@ -- asking
+    this.
+    -}
+    MovingTo LocationMatcher
+  | {- | The matching location is one you could move to right now, counting the
+    connections you personally move as if you had ('MovesAsIfConnectedTo').
+
+    Not 'OnLocation' + 'accessibleTo': that asks the board which locations reach the
+    destination, and an as-if connection belongs to the mover rather than to either
+    location, so a location-side question cannot see it. This resolves through the
+    mover, which is also what keeps it from leaking to someone standing beside them.
+    -}
+    AccessibleToYou LocationMatcher
+  | TabooCriteria TabooList Criterion Criterion
+  | NotYetRecorded CampaignLogKey
+  | HasRecord CampaignLogKey
+  | {- | At least N of the given entries appear in a campaign-log /recorded set/.
+    The campaign-log analogue of 'RememberedAtLeast'; entries are compared
+    against the set's JSON-encoded 'Text' values.
+    -}
+    RecordSetHasAtLeast GameValue CampaignLogKey [Text]
+  | HasHistory HistoryType InvestigatorMatcher HistoryMatcher
+  | HasScenarioCount ScenarioCountKey ValueMatcher
+  | HasCampaignCount CampaignLogKey ValueMatcher
+  | HasCalculation GameCalculation ValueMatcher
+  | HasRemainingFrostTokens
+  | HasRemainingBlessTokens
+  | HasMoreBlessThanCurseTokens
+  | HasRemainingCurseTokens
+  | HasNRemainingCurseTokens ValueMatcher
+  | HasMoreCurseThanBlessTokens
+  | OnlySources SourceMatcher
+  | KeyIsSetAside ArkhamKey
+  | UnrevealedKeyIsSetAside
+  | CanEnterThisVehicle
+  | CanLeaveThisVehicle
+  | InThisVehicle
+  | NotInEliminatedBearersThreatArea
+  | PartnerHasStatus CardCode PartnerStatus
+  | -- Special Criterion
+    AtLeastNCriteriaMet Int [Criterion]
+  | Criteria [Criterion]
+  | AnyCriterion [Criterion]
+  | NoRestriction
+  | NotScenario ScenarioId
+  | Never
+  | Negate Criterion
+  | DuringAction
+  | AffectedByTarot
+  | HasTrueMagick
+  | ChosenCustomizationCardIsInPlay
+  | HasCustomization Customization
+  | IfYouOweBiancaDieKatz
+  | ElectrostaticDetonation
+  | BearerNotEliminated
+  | IsReturnTo
+  | {- | True when achievement tracking is switched on for this game. A handful of
+    cards carry a "don't offer this again, it would do nothing" guard that also
+    makes an official achievement unearnable; those guards are relaxed behind this
+    criterion (paired with 'onlyOnce') so the ability can still be resolved once,
+    as a no-op, when someone is chasing the achievement.
+    -}
+    AchievementsEnabled
+  | IfCostsAreIgnored Criterion
+  | IgnoreModifiersFrom Source Criterion
+  | IfCriteria Criterion Criterion Criterion
+  | {- | True when the investigator being asked has turned on this option for the
+    card the ability's source belongs to. Options are declared per card in
+    @cdOptions@; see "Arkham.Card.CardOption". Prefer 'whenOption'.
+    -}
+    CardOptionSet Text
+  deriving stock (Show, Eq, Ord, Data)
+
+instance Plated Criterion
+
+instance Duration Criterion where
+  type DurationOf Criterion = SkillTestMatcher
+  during = DuringSkillTest
+
+notYetRecorded :: IsCampaignLogKey k => k -> Criterion
+notYetRecorded = NotYetRecorded . toCampaignLogKey
+
+hasCampaignCount :: IsCampaignLogKey k => k -> ValueMatcher -> Criterion
+hasCampaignCount k = HasCampaignCount (toCampaignLogKey k)
+
+hasRecordCriteria :: IsCampaignLogKey k => k -> Criterion
+hasRecordCriteria = HasRecord . toCampaignLogKey
+
+recordSetHasAtLeast :: IsCampaignLogKey k => GameValue -> k -> [Text] -> Criterion
+recordSetHasAtLeast n k = RecordSetHasAtLeast n (toCampaignLogKey k)
+
+_DuringSkillTest :: Prism' Criterion SkillTestMatcher
+_DuringSkillTest = prism' DuringSkillTest $ \case
+  DuringSkillTest x -> Just x
+  _ -> Nothing
+
+instance Not Criterion where
+  not_ (Negate x) = x
+  not_ x = Negate x
+
+instance OneOf Criterion where
+  oneOf = AnyCriterion
+
+onLocation :: IsLocationMatcher a => a -> Criterion
+onLocation = OnLocation . toLocationMatcher
+
+cluesOnThis :: Int -> Criterion
+cluesOnThis = CluesOnThis . atLeast
+
+enemyExists :: EnemyMatcher -> Criterion
+enemyExists = EnemyCriteria . EnemyExists
+
+thisEnemy :: EnemyMatcher -> Criterion
+thisEnemy = EnemyCriteria . ThisEnemy
+
+atYourLocation :: InvestigatorMatcher -> Criterion
+atYourLocation matcher = exists (AtYourLocation <> matcher)
+
+class InPlay a where
+  asInPlay :: a -> a
+
+anyInPlay :: (Exists a, InPlay a) => a -> Criterion
+anyInPlay = exists . asInPlay
+
+noneInPlay :: (Exists a, InPlay a) => a -> Criterion
+noneInPlay = notExists . asInPlay
+
+class Exists a where
+  exists :: a -> Criterion
+
+thisIs :: (Exists matcher, Be a matcher, Semigroup matcher) => a -> matcher -> Criterion
+thisIs a matcher = exists (be a <> matcher)
+
+any_ :: (Exists a, OneOf a) => [a] -> Criterion
+any_ = exists . oneOf
+
+overrideExists :: Exists a => a -> CriteriaOverride
+overrideExists = CriteriaOverride . exists
+
+notExists :: Exists a => a -> Criterion
+notExists = not_ . exists
+
+instance Exists ScenarioMatcher where
+  exists = ScenarioExists
+
+instance Exists ConcealedCardMatcher where
+  exists = ConcealedCardExists
+
+instance Exists ChaosTokenMatcher where
+  exists = ChaosTokenExists
+
+instance Exists TargetMatcher where
+  exists = TargetExists
+
+instance Exists EventMatcher where
+  exists = EventExists
+
+instance Exists StoryMatcher where
+  exists = StoryExists
+
+instance Exists SkillMatcher where
+  exists = SkillExists
+
+instance Exists AgendaMatcher where
+  exists = AgendaExists
+
+instance Exists AbilityMatcher where
+  exists = AbilityExists
+
+instance Exists InvestigatorMatcher where
+  exists = InvestigatorExists
+
+you :: InvestigatorMatcher -> Criterion
+you a = exists (You <> a)
+
+instance Exists AssetMatcher where
+  exists = AssetExists
+
+instance Exists LocationMatcher where
+  exists = LocationExists
+
+instance Exists TreacheryMatcher where
+  exists = TreacheryExists
+
+instance Exists EnemyMatcher where
+  exists = enemyExists
+
+instance InPlay EnemyMatcher where
+  -- Enemy queries are in-play by default now, so this is the identity.
+  asInPlay = id
+
+instance Exists ExtendedCardMatcher where
+  exists = ExtendedCardExists
+
+instance Exists ScarletKeyMatcher where
+  exists = ScarletKeyExists
+
+thisExists :: (Be a matcher, Exists matcher, Semigroup matcher) => a -> matcher -> Criterion
+thisExists a matcher = exists (be a <> matcher)
+
+youExist :: InvestigatorMatcher -> Criterion
+youExist matcher = exists (You <> matcher)
+
+pattern CanPlaceDoomOnThis :: Criterion
+pattern CanPlaceDoomOnThis <- Negate (SelfHasModifier CannotPlaceDoomOnThis)
+  where
+    CanPlaceDoomOnThis = Negate (SelfHasModifier CannotPlaceDoomOnThis)
+
+instance Semigroup Criterion where
+  Never <> _ = Never
+  _ <> Never = Never
+  NoRestriction <> x = x
+  x <> NoRestriction = x
+  Criteria xs <> Criteria ys = Criteria $ xs <> ys
+  Criteria xs <> x = Criteria $ x : xs
+  x <> Criteria xs = Criteria $ x : xs
+  x <> y = Criteria [x, y]
+
+instance Monoid Criterion where
+  mempty = NoRestriction
+
+data EnemyCriterion
+  = EnemyExists EnemyMatcher
+  | NotAttackingEnemy
+  | EnemyExistsAtAttachedLocation EnemyMatcher
+  | ThisEnemy EnemyMatcher
+  | EnemyMatchesCriteria [EnemyCriterion]
+  deriving stock (Show, Eq, Ord, Data)
+
+canFightAtAnyLocation :: Criterion
+canFightAtAnyLocation =
+  EnemyCriteria (ThisEnemy $ CanBeAttackedBy You) <> CanAttack <> aloofFightRestriction
+
+canEvadeAtAnyLocation :: Criterion
+canEvadeAtAnyLocation = EnemyCriteria (ThisEnemy EnemyWithEvade)
+
+fightOverride :: EnemyMatcher -> EnemyMatcher
+fightOverride = CanFightEnemyWithOverride . CriteriaOverride . EnemyCriteria . ThisEnemy
+
+canFightOverride :: EnemyMatcher -> ModifierType
+canFightOverride = CanModify . EnemyFightActionCriteria . CriteriaOverride . EnemyCriteria . ThisEnemy
+
+ignoreAloofFightOverride :: EnemyMatcher -> EnemyMatcher
+ignoreAloofFightOverride matcher = fightOverride $ IgnoreAloofFightable <> matcher
+
+evadeOverride :: EnemyMatcher -> EnemyMatcher
+evadeOverride = CanEvadeEnemyWithOverride . CriteriaOverride . EnemyCriteria . ThisEnemy
+
+canFightCriteria :: Criterion
+canFightCriteria = canFightCriteriaObeyAloof True
+
+canFightIgnoreAloof :: Criterion
+canFightIgnoreAloof = canFightCriteriaObeyAloof False
+
+{- | Whether a fight should also offer targets that are merely attackable /as if/
+they were enemies (Mist-Pylons, Key Loci). Those are not enemies, so they only
+fit a fight that is not narrowed to some enemy property.
+
+A @CanFightEnemyWithOverride@ matcher /replaces/ the standard fight criteria
+rather than narrowing the enemy set, so look through it: an override that only
+restates the standard restrictions is still an unrestricted fight. That is how
+Longbow (3) and British Bull Dog (2) spell "ignore Aloof".
+-}
+fightOffersAsIfEnemyTargets :: EnemyMatcher -> Bool
+fightOffersAsIfEnemyTargets = \case
+  CanFightEnemyWithOverride (CriteriaOverride c) -> standardFightCriterion c
+  m -> coveredByAnyInPlayEnemy m
+ where
+  standardFightCriterion = \case
+    NoRestriction -> True
+    Criteria cs -> all standardFightCriterion cs
+    AnyCriterion cs -> any standardFightCriterion cs
+    OnSameLocation -> True
+    CanAttack -> True
+    EnemyCriteria (ThisEnemy m) -> standardFightMatcher m
+    _ -> False
+  -- the as-if-enemy selects already scope to your location, and "you may attack
+  -- it" is the default permission check, so neither clause narrows anything here
+  standardFightMatcher = \case
+    EnemyMatchAll ms -> all standardFightMatcher ms
+    EnemyOneOf ms -> any standardFightMatcher ms
+    EnemyAt YourLocation -> True
+    CanBeAttackedBy You -> True
+    m -> coveredByAnyInPlayEnemy m
+
+require :: Bool -> Criterion
+require True = NoRestriction
+require False = Never
+
+{- | Apply @c@ only when the controller has turned on the named card option; with
+the option off the ability is unrestricted. The inverse (a restriction that
+applies only when the option is /off/) is @IfCriteria (CardOptionSet k)
+NoRestriction c@.
+-}
+whenOption :: Text -> Criterion -> Criterion
+whenOption k c = IfCriteria (CardOptionSet k) c NoRestriction
+
+prohibit :: Bool -> Criterion
+prohibit = require . not
+
+canFightCriteriaObeyAloof :: Bool -> Criterion
+canFightCriteriaObeyAloof obeyAloof =
+  -- Cnidathqua is fought "as if it were at your location" from anywhere, so the
+  -- modifier stands in for the location check rather than narrowing it.
+  oneOf [OnSameLocation, thisEnemy (InPlayEnemy $ EnemyWithModifier CanBeFoughtAsIfAtYourLocation)]
+    <> EnemyCriteria (ThisEnemy $ CanBeAttackedBy You)
+    <> CanAttack
+    <> (if obeyAloof then aloofFightRestriction else NoRestriction)
+
+-- an aloof enemy is only attackable while engaged, unless the attacker ignores the keyword
+aloofFightRestriction :: Criterion
+aloofFightRestriction =
+  oneOf
+    [ EnemyCriteria (ThisEnemy $ EnemyOneOf [not_ AloofEnemy, EnemyIsEngagedWith Anyone])
+    , InvestigatorExists (You <> InvestigatorWithModifier IgnoreAloof)
+    ]
+
+canDamageEnemyAt :: Sourceable source => source -> LocationMatcher -> Criterion
+canDamageEnemyAt source locationMatcher = canDamageEnemyAtMatch source locationMatcher AnyEnemy
+
+canDamageEnemyAtMatch
+  :: Sourceable source => source -> LocationMatcher -> EnemyMatcher -> Criterion
+canDamageEnemyAtMatch (toSource -> source) locationMatcher enemyMatcher =
+  CanDealDamage
+    <> if enemyMatcher == AnyEnemy
+      then
+        oneOf -- technically Criteria
+          [ exists (EnemyAt locationMatcher <> EnemyCanBeDamagedBySource source)
+          , exists (LocationWithExposableConcealedCard source <> locationMatcher)
+          ]
+      else exists (EnemyAt locationMatcher <> EnemyCanBeDamagedBySource source <> enemyMatcher)
+
+{- | "There is something here I can attack": a fightable enemy, or a concealed
+mini-card, which may be attacked as if it were an engaged enemy to expose it,
+or a location that can be attacked as if it were an enemy (bug #20: Mist-Pylon).
+-}
+canFightSomething :: Sourceable source => source -> Criterion
+canFightSomething (toSource -> source) =
+  oneOf -- technically Criteria
+    [ exists (CanFightEnemy source)
+    , exists (YourLocation <> LocationWithExposableConcealedCard source)
+    , exists (YourLocation <> LocationWithModifier CanBeAttackedAsIfEnemy)
+    ]
+
+-- | Evade counterpart of 'canFightSomething'.
+canEvadeSomething :: Sourceable source => source -> Criterion
+canEvadeSomething (toSource -> source) =
+  oneOf -- technically Criteria
+    [ exists (CanEvadeEnemy source)
+    , exists (YourLocation <> LocationWithExposableConcealedCard source)
+    ]
+
+canEvadeEnemyAtMatch
+  :: Sourceable source => source -> LocationMatcher -> EnemyMatcher -> Criterion
+canEvadeEnemyAtMatch (toSource -> source) locationMatcher enemyMatcher =
+  if enemyMatcher == AnyEnemy
+    then
+      oneOf -- technically Criteria
+        [ exists (EnemyAt locationMatcher <> EnemyCanBeEvadedBy source)
+        , exists (LocationWithExposableConcealedCard source <> locationMatcher)
+        ]
+    else exists (EnemyAt locationMatcher <> EnemyCanBeEvadedBy source <> enemyMatcher)
+
+instance Semigroup EnemyCriterion where
+  EnemyMatchesCriteria xs <> EnemyMatchesCriteria ys =
+    EnemyMatchesCriteria $ xs <> ys
+  EnemyMatchesCriteria xs <> x = EnemyMatchesCriteria $ x : xs
+  x <> EnemyMatchesCriteria xs = EnemyMatchesCriteria $ x : xs
+  x <> y = EnemyMatchesCriteria [x, y]
+
+data UnderZone = UnderActDeck | UnderAgendaDeck | UnderZones [UnderZone]
+  deriving stock (Show, Eq, Ord, Data)
+
+instance Semigroup UnderZone where
+  UnderZones xs <> UnderZones ys = UnderZones $ xs <> ys
+  UnderZones xs <> y = UnderZones $ xs <> [y]
+  x <> UnderZones ys = UnderZones $ x : ys
+  x <> y = UnderZones [x, y]
+
+instance Capable (InvestigatorMatcher -> Maybe Criterion) where
+  can =
+    let can' = can :: Capabilities (InvestigatorMatcher -> Criterion)
+     in fmap (fmap Just) can'
+
+instance Capable (InvestigatorMatcher -> Criterion) where
+  can =
+    let can' = can :: Capabilities InvestigatorMatcher
+     in fmap (\m matcher -> exists (m <> matcher)) can'
+
+instance Capable (Maybe Criterion) where
+  can =
+    let can' = can :: Capabilities (InvestigatorMatcher -> Maybe Criterion)
+     in fmap (\m -> m You) can'
+
+instance Capable (FromSource -> InvestigatorMatcher -> Criterion) where
+  can =
+    let can' = can :: Capabilities (FromSource -> InvestigatorMatcher)
+     in fmap
+          (\(m :: FromSource -> InvestigatorMatcher) fSource matcher -> exists (m fSource <> matcher))
+          can'
+
+$(deriveJSON defaultOptions ''CostReduction)
+$(deriveJSON defaultOptions ''DiscardSignifier)
+$(deriveJSON defaultOptions ''UnderZone)
+$(deriveJSON defaultOptions ''EnemyCriterion)
+$(deriveToJSON defaultOptions ''Criterion)
+
+instance FromJSON Criterion where
+  parseJSON = withObject "Criterion" $ \o -> do
+    tag <- o .: "tag"
+    case (tag :: Text) of
+      "ReturnableCardInDiscard" -> do
+        contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+        pure $ case contents of
+          Right (ds, em) -> ReturnableCardInDiscard ds em
+          Left (ds, ts :: [Trait]) -> ReturnableCardInDiscard ds (BasicCardMatch $ mapOneOf CardWithTrait ts)
+      "CardInDiscard" -> do
+        (ds, cm) <- o .: "contents"
+        pure $ ReturnableCardInDiscard ds (BasicCardMatch cm)
+      "EnemyCount" -> do
+        contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+        pure $ case contents of
+          Right (vm, em) -> EnemyCount vm em
+          Left (n, em) -> EnemyCount (GreaterThanOrEqualTo (Static n)) em
+      "ExtendedCardCount" -> do
+        contents <- (Right <$> o .: "contents") <|> (Left <$> o .: "contents")
+        pure $ case contents of
+          Right (vm, em) -> ExtendedCardCount vm em
+          Left (n, em) -> ExtendedCardCount (GreaterThanOrEqualTo (Static n)) em
+      _ -> $(mkParseJSON defaultOptions ''Criterion) (Object o)

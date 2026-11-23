@@ -1,0 +1,9 @@
+[Unit]
+Description=Clean up the QQ Bot bug list every day at 04:00 (Asia/Shanghai)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 Asia/Shanghai
+Persistent=true
+
+[Install]
+WantedBy=timers.target

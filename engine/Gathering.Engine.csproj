@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseSharedCompilation>false</UseSharedCompilation>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="ClientRegions.cs" />
+    <Reference Include="Arkham.NativeHost"><HintPath>../runtime/Arkham.NativeHost.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

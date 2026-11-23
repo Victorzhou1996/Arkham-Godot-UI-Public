@@ -1,0 +1,354 @@
+{-# LANGUAGE TemplateHaskell #-}
+
+module Arkham.Ability.Types where
+
+import Arkham.Prelude
+
+import Arkham.Ability.Limit
+import Arkham.Ability.Type
+import Arkham.Action
+import Arkham.Card.CardCode
+import {-# SOURCE #-} Arkham.Card.EncounterCard
+import Arkham.ChaosToken.Types (ChaosTokenValue)
+import Arkham.Cost
+import Arkham.Criteria (Criterion (NoRestriction))
+import Arkham.Criteria.Override (CriteriaOverride)
+import Arkham.Json
+import Arkham.Matcher
+import Arkham.SkillType
+import Arkham.Source
+import Arkham.Target
+import Data.Aeson.TH
+import GHC.Records
+
+data AdditionalCostDelay = DelayAdditionalCosts | DelayAdditionalCostsWhen Criterion
+  deriving stock (Show, Eq, Ord, Data)
+
+data AbilityDisplayAs = DisplayAsAction | DisplayAsCard
+  deriving stock (Show, Eq, Ord, Data)
+
+data Ability = Ability
+  { abilitySource :: Source
+  , abilityCardCode :: CardCode
+  , abilityIndex :: Int
+  , abilityType :: AbilityType
+  , abilityLimit :: AbilityLimit
+  , abilityWindow :: WindowMatcher
+  , abilityMetadata :: Maybe AbilityMetadata
+  , abilityCriteria :: Criterion
+  , abilityDoesNotProvokeAttacksOfOpportunity :: Maybe EnemyMatcher
+  , abilityTooltip :: Maybe Text
+  , abilityResultLabel :: Maybe Text
+  {- ^ A complete i18n key naming what this ability's success does, for the choice that
+  resolves it. The default label assumes clue discovery, which an ability that does
+  something else instead needs to override. See 'withI18nResultLabel'.
+  -}
+  , abilityCanBeCancelled :: Bool
+  , abilityDisplayAs :: Maybe AbilityDisplayAs
+  , abilityDelayAdditionalCosts :: Maybe AdditionalCostDelay
+  , abilityBasic :: Bool
+  , abilityAdditionalCosts :: [Cost]
+  , abilityRequestor :: Source
+  , abilityTriggersSkillTest :: Bool
+  , abilityWantsSkillTest :: Maybe SkillTestMatcher
+  , abilityTarget :: Maybe Target -- used to highlight the target of the ability in the UI
+  , abilityHighlightFromWindow :: Bool -- when true, abilityTarget is auto-set from the triggering window
+  , abilitySkipForAll :: Bool
+  , abilityIgnoreAllCosts :: Bool
+  , abilityFightCriteriaOverride :: Maybe CriteriaOverride
+  , abilityEvadeCriteriaOverride :: Maybe CriteriaOverride
+  , abilityNonBlocking :: Bool
+  {- ^ A reaction that must never be the reason a window stops for input. It rides along
+  with whatever else that window offers and is dropped as soon as the window is
+  answered, so it never produces a lone prompt needing a Skip Triggers press.
+  See 'runWindow' in "Arkham.Investigator.Runner".
+  -}
+  , abilityBlocksIn :: Maybe WindowMatcher
+  {- ^ Windows in which a non-blocking reaction blocks anyway, so it still gets one
+  deliberate prompt of its own there. Safeguard (2) uses the start of a turn: that is the
+  only point at which arming it can still matter, and nothing else is ever on offer in the
+  windows that follow.
+  -}
+  , abilityChaosTokenEffects :: [ChaosTokenValue]
+  {- ^ "I affect these chaos token faces."
+
+  A declaration, not a behaviour: it changes nothing about how the ability
+  resolves, and the ability still has to do the work itself. It exists so
+  'getSkillTestValueBreakdown' can list the effect -- attributed to this card --
+  /before/ a token is revealed, which no modifier can do for an effect that only
+  becomes a modifier once the ability resolves.
+
+  Each entry pairs a face with the value this ability adds to a test when that
+  face is revealed, in the same payload 'AddChaosTokenValue' carries; use
+  'NoModifier' for an effect with no numeric part. 'abilityTooltip' supplies the
+  prose half. Set it with 'affectsChaosToken' / 'affectsChaosTokens'.
+  -}
+  }
+  deriving stock (Show, Ord, Data)
+
+-- Traversal focusing on the AbilityLimitType inside an Ability, if present
+limitType :: Traversal' Ability AbilityLimitType
+limitType f ability = case ability.abilityLimit of
+  PerInvestigatorLimit t n ->
+    (\t' -> ability {abilityLimit = PerInvestigatorLimit t' n}) <$> f t
+  PlayerLimit t n ->
+    (\t' -> ability {abilityLimit = PlayerLimit t' n}) <$> f t
+  GroupLimit t n ->
+    (\t' -> ability {abilityLimit = GroupLimit t' n}) <$> f t
+  MaxPer cd t n ->
+    (\t' -> ability {abilityLimit = MaxPer cd t' n}) <$> f t
+  NoLimit -> pure ability
+
+overAbilityActions :: ([Action] -> [Action]) -> Ability -> Ability
+overAbilityActions f ab = ab {Arkham.Ability.Types.abilityType = overAbilityTypeActions f ab.kind}
+buildAbility :: (Sourceable source, HasCardCode source) => source -> Int -> AbilityType -> Ability
+buildAbility source idx abilityType =
+  Ability
+    { abilitySource = toSource source
+    , abilityCardCode = toCardCode source
+    , abilityIndex = idx
+    , abilityType = abilityType
+    , abilityLimit = NoLimit
+    , abilityWindow = AnyWindow
+    , abilityMetadata = Nothing
+    , abilityCriteria = NoRestriction
+    , abilityDoesNotProvokeAttacksOfOpportunity = Nothing
+    , abilityTooltip = Nothing
+    , abilityResultLabel = Nothing
+    , abilityCanBeCancelled = True
+    , abilityDisplayAs = Nothing
+    , abilityDelayAdditionalCosts = Nothing
+    , abilityBasic = False
+    , abilityAdditionalCosts = []
+    , abilityRequestor = toSource source
+    , abilityTriggersSkillTest = False
+    , abilityWantsSkillTest = Nothing
+    , abilityTarget = Nothing
+    , abilityHighlightFromWindow = False
+    , abilitySkipForAll = False
+    , abilityIgnoreAllCosts = False
+    , abilityFightCriteriaOverride = Nothing
+    , abilityEvadeCriteriaOverride = Nothing
+    , abilityNonBlocking = False
+    , abilityBlocksIn = Nothing
+    , abilityChaosTokenEffects = []
+    }
+
+withHighlight :: Targetable target => target -> Ability -> Ability
+withHighlight target ab = ab {abilityTarget = Just (toTarget target)}
+
+withWindowHighlight :: Ability -> Ability
+withWindowHighlight ab = ab {abilityHighlightFromWindow = True}
+
+skillTestAbility :: Ability -> Ability
+skillTestAbility ab = ab {abilityTriggersSkillTest = True}
+
+notSkillTestAbility :: Ability -> Ability
+notSkillTestAbility ab = ab {abilityTriggersSkillTest = False}
+
+setRequestor :: Sourceable source => source -> Ability -> Ability
+setRequestor source ab = ab {abilityRequestor = toSource source}
+
+instance HasCost Ability where
+  overCost f ab = ab {Arkham.Ability.Types.abilityType = overCost f (abilityType ab)}
+
+instance HasField "skipForAll" Ability Bool where
+  getField = abilitySkipForAll
+
+instance HasField "nonBlocking" Ability Bool where
+  getField = abilityNonBlocking
+
+instance HasField "blocksIn" Ability (Maybe WindowMatcher) where
+  getField = abilityBlocksIn
+
+instance HasField "wantsSkillTest" Ability (Maybe SkillTestMatcher) where
+  getField = abilityWantsSkillTest
+
+instance HasField "resultLabel" Ability (Maybe Text) where
+  getField = abilityResultLabel
+
+instance HasField "limitType" Ability (Maybe AbilityLimitType) where
+  getField = abilityLimitType . abilityLimit
+
+instance HasField "window" Ability WindowMatcher where
+  getField = abilityWindow
+
+instance HasField "chaosTokenEffects" Ability [ChaosTokenValue] where
+  getField = abilityChaosTokenEffects
+
+instance HasField "criteria" Ability Criterion where
+  getField = abilityCriteria
+
+instance HasField "kind" Ability AbilityType where
+  getField = abilityType
+
+instance HasField "requestor" Ability Source where
+  getField = abilityRequestor
+
+instance HasField "source" Ability Source where
+  getField = abilitySource
+
+instance HasField "cardCode" Ability CardCode where
+  getField = abilityCardCode
+
+instance HasField "index" Ability Int where
+  getField = abilityIndex
+
+instance HasField "fast" Ability Bool where
+  getField Ability {abilityType} = isFastAbilityType abilityType
+
+instance HasField "ref" Ability AbilityRef where
+  getField = abilityToRef
+
+data AbilityRef = AbilityRef Source Int
+  deriving stock (Show, Eq, Ord, Generic, Data)
+  deriving anyclass (ToJSON, FromJSON)
+
+instance Sourceable AbilityRef where
+  toSource (AbilityRef s n) = AbilitySource s n
+
+abilityToRef :: Ability -> AbilityRef
+abilityToRef a = AbilityRef a.source a.index
+instance HasField "source" AbilityRef Source where
+  getField (AbilityRef s _) = s
+
+instance HasField "index" AbilityRef Int where
+  getField (AbilityRef _ idx) = idx
+
+data AbilityMetadata
+  = IntMetadata Int
+  | TargetMetadata Target
+  | SourceMetadata Source
+  | EncounterCardMetadata EncounterCard
+  | SkillChoiceMetadata SkillType
+  | NoAbilityMetadata
+  | InvestigateTargets LocationMatcher
+  | CardCodeMetadata CardCode
+  deriving stock (Eq, Show, Ord, Data)
+
+instance Eq Ability where
+  a == b =
+    (abilitySource a == abilitySource b)
+      && (abilityIndex a == abilityIndex b)
+      && (abilityCardCode a == abilityCardCode b)
+
+instance Sourceable Ability where
+  toSource a = AbilitySource (abilitySource a) (abilityIndex a)
+
+abilityLimitL :: Lens' Ability AbilityLimit
+abilityLimitL = lens abilityLimit $ \m x -> m {abilityLimit = x}
+abilityMetadataL :: Lens' Ability (Maybe AbilityMetadata)
+abilityMetadataL = lens abilityMetadata $ \m x -> m {abilityMetadata = x}
+
+abilityTooltipL :: Lens' Ability (Maybe Text)
+abilityTooltipL = lens abilityTooltip $ \m x -> m {abilityTooltip = x}
+
+abilityChaosTokenEffectsL :: Lens' Ability [ChaosTokenValue]
+abilityChaosTokenEffectsL = lens abilityChaosTokenEffects $ \m x -> m {abilityChaosTokenEffects = x}
+
+abilityResultLabelL :: Lens' Ability (Maybe Text)
+abilityResultLabelL = lens abilityResultLabel $ \m x -> m {abilityResultLabel = x}
+
+abilityCriteriaL :: Lens' Ability Criterion
+abilityCriteriaL = lens abilityCriteria $ \m x -> m {abilityCriteria = x}
+
+abilityWantsSkillTestL :: Lens' Ability (Maybe SkillTestMatcher)
+abilityWantsSkillTestL = lens abilityWantsSkillTest $ \m x -> m {abilityWantsSkillTest = x}
+
+abilityDoesNotProvokeAttacksOfOpportunityL :: Lens' Ability (Maybe EnemyMatcher)
+abilityDoesNotProvokeAttacksOfOpportunityL =
+  lens abilityDoesNotProvokeAttacksOfOpportunity
+    $ \m x -> m {abilityDoesNotProvokeAttacksOfOpportunity = x}
+
+abilityDisplayAsL :: Lens' Ability (Maybe AbilityDisplayAs)
+abilityDisplayAsL = lens abilityDisplayAs $ \m x -> m {abilityDisplayAs = x}
+
+abilityDelayAdditionalCostsL :: Lens' Ability (Maybe AdditionalCostDelay)
+abilityDelayAdditionalCostsL = lens abilityDelayAdditionalCosts $ \m x -> m {abilityDelayAdditionalCosts = x}
+delayAdditionalCostsWhen :: Criterion -> Ability -> Ability
+delayAdditionalCostsWhen c = abilityDelayAdditionalCostsL ?~ DelayAdditionalCostsWhen c
+
+delayAdditionalCosts :: Ability -> Ability
+delayAdditionalCosts = abilityDelayAdditionalCostsL ?~ DelayAdditionalCosts
+
+mconcat
+  [ deriveJSON defaultOptions ''AdditionalCostDelay
+  , deriveJSON defaultOptions ''AbilityMetadata
+  , deriveJSON defaultOptions ''AbilityDisplayAs
+  , deriveToJSON (aesonOptions $ Just "ability") ''Ability
+  ]
+
+instance FromJSON Ability where
+  parseJSON = withObject "Ability" $ \o -> do
+    abilitySource <- o .: "source"
+    abilityCardCode <- o .: "cardCode"
+    abilityIndex <- o .: "index"
+    abilityType <- o .: "type"
+    abilityLimit <- o .: "limit"
+    abilityWindow <- o .: "window"
+    abilityMetadata <- o .:? "metadata"
+    abilityCriteria <- o .: "criteria"
+    abilityDoesNotProvokeAttacksOfOpportunity <-
+      o .: "doesNotProvokeAttacksOfOpportunity" <|> do
+        boolVal <- o .: "doesNotProvokeAttacksOfOpportunity"
+        pure $ if boolVal then Just AnyEnemy else Nothing
+    abilityTooltip <- o .:? "tooltip"
+    abilityResultLabel <- o .:? "resultLabel"
+    abilityCanBeCancelled <- o .: "canBeCancelled"
+    abilityDisplayAsAction <- o .:? "displayAsAction" .!= False
+    abilityDisplayAs <-
+      o .:? "displayAs" .!= (guard abilityDisplayAsAction $> DisplayAsAction)
+    abilityDelayAdditionalCosts <-
+      ((o .:? "delayAdditionalCosts" .!= False) <&> \x -> guard x $> DelayAdditionalCosts)
+        <|> o
+        .:? "delayAdditionalCosts"
+    abilityBasic <- o .: "basic"
+    abilityAdditionalCosts <- o .: "additionalCosts"
+    abilityRequestor <- o .:? "requestor" .!= abilitySource
+    abilityTriggersSkillTest <- o .:? "triggersSkillTest" .!= False
+    abilityWantsSkillTest <- o .:? "wantsSkillTest" .!= Nothing
+    abilityTarget <- o .:? "target"
+    abilityHighlightFromWindow <- o .:? "highlightFromWindow" .!= False
+    abilitySkipForAll <- o .:? "skipForAll" .!= False
+    abilityIgnoreAllCosts <- o .:? "ignoreAllCosts" .!= False
+    abilityFightCriteriaOverride <- o .:? "fightCriteriaOverride"
+    abilityEvadeCriteriaOverride <- o .:? "evadeCriteriaOverride"
+    abilityNonBlocking <- o .:? "nonBlocking" .!= False
+    abilityBlocksIn <- o .:? "blocksIn"
+    abilityChaosTokenEffects <- o .:? "chaosTokenEffects" .!= []
+
+    pure Ability {..}
+
+newtype DifferentAbility = DifferentAbility AbilityRef
+  deriving newtype (Show, ToJSON, FromJSON)
+
+instance HasField "different" Ability DifferentAbility where
+  getField ab = DifferentAbility (abilityToRef ab)
+
+instance HasField "different" AbilityRef DifferentAbility where
+  getField = DifferentAbility
+
+instance Eq DifferentAbility where
+  (DifferentAbility a) == (DifferentAbility b) =
+    case a.index of
+      100 -> b.index == 100 && sameSource
+      101 -> b.index == 101 && sameSource
+      102 -> b.index == 102 && sameSource
+      103 -> b.index == 103 && sameSource
+      104 -> b.index == 104 && sameSource
+      _ -> (a.source == b.source) && (a.index == b.index)
+   where
+    sameSource = case a.source of
+      EnemySource _ -> case b.source of
+        EnemySource _ -> True
+        _ -> False
+      LocationSource _ -> case b.source of
+        LocationSource _ -> True
+        _ -> False
+      InvestigatorSource _ -> case b.source of
+        InvestigatorSource _ -> True
+        _ -> False
+      ConcealedCardSource _ -> case b.source of
+        ConcealedCardSource _ -> True
+        _ -> False
+      _ -> error $ "Unhandled samesource in DifferentAbility: " <> show (a.source, b.source)
